@@ -2,25 +2,174 @@ import { MatrixClient, MatrixEvent, MatrixRoom, MatrixUser, Sticker, Gif } from 
 // FIX: `RoomCreateOptions` is not an exported member of `matrix-js-sdk`. Replaced with the correct type `ICreateRoomOpts`.
 // FIX: Import Visibility enum to correctly type room creation options.
 import { createClient, ICreateClientOpts, EventType, MsgType, RelationType, ICreateRoomOpts, Visibility } from 'matrix-js-sdk';
+import { IndexedDBCryptoStore } from 'matrix-js-sdk/lib/crypto/store/indexeddb-crypto-store';
+import { LocalStorageCryptoStore } from 'matrix-js-sdk/lib/crypto/store/localStorage-crypto-store';
+import { MemoryCryptoStore } from 'matrix-js-sdk/lib/crypto/store/memory-crypto-store';
+import type { CryptoStore } from 'matrix-js-sdk/lib/crypto/store/base';
+
+const CRYPTO_DB_NAME = 'matrix-messenger-crypto';
+const DEVICE_STORAGE_KEY = 'matrix-device-id';
+const SECRET_STORAGE_KEY_PREFIX = 'matrix-secret-storage:';
+
+const getBrowserStorage = (): Storage | undefined => {
+    if (typeof window === 'undefined') {
+        return undefined;
+    }
+    try {
+        return window.localStorage;
+    } catch (error) {
+        console.warn('Local storage unavailable for session persistence', error);
+        return undefined;
+    }
+};
+
+const createCryptoStore = (): CryptoStore | undefined => {
+    if (typeof window === 'undefined') {
+        return new MemoryCryptoStore();
+    }
+    if (window.indexedDB) {
+        return new IndexedDBCryptoStore(window.indexedDB, CRYPTO_DB_NAME);
+    }
+    if (window.localStorage) {
+        return new LocalStorageCryptoStore(window.localStorage);
+    }
+    return new MemoryCryptoStore();
+};
+
+const resolveStoredDeviceId = (userId?: string): string | undefined => {
+    const storage = getBrowserStorage();
+    if (!storage || !userId) {
+        return undefined;
+    }
+    return storage.getItem(`${DEVICE_STORAGE_KEY}:${userId}`) || undefined;
+};
+
+const persistDeviceId = (userId: string, deviceId: string | undefined): void => {
+    const storage = getBrowserStorage();
+    if (!storage || !deviceId) {
+        return;
+    }
+    storage.setItem(`${DEVICE_STORAGE_KEY}:${userId}`, deviceId);
+};
+
+const markSecretStorageReady = (userId: string): void => {
+    const storage = getBrowserStorage();
+    if (!storage) {
+        return;
+    }
+    storage.setItem(`${SECRET_STORAGE_KEY_PREFIX}${userId}`, 'true');
+};
+
+const isSecretStorageMarkedReady = (userId: string): boolean => {
+    const storage = getBrowserStorage();
+    if (!storage) {
+        return false;
+    }
+    return storage.getItem(`${SECRET_STORAGE_KEY_PREFIX}${userId}`) === 'true';
+};
+
+const attachSessionStore = (options: ICreateClientOpts): void => {
+    if (typeof window === 'undefined') {
+        return;
+    }
+    try {
+        const sessionStore = window.sessionStorage;
+        if (sessionStore) {
+            (options as ICreateClientOpts & { sessionStore?: Storage }).sessionStore = sessionStore;
+        }
+    } catch (error) {
+        console.warn('Session storage unavailable for Matrix session persistence', error);
+    }
+};
 
 // *** ВАЖНО: Укажите здесь URL вашего сервера для перевода ***
 const TRANSLATION_SERVER_URL = 'https://your-translation-server.com/api/translate';
 
 
-export const initClient = (homeserverUrl: string, accessToken?: string, userId?: string): MatrixClient => {
+export const initClient = (homeserverUrl: string, accessToken?: string, userId?: string, deviceId?: string): MatrixClient => {
     const options: ICreateClientOpts = {
         baseUrl: homeserverUrl,
+        cryptoStore: createCryptoStore(),
     };
     if (accessToken && userId) {
         options.accessToken = accessToken;
         options.userId = userId;
     }
+
+    const resolvedDeviceId = deviceId || resolveStoredDeviceId(userId);
+    if (resolvedDeviceId) {
+        options.deviceId = resolvedDeviceId;
+    }
+
+    attachSessionStore(options);
     return createClient(options);
+};
+
+const waitForCryptoStore = async (client: MatrixClient): Promise<void> => {
+    const cryptoStore = (client as MatrixClient & { cryptoStore?: { startup?: () => Promise<unknown>; startupPromise?: Promise<unknown>; } }).cryptoStore;
+    try {
+        if (cryptoStore?.startup) {
+            await cryptoStore.startup();
+        } else if (cryptoStore?.startupPromise) {
+            await cryptoStore.startupPromise;
+        }
+    } catch (error) {
+        console.warn('Failed to initialise crypto store', error);
+    }
+};
+
+export const ensureCryptoIsReady = async (client: MatrixClient): Promise<void> => {
+    try {
+        await client.initCrypto();
+        await waitForCryptoStore(client);
+    } catch (error) {
+        console.warn('Failed to initialise Matrix crypto engine', error);
+        return;
+    }
+
+    const userId = client.getUserId();
+    if (!userId) {
+        return;
+    }
+
+    if (!isSecretStorageMarkedReady(userId)) {
+        try {
+            await client.bootstrapSecretStorage({ setupNewKeyBackup: true });
+            const backupInfo = await client.getKeyBackupVersion();
+            if (backupInfo) {
+                await client.enableKeyBackup(backupInfo);
+            }
+            markSecretStorageReady(userId);
+        } catch (error) {
+            console.warn('Automatic secret storage bootstrap failed', error);
+        }
+    } else {
+        try {
+            const backupEnabled = client.getKeyBackupEnabled();
+            if (!backupEnabled) {
+                const backupInfo = await client.getKeyBackupVersion();
+                if (backupInfo) {
+                    await client.enableKeyBackup(backupInfo);
+                }
+            }
+        } catch (error) {
+            console.warn('Failed to re-enable key backup', error);
+        }
+    }
 };
 
 export const login = async (homeserverUrl: string, username: string, password: string): Promise<MatrixClient> => {
     const client = initClient(homeserverUrl);
-    await client.loginWithPassword(username, password);
+    const loginResponse = await client.loginWithPassword(username, password);
+
+    const userId = loginResponse.user_id || client.getUserId();
+    const deviceId = loginResponse.device_id || client.getDeviceId();
+
+    if (userId && deviceId) {
+        persistDeviceId(userId, deviceId);
+    }
+
+    await ensureCryptoIsReady(client);
     await client.startClient({ initialSyncLimit: 10 });
     return client;
 };

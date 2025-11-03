@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import LoginPage from './components/LoginPage';
 import ChatPage from './components/ChatPage';
 import { MatrixClient } from './types';
-import { initClient, findOrCreateSavedMessagesRoom } from './services/matrixService';
+import { initClient, findOrCreateSavedMessagesRoom, ensureCryptoIsReady } from './services/matrixService';
 
 const App: React.FC = () => {
     const [client, setClient] = useState<MatrixClient | null>(null);
@@ -16,6 +16,7 @@ const App: React.FC = () => {
     }, []);
 
     const setupSession = async (matrixClient: MatrixClient) => {
+        await ensureCryptoIsReady(matrixClient);
         await matrixClient.startClient({ initialSyncLimit: 10 });
         const smRoomId = await findOrCreateSavedMessagesRoom(matrixClient);
         setSavedMessagesRoomId(smRoomId);
@@ -27,8 +28,8 @@ const App: React.FC = () => {
             const storedCreds = localStorage.getItem('matrix-creds');
             if (storedCreds) {
                 try {
-                    const { homeserverUrl, userId, accessToken } = JSON.parse(storedCreds);
-                    const matrixClient = initClient(homeserverUrl, accessToken, userId);
+                    const { homeserverUrl, userId, accessToken, deviceId } = JSON.parse(storedCreds);
+                    const matrixClient = initClient(homeserverUrl, accessToken, userId, deviceId);
                     await setupSession(matrixClient);
                 } catch (err: any) {
                     console.error("Auto-login failed:", err);
@@ -51,6 +52,7 @@ const App: React.FC = () => {
             homeserverUrl: newClient.getHomeserverUrl(),
             userId: newClient.getUserId(),
             accessToken: newClient.getAccessToken(),
+            deviceId: newClient.getDeviceId(),
         };
         localStorage.setItem('matrix-creds', JSON.stringify(creds));
         setError(null);

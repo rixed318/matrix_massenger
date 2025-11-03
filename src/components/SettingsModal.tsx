@@ -1,7 +1,9 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { MatrixClient } from '../types';
 import { mxcToHttp } from '../services/matrixService';
 import Avatar from './Avatar';
+import { DeviceVerification } from 'matrix-js-sdk/lib/models/device';
+import { CryptoEvent } from 'matrix-js-sdk/lib/crypto';
 
 interface SettingsModalProps {
     isOpen: boolean;
@@ -41,6 +43,24 @@ const BACKGROUNDS = [
     'https://www.transparenttextures.com/patterns/brushed-alum.png'
 ];
 
+interface SecurityDeviceSummary {
+    deviceId: string;
+    displayName: string;
+    fingerprint?: string;
+    verification: DeviceVerification;
+    isCurrent: boolean;
+}
+
+interface SecurityState {
+    loading: boolean;
+    devices: SecurityDeviceSummary[];
+    crossSigningReady: boolean;
+    keyBackupEnabled: boolean;
+    secretStorageReady: boolean;
+    keyBackupVersion?: string | null;
+    error?: string;
+}
+
 
 const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, onSave, client, notificationsEnabled, onSetNotificationsEnabled, chatBackground, onSetChatBackground, onResetChatBackground }) => {
     const user = client.getUser(client.getUserId());
@@ -50,6 +70,77 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, onSave, 
     const [currentTheme, setCurrentTheme] = useState(document.documentElement.className || '');
     const fileInputRef = useRef<HTMLInputElement>(null);
     const bgFileInputRef = useRef<HTMLInputElement>(null);
+    const [securityState, setSecurityState] = useState<SecurityState>({
+        loading: true,
+        devices: [],
+        crossSigningReady: false,
+        keyBackupEnabled: false,
+        secretStorageReady: false,
+        keyBackupVersion: null,
+    });
+    const [securityMessage, setSecurityMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+
+    const loadSecurityState = useCallback(async () => {
+        const crypto = client.getCrypto?.();
+        const userId = client.getUserId();
+        if (!crypto || !userId) {
+            setSecurityState(prev => ({
+                ...prev,
+                loading: false,
+                devices: [],
+                crossSigningReady: false,
+                keyBackupEnabled: false,
+                secretStorageReady: false,
+                keyBackupVersion: null,
+                error: crypto ? undefined : 'Encryption engine is not initialised.',
+            }));
+            return;
+        }
+
+        setSecurityState(prev => ({ ...prev, loading: true, error: undefined }));
+        try {
+            const deviceInfoMap = await crypto.getUserDeviceInfo([userId], true);
+            const userDevices = deviceInfoMap.get(userId);
+            const devices: SecurityDeviceSummary[] = userDevices
+                ? Array.from(userDevices.values()).map(device => ({
+                    deviceId: device.deviceId,
+                    displayName: device.displayName || 'Unnamed device',
+                    fingerprint: device.getFingerprint(),
+                    verification: device.verified,
+                    isCurrent: device.deviceId === client.getDeviceId(),
+                }))
+                : [];
+
+            const crossSigningReady = typeof crypto.isCrossSigningReady === 'function' ? await crypto.isCrossSigningReady() : false;
+            const secretStorageReady = typeof client.isSecretStorageReady === 'function' ? await client.isSecretStorageReady() : false;
+            let keyBackupVersion: string | null = null;
+            let keyBackupEnabled = false;
+            try {
+                keyBackupEnabled = Boolean(client.getKeyBackupEnabled());
+                const version = await client.getKeyBackupVersion();
+                keyBackupVersion = version?.version ?? null;
+            } catch (error) {
+                console.warn('Failed to query key backup status', error);
+            }
+
+            setSecurityState({
+                loading: false,
+                devices,
+                crossSigningReady,
+                keyBackupEnabled,
+                secretStorageReady,
+                keyBackupVersion,
+            });
+        } catch (error: any) {
+            console.error('Failed to load device verification state', error);
+            setSecurityState(prev => ({
+                ...prev,
+                loading: false,
+                devices: [],
+                error: error?.message || 'Unable to load security status.',
+            }));
+        }
+    }, [client]);
 
 
     useEffect(() => {
@@ -57,6 +148,23 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, onSave, 
         setAvatarPreview(mxcToHttp(client, user?.avatarUrl, 96));
         setAvatarFile(null);
     }, [isOpen, user, client]);
+
+    useEffect(() => {
+        if (isOpen) {
+            loadSecurityState();
+        }
+    }, [isOpen, loadSecurityState]);
+
+    useEffect(() => {
+        if (!isOpen) {
+            return;
+        }
+        const handler = () => loadSecurityState();
+        client.on(CryptoEvent.DeviceVerificationChanged, handler);
+        return () => {
+            client.removeListener(CryptoEvent.DeviceVerificationChanged, handler);
+        };
+    }, [client, isOpen, loadSecurityState]);
 
     if (!isOpen) return null;
 
@@ -81,6 +189,62 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, onSave, 
                 onSetChatBackground(dataUrl);
             };
             reader.readAsDataURL(file);
+        }
+    };
+
+    const verificationLabel = (verification: DeviceVerification): string => {
+        switch (verification) {
+            case DeviceVerification.Verified:
+                return 'Verified';
+            case DeviceVerification.Blocked:
+                return 'Blocked';
+            default:
+                return 'Unverified';
+        }
+    };
+
+    const verificationBadgeClass = (verification: DeviceVerification): string => {
+        switch (verification) {
+            case DeviceVerification.Verified:
+                return 'bg-emerald-500/10 text-emerald-300 border border-emerald-500/30';
+            case DeviceVerification.Blocked:
+                return 'bg-error/10 text-error border border-error/30';
+            default:
+                return 'bg-amber-500/10 text-amber-300 border border-amber-400/30';
+        }
+    };
+
+    const handleRequestVerification = async (deviceId: string) => {
+        if (!client.getUserId()) {
+            return;
+        }
+        try {
+            await client.requestVerification(client.getUserId()!, [deviceId]);
+            setSecurityMessage({ type: 'success', text: 'Verification request sent. Approve it on the other device to trust keys.' });
+        } catch (error: any) {
+            console.error('Failed to request verification', error);
+            setSecurityMessage({ type: 'error', text: error?.message || 'Unable to send verification request.' });
+        }
+    };
+
+    const handleRequestKeys = async () => {
+        try {
+            await client.checkOwnCrossSigningTrust({ allowPrivateKeyRequests: true });
+            setSecurityMessage({ type: 'success', text: 'Requested encryption keys from trusted devices.' });
+        } catch (error: any) {
+            console.error('Failed to request cross-signing secrets', error);
+            setSecurityMessage({ type: 'error', text: error?.message || 'Unable to request keys.' });
+        }
+    };
+
+    const handleBootstrapCrossSigning = async () => {
+        try {
+            await client.bootstrapCrossSigning({ setupNewKeyBackup: true });
+            setSecurityMessage({ type: 'success', text: 'Cross-signing has been initialised. Verify this device from a trusted session.' });
+            await loadSecurityState();
+        } catch (error: any) {
+            console.error('Failed to bootstrap cross-signing', error);
+            setSecurityMessage({ type: 'error', text: error?.message || 'Unable to bootstrap cross-signing.' });
         }
     };
 
@@ -200,6 +364,126 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, onSave, 
                                 <p className="text-text-secondary">Show a system notification for new messages and calls when the app is in the background.</p>
                             </div>
                         </div>
+                    </div>
+
+                    <div className="pt-6 border-t border-border-primary">
+                        <h3 className="text-lg font-semibold text-text-primary mb-3">Security &amp; Devices</h3>
+                        {securityMessage && (
+                            <div className={`rounded-md p-3 text-sm mb-3 ${securityMessage.type === 'success' ? 'bg-emerald-500/10 text-emerald-200 border border-emerald-500/30' : 'bg-error/10 text-error border border-error/40'}`}>
+                                {securityMessage.text}
+                            </div>
+                        )}
+                        {securityState.error && (
+                            <div className="rounded-md p-3 text-sm mb-3 bg-error/10 text-error border border-error/40">
+                                {securityState.error}
+                            </div>
+                        )}
+                        {securityState.loading ? (
+                            <div className="flex items-center gap-2 text-text-secondary text-sm">
+                                <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24">
+                                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                                </svg>
+                                Loading device security status...
+                            </div>
+                        ) : (
+                            <div className="space-y-4">
+                                <div className="grid grid-cols-1 gap-3">
+                                    <div className={`p-3 rounded-md border ${securityState.crossSigningReady ? 'border-emerald-500/40 bg-emerald-500/10' : 'border-amber-500/40 bg-amber-500/10'}`}>
+                                        <p className="text-sm font-semibold text-text-primary">Cross-signing</p>
+                                        <p className="text-xs text-text-secondary mt-1">
+                                            {securityState.crossSigningReady
+                                                ? 'Cross-signing keys are available on this device.'
+                                                : 'Cross-signing isn\'t trusted yet. Bootstrap it and verify from a trusted session.'}
+                                        </p>
+                                    </div>
+                                    <div className={`p-3 rounded-md border ${securityState.keyBackupEnabled ? 'border-emerald-500/40 bg-emerald-500/10' : 'border-amber-500/40 bg-amber-500/10'}`}>
+                                        <p className="text-sm font-semibold text-text-primary">Secure backup</p>
+                                        <p className="text-xs text-text-secondary mt-1">
+                                            {securityState.keyBackupEnabled
+                                                ? `Key backup is active${securityState.keyBackupVersion ? ` (version ${securityState.keyBackupVersion})` : ''}.`
+                                                : 'Key backup is disabled. Complete the recovery flow to protect message keys.'}
+                                        </p>
+                                    </div>
+                                    <div className={`p-3 rounded-md border ${securityState.secretStorageReady ? 'border-emerald-500/40 bg-emerald-500/10' : 'border-amber-500/40 bg-amber-500/10'}`}>
+                                        <p className="text-sm font-semibold text-text-primary">Secret storage</p>
+                                        <p className="text-xs text-text-secondary mt-1">
+                                            {securityState.secretStorageReady
+                                                ? 'Secret storage is ready and holds your recovery secrets.'
+                                                : 'Secret storage is not initialised yet. Back up your recovery key to finish setup.'}
+                                        </p>
+                                    </div>
+                                </div>
+
+                                {(!securityState.crossSigningReady || !securityState.keyBackupEnabled || !securityState.secretStorageReady) && (
+                                    <div className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-sm text-amber-200">
+                                        <p className="font-semibold mb-2">Complete verification to keep encrypted history safe:</p>
+                                        <ul className="list-disc ml-4 space-y-1">
+                                            <li>Accept verification requests from another trusted session or start one below.</li>
+                                            <li>Store the generated recovery key somewhere safe; you&apos;ll need it when restoring keys.</li>
+                                            <li>Keep at least one additional verified device available to share keys on demand.</li>
+                                        </ul>
+                                    </div>
+                                )}
+
+                                <div>
+                                    <h4 className="text-sm font-semibold text-text-primary mb-2">Your devices</h4>
+                                    <div className="space-y-3">
+                                        {securityState.devices.map(device => (
+                                            <div key={device.deviceId} className="border border-border-primary rounded-md p-3 flex flex-col gap-2 md:flex-row md:items-center md:justify-between bg-bg-tertiary/40">
+                                                <div>
+                                                    <p className="font-medium text-text-primary">
+                                                        {device.displayName}
+                                                        {device.isCurrent && <span className="text-xs text-accent ml-2">(This device)</span>}
+                                                    </p>
+                                                    <p className="text-xs text-text-secondary mt-1 break-all">ID: {device.deviceId}</p>
+                                                    {device.fingerprint && (
+                                                        <p className="text-xs text-text-secondary break-all">Fingerprint: {device.fingerprint}</p>
+                                                    )}
+                                                </div>
+                                                <div className="flex flex-col items-start md:items-end gap-2 w-full md:w-auto">
+                                                    <span className={`text-xs font-semibold px-2 py-1 rounded-full ${verificationBadgeClass(device.verification)}`}>
+                                                        {verificationLabel(device.verification)}
+                                                    </span>
+                                                    {device.verification === DeviceVerification.Unverified && (
+                                                        <button
+                                                            onClick={() => handleRequestVerification(device.deviceId)}
+                                                            className="text-xs font-medium px-3 py-1 rounded-md border border-accent text-accent hover:bg-accent/10 transition"
+                                                        >
+                                                            Request verification
+                                                        </button>
+                                                    )}
+                                                </div>
+                                            </div>
+                                        ))}
+                                        {securityState.devices.length === 0 && (
+                                            <p className="text-sm text-text-secondary">No other devices yet. Sign in elsewhere to see them listed here.</p>
+                                        )}
+                                    </div>
+                                </div>
+
+                                <div className="flex flex-wrap gap-2">
+                                    <button
+                                        onClick={handleBootstrapCrossSigning}
+                                        className="px-3 py-2 text-sm font-medium rounded-md border border-border-primary hover:bg-bg-tertiary transition"
+                                    >
+                                        Bootstrap cross-signing
+                                    </button>
+                                    <button
+                                        onClick={handleRequestKeys}
+                                        className="px-3 py-2 text-sm font-medium rounded-md border border-border-primary hover:bg-bg-tertiary transition"
+                                    >
+                                        Request keys from my devices
+                                    </button>
+                                    <button
+                                        onClick={loadSecurityState}
+                                        className="px-3 py-2 text-sm font-medium rounded-md border border-border-primary hover:bg-bg-tertiary transition"
+                                    >
+                                        Refresh status
+                                    </button>
+                                </div>
+                            </div>
+                        )}
                     </div>
                 </div>
                 <div className="bg-bg-hover px-6 py-4 flex justify-end gap-3 rounded-b-lg">
