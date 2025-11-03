@@ -16,13 +16,19 @@ const saveScheduledMessages = (messages: ScheduledMessage[]): void => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(messages));
 };
 
-export const addScheduledMessage = (roomId: string, content: string, sendAt: number): ScheduledMessage => {
+export const addScheduledMessage = (
+    roomId: string,
+    content: string,
+    sendAt: number,
+    threadRootId?: string
+): ScheduledMessage => {
     const messages = getScheduledMessages();
     const newMessage: ScheduledMessage = {
         id: `scheduled_${Date.now()}`,
         roomId,
         content,
         sendAt,
+        threadRootId,
     };
     saveScheduledMessages([...messages, newMessage]);
     return newMessage;

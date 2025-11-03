@@ -3,10 +3,11 @@ import React, { useState } from 'react';
 interface CreatePollModalProps {
     isOpen: boolean;
     onClose: () => void;
-    onCreate: (question: string, options: string[]) => void;
+    onCreate: (question: string, options: string[], threadRootId?: string) => void | Promise<void>;
+    threadRootId?: string;
 }
 
-const CreatePollModal: React.FC<CreatePollModalProps> = ({ isOpen, onClose, onCreate }) => {
+const CreatePollModal: React.FC<CreatePollModalProps> = ({ isOpen, onClose, onCreate, threadRootId }) => {
     const [question, setQuestion] = useState('');
     const [options, setOptions] = useState(['', '']);
     const [isCreating, setIsCreating] = useState(false);
@@ -41,7 +42,7 @@ const CreatePollModal: React.FC<CreatePollModalProps> = ({ isOpen, onClose, onCr
 
         setIsCreating(true);
         try {
-            await onCreate(trimmedQuestion, trimmedOptions);
+            await onCreate(trimmedQuestion, trimmedOptions, threadRootId);
             // Reset state for next time
             setQuestion('');
             setOptions(['', '']);
@@ -57,6 +58,11 @@ const CreatePollModal: React.FC<CreatePollModalProps> = ({ isOpen, onClose, onCr
                     <h2 className="text-xl font-bold">Create a Poll</h2>
                 </div>
                 <div className="p-6 space-y-6 max-h-[60vh] overflow-y-auto">
+                    {threadRootId && (
+                        <div className="p-3 rounded-md bg-indigo-900/30 border border-indigo-700/40 text-sm text-indigo-200">
+                            This poll will be posted in the current thread.
+                        </div>
+                    )}
                     <div>
                         <label htmlFor="pollQuestion" className="block text-sm font-medium text-gray-300 mb-1">
                             Question <span className="text-red-400">*</span>

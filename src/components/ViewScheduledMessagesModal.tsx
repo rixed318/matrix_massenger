@@ -28,9 +28,16 @@ const ViewScheduledMessagesModal: React.FC<ViewScheduledMessagesModalProps> = ({
                             <div key={msg.id} className="p-3 bg-gray-900/50 rounded-md">
                                 <p className="text-white break-words whitespace-pre-wrap">{msg.content}</p>
                                 <div className="flex items-center justify-between mt-2 pt-2 border-t border-gray-700/50">
-                                    <p className="text-sm text-indigo-300 font-medium">
-                                        {format(new Date(msg.sendAt), "MMM d, yyyy 'at' h:mm a")}
-                                    </p>
+                                    <div>
+                                        <p className="text-sm text-indigo-300 font-medium">
+                                            {format(new Date(msg.sendAt), "MMM d, yyyy 'at' h:mm a")}
+                                        </p>
+                                        {msg.threadRootId && (
+                                            <p className="text-xs text-gray-400 mt-1">
+                                                Thread: {msg.threadRootId.slice(0, 8)}…
+                                            </p>
+                                        )}
+                                    </div>
                                     <div className="flex items-center gap-2">
                                         <button onClick={() => onSendNow(msg.id)} className="text-sm text-gray-300 hover:text-white hover:underline">Send Now</button>
                                         <button onClick={() => onDelete(msg.id)} className="p-1 rounded-full text-gray-400 hover:text-red-400 hover:bg-gray-700">

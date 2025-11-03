@@ -1,5 +1,5 @@
-import React, { useRef, useEffect } from 'react';
-import { ActiveThread, MatrixClient, MatrixRoom, MatrixUser } from '../types';
+import React, { useRef, useEffect, useCallback } from 'react';
+import { ActiveThread, MatrixClient, MatrixRoom, MatrixUser, Sticker, Gif } from '../types';
 import ChatMessage from './ChatMessage';
 import MessageInput from './MessageInput';
 
@@ -10,9 +10,28 @@ interface ThreadViewProps {
     client: MatrixClient;
     onSendMessage: (content: string, threadRootId?: string) => Promise<void>;
     onImageClick: (url: string) => void;
+    onSendFile: (file: File, threadRootId: string) => Promise<void>;
+    onSendAudio: (file: Blob, duration: number, threadRootId: string) => Promise<void>;
+    onSendSticker: (sticker: Sticker, threadRootId: string) => Promise<void>;
+    onSendGif: (gif: Gif, threadRootId: string) => Promise<void>;
+    onOpenCreatePoll: (threadRootId: string) => void;
+    onSchedule: (content: string, threadRootId: string) => void;
 }
 
-const ThreadView: React.FC<ThreadViewProps> = ({ room, activeThread, onClose, client, onSendMessage, onImageClick }) => {
+const ThreadView: React.FC<ThreadViewProps> = ({
+    room,
+    activeThread,
+    onClose,
+    client,
+    onSendMessage,
+    onImageClick,
+    onSendFile,
+    onSendAudio,
+    onSendSticker,
+    onSendGif,
+    onOpenCreatePoll,
+    onSchedule,
+}) => {
     const scrollContainerRef = useRef<HTMLDivElement>(null);
 
     useEffect(() => {
@@ -21,10 +40,40 @@ const ThreadView: React.FC<ThreadViewProps> = ({ room, activeThread, onClose, cl
             behavior: 'smooth',
         });
     }, [activeThread.threadMessages]);
-    
+
     const handleSendMessageInThread = async (content: string) => {
         await onSendMessage(content, activeThread.rootMessage.id);
     };
+
+    const handleSendFileInThread = useCallback(
+        (file: File) => onSendFile(file, activeThread.rootMessage.id),
+        [onSendFile, activeThread.rootMessage.id]
+    );
+
+    const handleSendAudioInThread = useCallback(
+        (file: Blob, duration: number) => onSendAudio(file, duration, activeThread.rootMessage.id),
+        [onSendAudio, activeThread.rootMessage.id]
+    );
+
+    const handleSendStickerInThread = useCallback(
+        (sticker: Sticker) => onSendSticker(sticker, activeThread.rootMessage.id),
+        [onSendSticker, activeThread.rootMessage.id]
+    );
+
+    const handleSendGifInThread = useCallback(
+        (gif: Gif) => onSendGif(gif, activeThread.rootMessage.id),
+        [onSendGif, activeThread.rootMessage.id]
+    );
+
+    const handleOpenCreatePollInThread = useCallback(
+        () => onOpenCreatePoll(activeThread.rootMessage.id),
+        [onOpenCreatePoll, activeThread.rootMessage.id]
+    );
+
+    const handleScheduleInThread = useCallback(
+        (content: string) => onSchedule(content, activeThread.rootMessage.id),
+        [onSchedule, activeThread.rootMessage.id]
+    );
 
     // FIX: Get room members to pass to MessageInput for mentions.
     const roomMembers = room.getJoinedMembers().map(m => m.user).filter((u): u is MatrixUser => !!u);
@@ -91,15 +140,12 @@ const ThreadView: React.FC<ThreadViewProps> = ({ room, activeThread, onClose, cl
 
             <MessageInput
                 onSendMessage={handleSendMessageInThread}
-                onSendFile={() => { /* Not implemented for threads yet */ }}
-                onSendAudio={() => { /* Not implemented for threads yet */ }}
-                // FIX: The 'MessageInput' component requires 'onSendSticker' and 'onSendGif' props.
-                // Adding placeholder functions as this feature is not yet implemented for threads.
-                onSendSticker={() => { /* Not implemented for threads yet */ }}
-                onSendGif={() => { /* Not implemented for threads yet */ }}
-                onOpenCreatePoll={() => { /* Not implemented for threads yet */}}
-                // FIX: Add missing 'onSchedule' prop to satisfy the MessageInputProps interface.
-                onSchedule={() => { /* Not implemented for threads yet */}}
+                onSendFile={handleSendFileInThread}
+                onSendAudio={handleSendAudioInThread}
+                onSendSticker={handleSendStickerInThread}
+                onSendGif={handleSendGifInThread}
+                onOpenCreatePoll={handleOpenCreatePollInThread}
+                onSchedule={handleScheduleInThread}
                 isSending={false} // This needs more state management if we want fine-grained control
                 client={client}
                 roomId={room.roomId}

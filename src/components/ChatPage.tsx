@@ -47,10 +47,12 @@ const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoom
     const [isCreateRoomOpen, setIsCreateRoomOpen] = useState(false);
     const [isInviteUserOpen, setIsInviteUserOpen] = useState(false);
     const [isCreatePollOpen, setIsCreatePollOpen] = useState(false);
+    const [pollThreadRootId, setPollThreadRootId] = useState<string | undefined>(undefined);
     const [isManageFoldersOpen, setIsManageFoldersOpen] = useState(false);
     const [isScheduleModalOpen, setIsScheduleModalOpen] = useState(false);
     const [isViewScheduledModalOpen, setIsViewScheduledModalOpen] = useState(false);
     const [contentToSchedule, setContentToSchedule] = useState('');
+    const [scheduleThreadRootId, setScheduleThreadRootId] = useState<string | undefined>(undefined);
     const [allScheduledMessages, setAllScheduledMessages] = useState<ScheduledMessage[]>([]);
     const [userProfileVersion, setUserProfileVersion] = useState(0); // Used to force-refresh components
     const [isPaginating, setIsPaginating] = useState(false);
@@ -119,7 +121,7 @@ const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoom
                 dueMessages.forEach(async msg => {
                     try {
                         console.log(`Sending scheduled message ${msg.id} to room ${msg.roomId}`);
-                        await sendMessage(client, msg.roomId, msg.content);
+                        await sendMessage(client, msg.roomId, msg.content, undefined, msg.threadRootId);
                         deleteScheduledMessage(msg.id);
                     } catch (error) {
                         console.error(`Failed to send scheduled message ${msg.id}:`, error);
@@ -606,7 +608,7 @@ const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoom
         }
     };
     
-    const handleSendFile = async (file: File) => {
+    const handleSendFile = async (file: File, threadRootId?: string) => {
         if (!selectedRoomId) return;
 
         const tempId = `temp-file-${Date.now()}`;
@@ -621,8 +623,8 @@ const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoom
                 name: user?.displayName || 'Me',
                 avatarUrl: mxcToHttp(client, user?.avatarUrl),
             },
-            content: { 
-                body: file.name, 
+            content: {
+                body: file.name,
                 msgtype: isImage ? MsgType.Image : MsgType.File,
                 info: {
                     mimetype: file.type,
@@ -635,28 +637,49 @@ const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoom
             isUploading: true,
             localUrl: localUrl,
             threadReplyCount: 0,
+            threadRootId,
         };
 
-        setMessages(prev => [...prev, tempMessage]);
-        scrollToBottom();
+        if (threadRootId) {
+            setActiveThread(prev => {
+                if (!prev || prev.rootMessage.id !== threadRootId) return prev;
+                return {
+                    ...prev,
+                    threadMessages: [...prev.threadMessages, tempMessage],
+                };
+            });
+        } else {
+            setMessages(prev => [...prev, tempMessage]);
+            scrollToBottom();
+        }
 
         try {
             if (isImage) {
-                await sendImageMessage(client, selectedRoomId, file);
+                await sendImageMessage(client, selectedRoomId, file, threadRootId);
             } else {
-                await sendFileMessage(client, selectedRoomId, file);
+                await sendFileMessage(client, selectedRoomId, file, threadRootId);
             }
         } catch (error) {
             console.error('Failed to send file:', error);
-            setMessages(prev => prev.filter(m => m.id !== tempId));
+            if (threadRootId) {
+                setActiveThread(prev => {
+                    if (!prev || prev.rootMessage.id !== threadRootId) return prev;
+                    return {
+                        ...prev,
+                        threadMessages: prev.threadMessages.filter(m => m.id !== tempId),
+                    };
+                });
+            } else {
+                setMessages(prev => prev.filter(m => m.id !== tempId));
+            }
         } finally {
             if (localUrl) {
                 URL.revokeObjectURL(localUrl);
             }
         }
     };
-    
-    const handleSendAudio = async (file: Blob, duration: number) => {
+
+    const handleSendAudio = async (file: Blob, duration: number, threadRootId?: string) => {
         if (!selectedRoomId) return;
 
         const tempId = `temp-audio-${Date.now()}`;
@@ -685,34 +708,55 @@ const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoom
             isUploading: true,
             localUrl: localUrl,
             threadReplyCount: 0,
+            threadRootId,
         };
 
-        setMessages(prev => [...prev, tempMessage]);
-        scrollToBottom();
+        if (threadRootId) {
+            setActiveThread(prev => {
+                if (!prev || prev.rootMessage.id !== threadRootId) return prev;
+                return {
+                    ...prev,
+                    threadMessages: [...prev.threadMessages, tempMessage],
+                };
+            });
+        } else {
+            setMessages(prev => [...prev, tempMessage]);
+            scrollToBottom();
+        }
 
         try {
-            await sendAudioMessage(client, selectedRoomId, file, duration);
+            await sendAudioMessage(client, selectedRoomId, file, duration, threadRootId);
         } catch (error) {
             console.error('Failed to send audio message:', error);
-            setMessages(prev => prev.filter(m => m.id !== tempId));
+            if (threadRootId) {
+                setActiveThread(prev => {
+                    if (!prev || prev.rootMessage.id !== threadRootId) return prev;
+                    return {
+                        ...prev,
+                        threadMessages: prev.threadMessages.filter(m => m.id !== tempId),
+                    };
+                });
+            } else {
+                setMessages(prev => prev.filter(m => m.id !== tempId));
+            }
         } finally {
             URL.revokeObjectURL(localUrl);
         }
     };
-    
-    const handleSendSticker = async (sticker: Sticker) => {
+
+    const handleSendSticker = async (sticker: Sticker, threadRootId?: string) => {
         if (!selectedRoomId) return;
         try {
-            await sendStickerMessage(client, selectedRoomId, sticker.url, sticker.body, sticker.info);
+            await sendStickerMessage(client, selectedRoomId, sticker.url, sticker.body, sticker.info, threadRootId);
         } catch (error) {
             console.error('Failed to send sticker:', error);
         }
     };
 
-    const handleSendGif = async (gif: Gif) => {
+    const handleSendGif = async (gif: Gif, threadRootId?: string) => {
         if (!selectedRoomId) return;
         try {
-            await sendGifMessage(client, selectedRoomId, gif);
+            await sendGifMessage(client, selectedRoomId, gif, threadRootId);
         } catch (error) {
             console.error('Failed to send GIF:', error);
         }
@@ -835,13 +879,15 @@ const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoom
         setActiveThread(null);
     };
 
-    const handleCreatePoll = async (question: string, options: string[]) => {
+    const handleCreatePoll = async (question: string, options: string[], threadRootId?: string) => {
         if (!selectedRoomId || !question.trim() || options.length < 2) return;
         try {
-            await sendPollStart(client, selectedRoomId, question, options);
-            setIsCreatePollOpen(false);
+            await sendPollStart(client, selectedRoomId, question, options, threadRootId);
         } catch (error) {
             console.error("Failed to create poll:", error);
+        } finally {
+            setIsCreatePollOpen(false);
+            setPollThreadRootId(undefined);
         }
     };
 
@@ -853,21 +899,39 @@ const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoom
             console.error("Failed to vote in poll:", error);
         }
     };
-    
-    const handleOpenScheduleModal = (content: string) => {
+
+    const handleOpenCreatePollModal = (threadRootId?: string) => {
+        setPollThreadRootId(threadRootId);
+        setIsCreatePollOpen(true);
+    };
+
+    const handleCloseCreatePollModal = () => {
+        setIsCreatePollOpen(false);
+        setPollThreadRootId(undefined);
+    };
+
+    const handleOpenScheduleModal = (content: string, threadRootId?: string) => {
         setContentToSchedule(content);
+        setScheduleThreadRootId(threadRootId);
         setIsScheduleModalOpen(true);
     };
-    
-    const handleConfirmSchedule = (sendAt: number) => {
+
+    const handleConfirmSchedule = (sendAt: number, threadRootId?: string) => {
         if (selectedRoomId) {
-            addScheduledMessage(selectedRoomId, contentToSchedule, sendAt);
+            addScheduledMessage(selectedRoomId, contentToSchedule, sendAt, threadRootId);
             setAllScheduledMessages(getScheduledMessages());
         }
         setIsScheduleModalOpen(false);
         setContentToSchedule('');
+        setScheduleThreadRootId(undefined);
     };
     
+    const handleCloseScheduleModal = () => {
+        setIsScheduleModalOpen(false);
+        setContentToSchedule('');
+        setScheduleThreadRootId(undefined);
+    };
+
     const handleDeleteScheduled = (id: string) => {
         deleteScheduledMessage(id);
         setAllScheduledMessages(getScheduledMessages());
@@ -876,7 +940,7 @@ const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoom
     const handleSendScheduledNow = async (id: string) => {
         const msg = allScheduledMessages.find(m => m.id === id);
         if (msg) {
-            await sendMessage(client, msg.roomId, msg.content);
+            await sendMessage(client, msg.roomId, msg.content, undefined, msg.threadRootId);
             handleDeleteScheduled(id);
         }
     };
@@ -950,6 +1014,7 @@ const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoom
     const matrixRoom = selectedRoomId ? client.getRoom(selectedRoomId) : null;
     const canInvite = matrixRoom?.canInvite(client.getUserId()!) || false;
     const scheduledForThisRoom = allScheduledMessages.filter(m => m.roomId === selectedRoomId);
+    const scheduledForMainTimeline = scheduledForThisRoom.filter(m => !m.threadRootId);
 
     return (
         <div className="flex h-screen">
@@ -980,7 +1045,7 @@ const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoom
                             onOpenInvite={() => setIsInviteUserOpen(true)}
                             pinnedMessage={pinnedMessage}
                             onPinToggle={handlePinToggle}
-                            scheduledMessageCount={scheduledForThisRoom.length}
+                            scheduledMessageCount={scheduledForMainTimeline.length}
                             onOpenViewScheduled={() => setIsViewScheduledModalOpen(true)}
                             isDirectMessageRoom={selectedRoom.isDirectMessageRoom}
                             onPlaceCall={handlePlaceCall}
@@ -1024,7 +1089,7 @@ const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoom
                             onSendAudio={handleSendAudio}
                             onSendSticker={handleSendSticker}
                             onSendGif={handleSendGif}
-                            onOpenCreatePoll={() => setIsCreatePollOpen(true)}
+                            onOpenCreatePoll={() => handleOpenCreatePollModal()}
                             onSchedule={handleOpenScheduleModal}
                             isSending={isSending}
                             client={client}
@@ -1045,6 +1110,12 @@ const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoom
                     client={client}
                     onSendMessage={handleSendMessage}
                     onImageClick={setViewingImageUrl}
+                    onSendFile={(file, threadRootId) => handleSendFile(file, threadRootId)}
+                    onSendAudio={(file, duration, threadRootId) => handleSendAudio(file, duration, threadRootId)}
+                    onSendSticker={(sticker, threadRootId) => handleSendSticker(sticker, threadRootId)}
+                    onSendGif={(gif, threadRootId) => handleSendGif(gif, threadRootId)}
+                    onOpenCreatePoll={(threadRootId) => handleOpenCreatePollModal(threadRootId)}
+                    onSchedule={(content, threadRootId) => handleOpenScheduleModal(content, threadRootId)}
                 />
             )}
 
@@ -1072,8 +1143,9 @@ const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoom
              {isCreatePollOpen && (
                 <CreatePollModal
                     isOpen={isCreatePollOpen}
-                    onClose={() => setIsCreatePollOpen(false)}
+                    onClose={handleCloseCreatePollModal}
                     onCreate={handleCreatePoll}
+                    threadRootId={pollThreadRootId}
                 />
             )}
             
@@ -1090,9 +1162,10 @@ const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoom
              {isScheduleModalOpen && (
                 <ScheduleMessageModal
                     isOpen={isScheduleModalOpen}
-                    onClose={() => setIsScheduleModalOpen(false)}
+                    onClose={handleCloseScheduleModal}
                     onConfirm={handleConfirmSchedule}
                     messageContent={contentToSchedule}
+                    threadRootId={scheduleThreadRootId}
                 />
             )}
             

@@ -113,6 +113,7 @@ export interface ScheduledMessage {
   roomId: string;
   content: string;
   sendAt: number; // timestamp
+  threadRootId?: string;
 }
 
 export interface Sticker {

@@ -213,7 +213,12 @@ export const compressImage = (file: File, maxWidth = 1280): Promise<File> => {
 };
 
 
-export const sendImageMessage = async (client: MatrixClient, roomId: string, file: File): Promise<{ event_id: string }> => {
+export const sendImageMessage = async (
+    client: MatrixClient,
+    roomId: string,
+    file: File,
+    threadRootId?: string
+): Promise<{ event_id: string }> => {
     const compressedFile = await compressImage(file);
 
     const { content_uri: mxcUrl } = await client.uploadContent(compressedFile, {
@@ -221,7 +226,7 @@ export const sendImageMessage = async (client: MatrixClient, roomId: string, fil
         type: compressedFile.type,
     });
 
-    const content = {
+    const content: any = {
         body: compressedFile.name,
         info: {
             mimetype: compressedFile.type,
@@ -231,16 +236,32 @@ export const sendImageMessage = async (client: MatrixClient, roomId: string, fil
         url: mxcUrl,
     };
 
+    if (threadRootId) {
+        content['m.relates_to'] = {
+            'rel_type': 'm.thread',
+            'event_id': threadRootId,
+            'm.in_reply_to': {
+                'event_id': threadRootId,
+            },
+        };
+    }
+
     return client.sendEvent(roomId, EventType.RoomMessage, content as any);
 };
 
-export const sendAudioMessage = async (client: MatrixClient, roomId: string, file: Blob, duration: number): Promise<{ event_id: string }> => {
+export const sendAudioMessage = async (
+    client: MatrixClient,
+    roomId: string,
+    file: Blob,
+    duration: number,
+    threadRootId?: string
+): Promise<{ event_id: string }> => {
     const { content_uri: mxcUrl } = await client.uploadContent(file, {
         name: "voice-message.ogg",
         type: file.type,
     });
 
-    const content = {
+    const content: any = {
         body: "Voice Message",
         info: {
             mimetype: file.type,
@@ -251,17 +272,32 @@ export const sendAudioMessage = async (client: MatrixClient, roomId: string, fil
         url: mxcUrl,
     };
 
+    if (threadRootId) {
+        content['m.relates_to'] = {
+            'rel_type': 'm.thread',
+            'event_id': threadRootId,
+            'm.in_reply_to': {
+                'event_id': threadRootId,
+            },
+        };
+    }
+
     return client.sendEvent(roomId, EventType.RoomMessage, content as any);
 };
 
 
-export const sendFileMessage = async (client: MatrixClient, roomId: string, file: File): Promise<{ event_id: string }> => {
+export const sendFileMessage = async (
+    client: MatrixClient,
+    roomId: string,
+    file: File,
+    threadRootId?: string
+): Promise<{ event_id: string }> => {
     const { content_uri: mxcUrl } = await client.uploadContent(file, {
         name: file.name,
         type: file.type,
     });
 
-    const content = {
+    const content: any = {
         body: file.name,
         info: {
             mimetype: file.type,
@@ -271,21 +307,53 @@ export const sendFileMessage = async (client: MatrixClient, roomId: string, file
         url: mxcUrl,
     };
 
+    if (threadRootId) {
+        content['m.relates_to'] = {
+            'rel_type': 'm.thread',
+            'event_id': threadRootId,
+            'm.in_reply_to': {
+                'event_id': threadRootId,
+            },
+        };
+    }
+
     return client.sendEvent(roomId, EventType.RoomMessage, content as any);
 };
 
-export const sendStickerMessage = async (client: MatrixClient, roomId: string, stickerUrl: string, body: string, info: Sticker['info']): Promise<{ event_id: string }> => {
-    const content = {
+export const sendStickerMessage = async (
+    client: MatrixClient,
+    roomId: string,
+    stickerUrl: string,
+    body: string,
+    info: Sticker['info'],
+    threadRootId?: string
+): Promise<{ event_id: string }> => {
+    const content: any = {
         body,
         info,
         url: stickerUrl,
         msgtype: 'm.sticker',
     };
+
+    if (threadRootId) {
+        content['m.relates_to'] = {
+            'rel_type': 'm.thread',
+            'event_id': threadRootId,
+            'm.in_reply_to': {
+                'event_id': threadRootId,
+            },
+        };
+    }
     // The matrix-js-sdk doesn't have m.sticker in its standard event types, so we cast to any.
     return client.sendEvent(roomId, 'm.sticker' as any, content);
 };
 
-export const sendGifMessage = async (client: MatrixClient, roomId: string, gif: Gif): Promise<{ event_id: string }> => {
+export const sendGifMessage = async (
+    client: MatrixClient,
+    roomId: string,
+    gif: Gif,
+    threadRootId?: string
+): Promise<{ event_id: string }> => {
     // We send GIFs as m.image events. We add a custom flag to help our UI distinguish it.
     const { url, title, dims } = gif;
     
@@ -299,7 +367,7 @@ export const sendGifMessage = async (client: MatrixClient, roomId: string, gif: 
         type: 'image/gif',
     });
 
-    const content = {
+    const content: any = {
         body: title,
         info: {
             mimetype: 'image/gif',
@@ -310,6 +378,16 @@ export const sendGifMessage = async (client: MatrixClient, roomId: string, gif: 
         msgtype: MsgType.Image,
         url: mxcUrl,
     };
+
+    if (threadRootId) {
+        content['m.relates_to'] = {
+            'rel_type': 'm.thread',
+            'event_id': threadRootId,
+            'm.in_reply_to': {
+                'event_id': threadRootId,
+            },
+        };
+    }
 
     return client.sendEvent(roomId, EventType.RoomMessage, content as any);
 };
@@ -479,13 +557,19 @@ export const paginateRoomHistory = async (client: MatrixClient, room: MatrixRoom
     }
 };
 
-export const sendPollStart = async (client: MatrixClient, roomId: string, question: string, options: string[]): Promise<{ event_id: string }> => {
+export const sendPollStart = async (
+    client: MatrixClient,
+    roomId: string,
+    question: string,
+    options: string[],
+    threadRootId?: string
+): Promise<{ event_id: string }> => {
     const answers = options.map((opt, i) => ({
         id: `option_${i}_${Date.now()}`,
         'org.matrix.msc1767.text': opt,
     }));
     
-    const content = {
+    const content: any = {
         'org.matrix.msc1767.text': `[POLL] ${question}`,
         'm.poll.start': { // Using stable prefix
             question: {
@@ -495,7 +579,17 @@ export const sendPollStart = async (client: MatrixClient, roomId: string, questi
         },
         "msgtype": "m.text"
     };
-    
+
+    if (threadRootId) {
+        content['m.relates_to'] = {
+            'rel_type': 'm.thread',
+            'event_id': threadRootId,
+            'm.in_reply_to': {
+                'event_id': threadRootId,
+            },
+        };
+    }
+
     // FIX: Cast custom event type to `any` to bypass strict SDK type checks.
     // Using custom event type as it might not be in the SDK's EventType enum
     return client.sendEvent(roomId, 'm.poll.start' as any, content);

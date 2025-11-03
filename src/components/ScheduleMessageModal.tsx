@@ -3,11 +3,12 @@ import React, { useState } from 'react';
 interface ScheduleMessageModalProps {
     isOpen: boolean;
     onClose: () => void;
-    onConfirm: (sendAt: number) => void;
+    onConfirm: (sendAt: number, threadRootId?: string) => void;
     messageContent: string;
+    threadRootId?: string;
 }
 
-const ScheduleMessageModal: React.FC<ScheduleMessageModalProps> = ({ isOpen, onClose, onConfirm, messageContent }) => {
+const ScheduleMessageModal: React.FC<ScheduleMessageModalProps> = ({ isOpen, onClose, onConfirm, messageContent, threadRootId }) => {
     const now = new Date();
     // Set default to 5 minutes in the future
     now.setMinutes(now.getMinutes() + 5);
@@ -21,7 +22,7 @@ const ScheduleMessageModal: React.FC<ScheduleMessageModalProps> = ({ isOpen, onC
     const handleConfirm = () => {
         const selectedDate = new Date(dateTime);
         if (selectedDate.getTime() > Date.now()) {
-            onConfirm(selectedDate.getTime());
+            onConfirm(selectedDate.getTime(), threadRootId);
         } else {
             // TODO: Show an error to the user
             alert("Please select a time in the future.");
@@ -38,6 +39,11 @@ const ScheduleMessageModal: React.FC<ScheduleMessageModalProps> = ({ isOpen, onC
                     <h2 className="text-xl font-bold">Schedule Message</h2>
                 </div>
                 <div className="p-6 space-y-6">
+                    {threadRootId && (
+                        <div className="p-3 rounded-md bg-indigo-900/30 border border-indigo-700/40 text-sm text-indigo-200">
+                            This message will be scheduled inside the active thread.
+                        </div>
+                    )}
                     <div>
                         <p className="text-sm text-gray-400 mb-1">Message:</p>
                         <p className="p-3 bg-gray-900/50 rounded-md text-white truncate">{messageContent}</p>
