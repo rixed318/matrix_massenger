@@ -18,13 +18,15 @@ interface MessageInputProps {
     replyingTo: Message | null;
     onCancelReply: () => void;
     roomMembers: MatrixUser[];
+    draftContent: string;
+    onDraftChange: (content: string) => void;
 }
 
-const MessageInput: React.FC<MessageInputProps> = ({ 
-    onSendMessage, onSendFile, onSendAudio, onSendSticker, onSendGif, onOpenCreatePoll, onSchedule, 
-    isSending, client, roomId, replyingTo, onCancelReply, roomMembers 
+const MessageInput: React.FC<MessageInputProps> = ({
+    onSendMessage, onSendFile, onSendAudio, onSendSticker, onSendGif, onOpenCreatePoll, onSchedule,
+    isSending, client, roomId, replyingTo, onCancelReply, roomMembers, draftContent, onDraftChange
 }) => {
-    const [content, setContent] = useState('');
+    const [content, setContent] = useState(draftContent || '');
     const [isRecording, setIsRecording] = useState(false);
     const [recordingTime, setRecordingTime] = useState(0);
     const [showMentions, setShowMentions] = useState(false);
@@ -47,6 +49,15 @@ const MessageInput: React.FC<MessageInputProps> = ({
             inputRef.current?.focus();
         }
     }, [replyingTo]);
+
+    useEffect(() => {
+        setContent(draftContent || '');
+    }, [draftContent, roomId]);
+
+    useEffect(() => {
+        if (!roomId) return;
+        onDraftChange(content);
+    }, [content, roomId, onDraftChange]);
 
     useEffect(() => {
         if (!roomId) return;
@@ -91,7 +102,6 @@ const MessageInput: React.FC<MessageInputProps> = ({
             if (typingTimeoutRef.current) window.clearTimeout(typingTimeoutRef.current);
             sendTypingIndicator(client, roomId, false);
             onSendMessage(content);
-            setContent('');
         }
     };
     
