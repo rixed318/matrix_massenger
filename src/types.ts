@@ -113,6 +113,18 @@ export interface ScheduledMessage {
   roomId: string;
   content: string;
   sendAt: number; // timestamp
+  /**
+   * Absolute UTC timestamp representation of the scheduled moment. This is stored for
+   * compatibility with older clients that only used `sendAt` as a local timestamp.
+   */
+  sendAtUtc?: number;
+  /** Timezone offset (in minutes) of the client that created the schedule. */
+  timezoneOffset?: number;
+  status?: 'pending' | 'retrying' | 'sent';
+  attempts?: number;
+  lastError?: string;
+  sentAt?: number;
+  nextRetryAt?: number;
 }
 
 export interface Sticker {
