@@ -27,11 +27,12 @@ interface ChatMessageProps {
     onPinToggle: () => void;
     onTranslateMessage: (messageId: string, text: string) => void;
     translatedMessage?: { text: string; isLoading: boolean; };
+    isHighlighted?: boolean;
 }
 
-const ChatMessage: React.FC<ChatMessageProps> = ({ 
+const ChatMessage: React.FC<ChatMessageProps> = ({
     message, client, onReaction, onEdit, onDelete, onSetReplyTo, onForward, onImageClick, onOpenThread, onPollVote,
-    isPinned, canPin, onPinToggle, onTranslateMessage, translatedMessage
+    isPinned, canPin, onPinToggle, onTranslateMessage, translatedMessage, isHighlighted
 }) => {
     const [isPickerOpen, setPickerOpen] = useState(false);
     const [isEditing, setIsEditing] = useState(false);
@@ -272,13 +273,13 @@ const ChatMessage: React.FC<ChatMessageProps> = ({
 
     const messageContainerClass = message.isSticker || message.isGif
         ? '' // No padding/bg for stickers/gifs
-        : `p-2 rounded-lg max-w-lg ${isOwn ? 'bg-accent text-text-inverted rounded-br-none' : 'bg-bg-primary text-text-primary rounded-bl-none'} ${isPinned ? 'ring-2 ring-yellow-400' : ''}`;
+        : `p-2 rounded-lg max-w-lg ${isOwn ? 'bg-accent text-text-inverted rounded-br-none' : 'bg-bg-primary text-text-primary rounded-bl-none'} ${isPinned ? 'ring-2 ring-yellow-400' : ''} ${isHighlighted ? 'ring-2 ring-accent shadow-lg animate-pulse' : ''}`;
 
 
     return (
-        <div className={`group flex items-start gap-3 relative ${isOwn ? 'flex-row-reverse' : ''}`}>
+        <div id={`message-${message.id}`} className={`group flex items-start gap-3 relative ${isOwn ? 'flex-row-reverse' : ''}`}>
             {!isOwn && <Avatar name={message.sender.name} imageUrl={message.sender.avatarUrl} size="sm" />}
-            
+
             <div className={`absolute top-[-10px] flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity z-10 ${isOwn ? 'left-[-244px]' : 'right-[-216px]'}`}>
                 {!isEditing && !message.isRedacted && (
                     <>

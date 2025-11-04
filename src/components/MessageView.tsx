@@ -23,14 +23,15 @@ interface MessageViewProps {
     pinnedEventIds: string[];
     canPin: boolean;
     onPinToggle: (messageId: string) => void;
+    highlightedMessageId?: string | null;
 }
 
-const MessageView: React.FC<MessageViewProps> = ({ 
-    messages, client, onReaction, onEditMessage, onDeleteMessage, 
+const MessageView: React.FC<MessageViewProps> = ({
+    messages, client, onReaction, onEditMessage, onDeleteMessage,
     onSetReplyTo, onForwardMessage, onImageClick, onOpenThread, onPollVote,
     onTranslateMessage, translatedMessages,
     scrollContainerRef, onScroll, onPaginate, isPaginating, canPaginate,
-    pinnedEventIds, canPin, onPinToggle
+    pinnedEventIds, canPin, onPinToggle, highlightedMessageId
 }) => {
     
     const handleScroll = () => {
@@ -54,9 +55,9 @@ const MessageView: React.FC<MessageViewProps> = ({
                 </div>
             )}
             {messages.map((msg) => (
-                <ChatMessage 
-                    key={msg.id} 
-                    message={msg} 
+                <ChatMessage
+                    key={msg.id}
+                    message={msg}
                     client={client}
                     onReaction={(emoji, reaction) => onReaction(msg.id, emoji, reaction)}
                     onEdit={onEditMessage}
@@ -71,6 +72,7 @@ const MessageView: React.FC<MessageViewProps> = ({
                     onPinToggle={() => onPinToggle(msg.id)}
                     onTranslateMessage={onTranslateMessage}
                     translatedMessage={translatedMessages[msg.id]}
+                    isHighlighted={highlightedMessageId === msg.id}
                 />
             ))}
         </div>
