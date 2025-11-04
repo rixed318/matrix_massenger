@@ -6,7 +6,15 @@ import MessageView from './MessageView';
 import ChatHeader from './ChatHeader';
 import MessageInput from './MessageInput';
 import { mxcToHttp, sendReaction, sendTypingIndicator, editMessage, sendMessage, deleteMessage, sendImageMessage, sendReadReceipt, sendFileMessage, setDisplayName, setAvatar, createRoom, inviteUser, forwardMessage, paginateRoomHistory, sendAudioMessage, setPinnedMessages, sendPollStart, sendPollResponse, translateText, sendStickerMessage, sendGifMessage } from '../services/matrixService';
-import { getScheduledMessages, addScheduledMessage, deleteScheduledMessage } from '../services/schedulerService';
+import {
+    getScheduledMessages,
+    addScheduledMessage,
+    deleteScheduledMessage,
+    markScheduledMessageSent,
+    recordScheduledMessageError,
+    parseScheduledMessagesFromEvent,
+    SCHEDULED_MESSAGES_EVENT_TYPE,
+} from '../services/schedulerService';
 import { checkPermission, sendNotification, setupNotificationListeners } from '../services/notificationService';
 import WelcomeView from './WelcomeView';
 import SettingsModal from './SettingsModal';
@@ -175,8 +183,39 @@ const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoom
 
     // Load scheduled messages on startup
     useEffect(() => {
-        setAllScheduledMessages(getScheduledMessages());
-    }, []);
+        let isMounted = true;
+
+        const loadScheduled = async () => {
+            try {
+                const messages = await getScheduledMessages(client);
+                if (isMounted) {
+                    setAllScheduledMessages(messages);
+                }
+            } catch (error) {
+                console.error('Failed to load scheduled messages from account data', error);
+            }
+        };
+
+        void loadScheduled();
+
+        const handleAccountData = (event: MatrixEvent) => {
+            if (event.getType() !== SCHEDULED_MESSAGES_EVENT_TYPE) {
+                return;
+            }
+
+            const messages = parseScheduledMessagesFromEvent(event);
+            if (isMounted) {
+                setAllScheduledMessages(messages);
+            }
+        };
+
+        client.on(ClientEvent.AccountData, handleAccountData);
+
+        return () => {
+            isMounted = false;
+            client.removeListener(ClientEvent.AccountData, handleAccountData);
+        };
+    }, [client]);
 
     // Load chat background on startup
     useEffect(() => {
@@ -198,26 +237,68 @@ const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoom
 
     // Scheduler check loop
     useEffect(() => {
-        const interval = setInterval(() => {
-            const now = Date.now();
-            const dueMessages = getScheduledMessages().filter(m => m.sendAt <= now);
+        let isDisposed = false;
+        let isProcessing = false;
 
-            if (dueMessages.length > 0) {
-                dueMessages.forEach(async msg => {
-                    try {
-                        console.log(`Sending scheduled message ${msg.id} to room ${msg.roomId}`);
-                        await sendMessage(client, msg.roomId, msg.content);
-                        deleteScheduledMessage(msg.id);
-                    } catch (error) {
-                        console.error(`Failed to send scheduled message ${msg.id}:`, error);
-                    }
-                });
-                // Refresh state after sending/deleting
-                setAllScheduledMessages(getScheduledMessages());
+        const resolveScheduledTime = (message: ScheduledMessage): number => {
+            const baseUtc =
+                message.sendAtUtc ??
+                (typeof message.timezoneOffset === 'number'
+                    ? message.sendAt + message.timezoneOffset * 60_000
+                    : message.sendAt);
+
+            if (typeof message.nextRetryAt === 'number') {
+                return message.nextRetryAt;
             }
-        }, 5000); // Check every 5 seconds
 
-        return () => clearInterval(interval);
+            return baseUtc;
+        };
+
+        const tick = async () => {
+            if (isProcessing) return;
+            isProcessing = true;
+
+            try {
+                const messages = await getScheduledMessages(client);
+                const nowUtc = Date.now();
+
+                for (const message of messages) {
+                    if (isDisposed) {
+                        break;
+                    }
+
+                    if (message.status === 'sent') {
+                        continue;
+                    }
+
+                    const dueAt = resolveScheduledTime(message);
+                    if (dueAt > nowUtc) {
+                        continue;
+                    }
+
+                    try {
+                        console.log(`Sending scheduled message ${message.id} to room ${message.roomId}`);
+                        await sendMessage(client, message.roomId, message.content);
+                        await markScheduledMessageSent(client, message.id);
+                    } catch (error) {
+                        console.error(`Failed to send scheduled message ${message.id}:`, error);
+                        await recordScheduledMessageError(client, message.id, error);
+                    }
+                }
+            } finally {
+                isProcessing = false;
+            }
+        };
+
+        void tick();
+        const interval = window.setInterval(() => {
+            void tick();
+        }, 5000);
+
+        return () => {
+            isDisposed = true;
+            window.clearInterval(interval);
+        };
     }, [client]);
 
 
@@ -1070,25 +1151,46 @@ const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoom
         setIsScheduleModalOpen(true);
     };
     
-    const handleConfirmSchedule = (sendAt: number) => {
+    const handleConfirmSchedule = async (sendAt: number) => {
         if (selectedRoomId) {
-            addScheduledMessage(selectedRoomId, contentToSchedule, sendAt);
-            setAllScheduledMessages(getScheduledMessages());
+            try {
+                await addScheduledMessage(client, selectedRoomId, contentToSchedule, sendAt);
+                setAllScheduledMessages(await getScheduledMessages(client));
+            } catch (error) {
+                console.error('Failed to schedule message', error);
+            }
         }
         setIsScheduleModalOpen(false);
         setContentToSchedule('');
     };
-    
-    const handleDeleteScheduled = (id: string) => {
-        deleteScheduledMessage(id);
-        setAllScheduledMessages(getScheduledMessages());
+
+    const handleDeleteScheduled = async (id: string) => {
+        try {
+            await deleteScheduledMessage(client, id);
+            setAllScheduledMessages(await getScheduledMessages(client));
+        } catch (error) {
+            console.error(`Failed to delete scheduled message ${id}`, error);
+        }
     };
 
     const handleSendScheduledNow = async (id: string) => {
         const msg = allScheduledMessages.find(m => m.id === id);
-        if (msg) {
+        if (!msg) {
+            return;
+        }
+
+        try {
             await sendMessage(client, msg.roomId, msg.content);
-            handleDeleteScheduled(id);
+            await markScheduledMessageSent(client, msg.id);
+        } catch (error) {
+            console.error(`Failed to send scheduled message ${id} immediately:`, error);
+            await recordScheduledMessageError(client, id, error);
+        } finally {
+            try {
+                setAllScheduledMessages(await getScheduledMessages(client));
+            } catch (loadError) {
+                console.error('Failed to refresh scheduled messages after manual send', loadError);
+            }
         }
     };
 
@@ -1160,7 +1262,9 @@ const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoom
     const savedMessagesRoom = rooms.find(r => r.roomId === savedMessagesRoomId);
     const matrixRoom = selectedRoomId ? client.getRoom(selectedRoomId) : null;
     const canInvite = matrixRoom?.canInvite(client.getUserId()!) || false;
-    const scheduledForThisRoom = allScheduledMessages.filter(m => m.roomId === selectedRoomId);
+    const scheduledForThisRoom = selectedRoomId
+        ? allScheduledMessages.filter(m => m.roomId === selectedRoomId && m.status !== 'sent')
+        : [];
 
     return (
         <div className="flex h-screen">
