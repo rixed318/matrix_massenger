@@ -1,8 +1,17 @@
 import React, { useState, useEffect } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import LoginPage from './components/LoginPage';
 import ChatPage from './components/ChatPage';
 import { MatrixClient } from './types';
 import { initClient, findOrCreateSavedMessagesRoom } from './services/matrixService';
+
+type StoredCredentials = {
+    homeserver_url: string;
+    user_id: string;
+    access_token: string;
+};
+
+const LEGACY_CREDENTIALS_KEY = 'matrix-creds';
 
 const App: React.FC = () => {
     const [client, setClient] = useState<MatrixClient | null>(null);
@@ -23,36 +32,68 @@ const App: React.FC = () => {
     };
 
     useEffect(() => {
-        const attemptAutoLogin = async () => {
-            const storedCreds = localStorage.getItem('matrix-creds');
-            if (storedCreds) {
-                try {
-                    const { homeserverUrl, userId, accessToken } = JSON.parse(storedCreds);
-                    const matrixClient = initClient(homeserverUrl, accessToken, userId);
-                    await setupSession(matrixClient);
-                } catch (err: any) {
-                    console.error("Auto-login failed:", err);
-                    localStorage.removeItem('matrix-creds');
-                     if (err.message?.includes('M_UNKNOWN_TOKEN')) {
-                        setError("Your session has expired. Please log in again.");
-                    } else {
-                        setError("Failed to restore session. Please log in again.");
-                    }
-                }
+        const migrateLegacyCredentials = async () => {
+            const storedCreds = localStorage.getItem(LEGACY_CREDENTIALS_KEY);
+            if (!storedCreds) {
+                return;
             }
-            setIsLoading(false);
+            try {
+                const { homeserverUrl, userId, accessToken } = JSON.parse(storedCreds);
+                await invoke('save_credentials', {
+                    creds: {
+                        homeserver_url: homeserverUrl,
+                        user_id: userId,
+                        access_token: accessToken,
+                    },
+                });
+            } catch (err) {
+                console.warn('Failed to migrate legacy credentials', err);
+            } finally {
+                localStorage.removeItem(LEGACY_CREDENTIALS_KEY);
+            }
+        };
+
+        const attemptAutoLogin = async () => {
+            await migrateLegacyCredentials();
+            try {
+                const storedCreds = await invoke<StoredCredentials | null>('load_credentials');
+                if (storedCreds) {
+                    const matrixClient = initClient(
+                        storedCreds.homeserver_url,
+                        storedCreds.access_token,
+                        storedCreds.user_id
+                    );
+                    await setupSession(matrixClient);
+                }
+            } catch (err: any) {
+                console.error('Auto-login failed:', err);
+                await invoke('clear_credentials').catch(clearErr =>
+                    console.warn('Failed to clear credentials after auto-login error', clearErr)
+                );
+                if (err.message?.includes('M_UNKNOWN_TOKEN')) {
+                    setError('Your session has expired. Please log in again.');
+                } else {
+                    setError('Failed to restore session. Please log in again.');
+                }
+            } finally {
+                setIsLoading(false);
+            }
         };
         attemptAutoLogin();
     }, []);
-    
+
     const handleLoginSuccess = async (newClient: MatrixClient) => {
         await setupSession(newClient);
         const creds = {
-            homeserverUrl: newClient.getHomeserverUrl(),
-            userId: newClient.getUserId(),
-            accessToken: newClient.getAccessToken(),
+            homeserver_url: newClient.getHomeserverUrl(),
+            user_id: newClient.getUserId(),
+            access_token: newClient.getAccessToken(),
         };
-        localStorage.setItem('matrix-creds', JSON.stringify(creds));
+        try {
+            await invoke('save_credentials', { creds });
+        } catch (err) {
+            console.error('Failed to persist credentials:', err);
+        }
         setError(null);
     };
 
@@ -62,7 +103,11 @@ const App: React.FC = () => {
         }
         setClient(null);
         setSavedMessagesRoomId(null);
-        localStorage.removeItem('matrix-creds');
+        try {
+            await invoke('clear_credentials');
+        } catch (err) {
+            console.warn('Failed to clear credentials from secure store:', err);
+        }
     };
 
     if (isLoading) {

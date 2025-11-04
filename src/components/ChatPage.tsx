@@ -40,6 +40,9 @@ interface ChatPageProps {
     savedMessagesRoomId: string;
 }
 
+const DRAFT_STORAGE_KEY = 'matrix-message-drafts';
+const DRAFT_ACCOUNT_DATA_EVENT = 'econix.message_drafts';
+
 const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoomId }) => {
     const [rooms, setRooms] = useState<UIRoom[]>([]);
     const [selectedRoomId, setSelectedRoomId] = useState<string | null>(null);
@@ -77,9 +80,51 @@ const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoom
     const [notificationsEnabled, setNotificationsEnabled] = useState<boolean>(() => {
         return localStorage.getItem('matrix-notifications-enabled') === 'true';
     });
+    const [drafts, setDrafts] = useState<Record<string, string>>(() => {
+        try {
+            const storedDrafts = localStorage.getItem(DRAFT_STORAGE_KEY);
+            if (storedDrafts) {
+                const parsed = JSON.parse(storedDrafts);
+                if (parsed && typeof parsed === 'object') {
+                    return Object.entries(parsed).reduce<Record<string, string>>((acc, [roomId, value]) => {
+                        if (typeof value === 'string') {
+                            acc[roomId] = value;
+                        }
+                        return acc;
+                    }, {});
+                }
+            }
+        } catch (error) {
+            console.error('Failed to parse stored drafts from localStorage', error);
+        }
+        return {};
+    });
     
     const scrollContainerRef = useRef<HTMLDivElement>(null);
     const oldScrollHeightRef = useRef<number>(0);
+
+    useEffect(() => {
+        try {
+            localStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(drafts));
+        } catch (error) {
+            console.error('Failed to persist drafts to localStorage', error);
+        }
+    }, [drafts]);
+
+    useEffect(() => {
+        const syncDrafts = async () => {
+            try {
+                await client.setAccountData(DRAFT_ACCOUNT_DATA_EVENT as any, drafts as any);
+            } catch (error) {
+                console.error('Failed to sync drafts to Matrix account data', error);
+            }
+        };
+
+        // Avoid syncing when there is no authenticated user
+        if (client.getUserId()) {
+            syncDrafts();
+        }
+    }, [client, drafts]);
 
     // Handle notification settings
     useEffect(() => {
@@ -672,14 +717,80 @@ const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoom
         }
     }, [messages, scrollToBottom, isPaginating]);
 
+    useEffect(() => {
+        if (!selectedRoomId) return;
+
+        setDrafts(prev => {
+            if (prev[selectedRoomId] !== undefined) {
+                return prev;
+            }
+            return { ...prev, [selectedRoomId]: '' };
+        });
+
+        let isActive = true;
+
+        const loadAccountDrafts = async () => {
+            try {
+                const accountData = client.getAccountData(DRAFT_ACCOUNT_DATA_EVENT as any);
+                const content = accountData?.getContent() as Record<string, unknown> | undefined;
+                if (!isActive || !content || typeof content !== 'object') {
+                    return;
+                }
+
+                setDrafts(prev => {
+                    let hasChanges = false;
+                    const nextDrafts = { ...prev };
+                    Object.entries(content).forEach(([roomId, value]) => {
+                        if (typeof value === 'string' && nextDrafts[roomId] !== value) {
+                            nextDrafts[roomId] = value;
+                            hasChanges = true;
+                        }
+                    });
+
+                    return hasChanges ? nextDrafts : prev;
+                });
+            } catch (error) {
+                console.error('Failed to load drafts from Matrix account data', error);
+            }
+        };
+
+        loadAccountDrafts();
+
+        return () => {
+            isActive = false;
+        };
+    }, [client, selectedRoomId]);
+
+    const handleDraftChange = useCallback((roomId: string, value: string) => {
+        setDrafts(prev => {
+            const currentValue = prev[roomId] ?? '';
+            if (currentValue === value) {
+                return prev;
+            }
+            return { ...prev, [roomId]: value };
+        });
+    }, []);
+
+    const handleActiveDraftChange = useCallback((value: string) => {
+        if (!selectedRoomId) return;
+        handleDraftChange(selectedRoomId, value);
+    }, [handleDraftChange, selectedRoomId]);
+
     const handleSendMessage = async (content: string, threadRootId?: string) => {
         if (!selectedRoomId || !content.trim()) return;
+        const roomId = selectedRoomId;
         setIsSending(true);
         try {
-            const room = client.getRoom(selectedRoomId);
+            const room = client.getRoom(roomId);
             const eventToReplyTo = replyingTo ? room?.findEventById(replyingTo.id) : undefined;
-            await sendMessage(client, selectedRoomId, content.trim(), eventToReplyTo, threadRootId, roomMembers);
+            await sendMessage(client, roomId, content.trim(), eventToReplyTo, threadRootId, roomMembers);
             setReplyingTo(null);
+            setDrafts(prev => {
+                if (prev[roomId] === '') {
+                    return prev;
+                }
+                return { ...prev, [roomId]: '' };
+            });
         } catch (error) {
             console.error('Failed to send message:', error);
         } finally {
@@ -1122,8 +1233,8 @@ const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoom
                                 </svg>
                             </button>
                         )}
-                        <MessageInput 
-                            onSendMessage={handleSendMessage} 
+                        <MessageInput
+                            onSendMessage={handleSendMessage}
                             onSendFile={handleSendFile}
                             onSendAudio={handleSendAudio}
                             onSendSticker={handleSendSticker}
@@ -1136,6 +1247,8 @@ const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoom
                             replyingTo={replyingTo}
                             onCancelReply={() => setReplyingTo(null)}
                             roomMembers={roomMembers}
+                            draftContent={selectedRoomId ? drafts[selectedRoomId] ?? '' : ''}
+                            onDraftChange={handleActiveDraftChange}
                         />
                     </>
                 ) : <WelcomeView client={client} />}
