@@ -29,6 +29,7 @@ import { SearchResultItem } from '../services/searchService';
 import { NotificationCountType, EventType, MsgType, ClientEvent, RoomEvent, UserEvent, RelationType, CallEvent } from 'matrix-js-sdk';
 
 const DRAFT_STORAGE_KEY = 'matrix-chat-drafts';
+const DRAFT_ACCOUNT_DATA_EVENT = 'im.vector.web.room_draft';
 
 interface ChatPageProps {
     client: MatrixClient;
@@ -739,39 +740,80 @@ const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoom
         return () => window.clearTimeout(timeout);
     }, [highlightedMessage]);
 
-    const setDraftForRoom = useCallback((roomId: string, value: string) => {
-        setDrafts(prevDrafts => {
-            if (value.length > 0) {
-                if (prevDrafts[roomId] === value) {
-                    return prevDrafts;
-                }
-                return { ...prevDrafts, [roomId]: value };
-            }
-            if (!(roomId in prevDrafts)) {
-                return prevDrafts;
-            }
-            const { [roomId]: _removed, ...rest } = prevDrafts;
-            return rest;
-        });
-    }, [setDrafts]);
+    useEffect(() => {
+        if (!selectedRoomId) return;
 
-    const handleDraftChange = useCallback((value: string) => {
-        if (!selectedRoomId) {
-            return;
-        }
-        setDraftForRoom(selectedRoomId, value);
-    }, [selectedRoomId, setDraftForRoom]);
+        setDrafts(prev => {
+            if (prev[selectedRoomId] !== undefined) {
+                return prev;
+            }
+            return { ...prev, [selectedRoomId]: '' };
+        });
+
+        let isActive = true;
+
+        const loadAccountDrafts = async () => {
+            try {
+                const accountData = client.getAccountData(DRAFT_ACCOUNT_DATA_EVENT as any);
+                const content = accountData?.getContent() as Record<string, unknown> | undefined;
+                if (!isActive || !content || typeof content !== 'object') {
+                    return;
+                }
+
+                setDrafts(prev => {
+                    let hasChanges = false;
+                    const nextDrafts = { ...prev };
+                    Object.entries(content).forEach(([roomId, value]) => {
+                        if (typeof value === 'string' && nextDrafts[roomId] !== value) {
+                            nextDrafts[roomId] = value;
+                            hasChanges = true;
+                        }
+                    });
+
+                    return hasChanges ? nextDrafts : prev;
+                });
+            } catch (error) {
+                console.error('Failed to load drafts from Matrix account data', error);
+            }
+        };
+
+        loadAccountDrafts();
+
+        return () => {
+            isActive = false;
+        };
+    }, [client, selectedRoomId]);
+
+    const handleDraftChange = useCallback((roomId: string, value: string) => {
+        setDrafts(prev => {
+            const currentValue = prev[roomId] ?? '';
+            if (currentValue === value) {
+                return prev;
+            }
+            return { ...prev, [roomId]: value };
+        });
+    }, []);
+
+    const handleActiveDraftChange = useCallback((value: string) => {
+        if (!selectedRoomId) return;
+        handleDraftChange(selectedRoomId, value);
+    }, [handleDraftChange, selectedRoomId]);
 
     const handleSendMessage = async (content: string, threadRootId?: string) => {
+        if (!selectedRoomId || !content.trim()) return;
         const roomId = selectedRoomId;
-        if (!roomId || !content.trim()) return;
         setIsSending(true);
         try {
             const room = client.getRoom(roomId);
             const eventToReplyTo = replyingTo ? room?.findEventById(replyingTo.id) : undefined;
             await sendMessage(client, roomId, content.trim(), eventToReplyTo, threadRootId, roomMembers);
             setReplyingTo(null);
-            setDraftForRoom(roomId, '');
+            setDrafts(prev => {
+                if (prev[roomId] === '') {
+                    return prev;
+                }
+                return { ...prev, [roomId]: '' };
+            });
         } catch (error) {
             console.error('Failed to send message:', error);
         } finally {
@@ -1207,8 +1249,8 @@ const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoom
                             replyingTo={replyingTo}
                             onCancelReply={() => setReplyingTo(null)}
                             roomMembers={roomMembers}
-                            draft={selectedRoomId ? drafts[selectedRoomId] ?? '' : ''}
-                            onDraftChange={handleDraftChange}
+                            draftContent={selectedRoomId ? drafts[selectedRoomId] ?? '' : ''}
+                            onDraftChange={handleActiveDraftChange}
                         />
                     </>
                 ) : <WelcomeView client={client} />}

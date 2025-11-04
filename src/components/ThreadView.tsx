@@ -106,7 +106,7 @@ const ThreadView: React.FC<ThreadViewProps> = ({ room, activeThread, onClose, cl
                 replyingTo={null}
                 onCancelReply={() => {}}
                 roomMembers={roomMembers}
-                draft=""
+                draftContent=""
                 onDraftChange={() => {}}
             />
         </aside>

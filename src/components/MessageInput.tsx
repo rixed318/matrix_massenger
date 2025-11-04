@@ -18,15 +18,15 @@ interface MessageInputProps {
     replyingTo: Message | null;
     onCancelReply: () => void;
     roomMembers: MatrixUser[];
-    draft: string;
-    onDraftChange: (value: string) => void;
+    draftContent: string;
+    onDraftChange: (content: string) => void;
 }
 
 const MessageInput: React.FC<MessageInputProps> = ({
     onSendMessage, onSendFile, onSendAudio, onSendSticker, onSendGif, onOpenCreatePoll, onSchedule,
-    isSending, client, roomId, replyingTo, onCancelReply, roomMembers, draft, onDraftChange
+    isSending, client, roomId, replyingTo, onCancelReply, roomMembers, draftContent, onDraftChange
 }) => {
-    const [content, setContent] = useState(draft);
+    const [content, setContent] = useState(draftContent || '');
     const [isRecording, setIsRecording] = useState(false);
     const [recordingTime, setRecordingTime] = useState(0);
     const [showMentions, setShowMentions] = useState(false);
@@ -51,8 +51,13 @@ const MessageInput: React.FC<MessageInputProps> = ({
     }, [replyingTo]);
 
     useEffect(() => {
-        setContent(draft);
-    }, [draft, roomId]);
+        setContent(draftContent || '');
+    }, [draftContent, roomId]);
+
+    useEffect(() => {
+        if (!roomId) return;
+        onDraftChange(content);
+    }, [content, roomId, onDraftChange]);
 
     useEffect(() => {
         if (!roomId) return;
@@ -94,7 +99,6 @@ const MessageInput: React.FC<MessageInputProps> = ({
 
     const updateContent = (value: string) => {
         setContent(value);
-        onDraftChange(value);
     };
 
     const handleSend = () => {
@@ -102,7 +106,7 @@ const MessageInput: React.FC<MessageInputProps> = ({
             if (typingTimeoutRef.current) window.clearTimeout(typingTimeoutRef.current);
             sendTypingIndicator(client, roomId, false);
             onSendMessage(content);
-            updateContent('');
+            setContent('');
         }
     };
 
