@@ -36,9 +36,6 @@ import { SearchResultItem } from '../services/searchService';
 // FIX: `CallErrorCode` is not an exported member of `matrix-js-sdk`. It has been removed.
 import { NotificationCountType, EventType, MsgType, ClientEvent, RoomEvent, UserEvent, RelationType, CallEvent } from 'matrix-js-sdk';
 
-const DRAFT_STORAGE_KEY = 'matrix-chat-drafts';
-const DRAFT_ACCOUNT_DATA_EVENT = 'im.vector.web.room_draft';
-
 interface ChatPageProps {
     client: MatrixClient;
     onLogout: () => void;
@@ -85,6 +82,7 @@ const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoom
     const [notificationsEnabled, setNotificationsEnabled] = useState<boolean>(() => {
         return localStorage.getItem('matrix-notifications-enabled') === 'true';
     });
+    const [isSearchOpen, setIsSearchOpen] = useState(false);
     const [drafts, setDrafts] = useState<Record<string, string>>(() => {
         try {
             const storedDrafts = localStorage.getItem(DRAFT_STORAGE_KEY);
@@ -118,26 +116,10 @@ const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoom
     }, [drafts]);
 
     useEffect(() => {
-        const persistDraftsToAccountData = async () => {
-            try {
-                await client.setAccountData(DRAFT_ACCOUNT_DATA_EVENT as any, drafts);
-            } catch (error) {
-                console.error('Failed to persist drafts to Matrix account data', error);
-            }
-        };
-
-        void persistDraftsToAccountData();
-    }, [client, drafts]);
-
-    useEffect(() => {
-        try {
-            localStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(drafts));
-        } catch (error) {
-            console.error('Failed to persist drafts to localStorage', error);
+        if (!client.getUserId()) {
+            return;
         }
-    }, [drafts]);
 
-    useEffect(() => {
         const syncDrafts = async () => {
             try {
                 await client.setAccountData(DRAFT_ACCOUNT_DATA_EVENT as any, drafts as any);
@@ -146,10 +128,7 @@ const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoom
             }
         };
 
-        // Avoid syncing when there is no authenticated user
-        if (client.getUserId()) {
-            syncDrafts();
-        }
+        void syncDrafts();
     }, [client, drafts]);
 
     // Handle notification settings
