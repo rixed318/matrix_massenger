@@ -37,6 +37,9 @@ interface ChatPageProps {
     savedMessagesRoomId: string;
 }
 
+const DRAFT_STORAGE_KEY = 'matrix-message-drafts';
+const DRAFT_ACCOUNT_DATA_EVENT = 'econix.message_drafts';
+
 const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoomId }) => {
     const [rooms, setRooms] = useState<UIRoom[]>([]);
     const [selectedRoomId, setSelectedRoomId] = useState<string | null>(null);
@@ -93,10 +96,7 @@ const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoom
         }
         return {};
     });
-    const [isSearchOpen, setIsSearchOpen] = useState(false);
-    const [highlightedMessage, setHighlightedMessage] = useState<{ roomId: string; eventId: string } | null>(null);
-    const [pendingScrollTarget, setPendingScrollTarget] = useState<{ roomId: string; eventId: string } | null>(null);
-
+    
     const scrollContainerRef = useRef<HTMLDivElement>(null);
     const oldScrollHeightRef = useRef<number>(0);
     const focusEventIdRef = useRef<string | null>(null);
@@ -119,6 +119,29 @@ const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoom
         };
 
         void persistDraftsToAccountData();
+    }, [client, drafts]);
+
+    useEffect(() => {
+        try {
+            localStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(drafts));
+        } catch (error) {
+            console.error('Failed to persist drafts to localStorage', error);
+        }
+    }, [drafts]);
+
+    useEffect(() => {
+        const syncDrafts = async () => {
+            try {
+                await client.setAccountData(DRAFT_ACCOUNT_DATA_EVENT as any, drafts as any);
+            } catch (error) {
+                console.error('Failed to sync drafts to Matrix account data', error);
+            }
+        };
+
+        // Avoid syncing when there is no authenticated user
+        if (client.getUserId()) {
+            syncDrafts();
+        }
     }, [client, drafts]);
 
     // Handle notification settings
@@ -714,45 +737,6 @@ const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoom
     }, [messages, scrollToBottom, isPaginating]);
 
     useEffect(() => {
-        if (!pendingScrollTarget || pendingScrollTarget.roomId !== selectedRoomId) return;
-        let attempts = 0;
-        let cancelled = false;
-
-        const tryScroll = () => {
-            if (cancelled) return;
-            const element = document.getElementById(`message-${pendingScrollTarget.eventId}`);
-            if (element) {
-                element.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                setPendingScrollTarget(null);
-            } else if (attempts < 10) {
-                attempts += 1;
-                setTimeout(tryScroll, 150);
-            } else {
-                setPendingScrollTarget(null);
-            }
-        };
-
-        tryScroll();
-        return () => {
-            cancelled = true;
-        };
-    }, [messages, pendingScrollTarget, selectedRoomId]);
-
-    useEffect(() => {
-        if (!highlightedMessage) return;
-        const timeout = window.setTimeout(() => {
-            setHighlightedMessage(current => {
-                if (!current) return null;
-                if (current.roomId === highlightedMessage.roomId && current.eventId === highlightedMessage.eventId) {
-                    return null;
-                }
-                return current;
-            });
-        }, 8000);
-        return () => window.clearTimeout(timeout);
-    }, [highlightedMessage]);
-
-    useEffect(() => {
         if (!selectedRoomId) return;
 
         setDrafts(prev => {
@@ -820,7 +804,12 @@ const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoom
             const eventToReplyTo = replyingTo ? room?.findEventById(replyingTo.id) : undefined;
             await sendMessage(client, roomId, content.trim(), eventToReplyTo, threadRootId, roomMembers);
             setReplyingTo(null);
-            handleDraftChange(roomId, '');
+            setDrafts(prev => {
+                if (prev[roomId] === '') {
+                    return prev;
+                }
+                return { ...prev, [roomId]: '' };
+            });
         } catch (error) {
             console.error('Failed to send message:', error);
         } finally {

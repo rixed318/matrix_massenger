@@ -106,7 +106,6 @@ const MessageInput: React.FC<MessageInputProps> = ({
             if (typingTimeoutRef.current) window.clearTimeout(typingTimeoutRef.current);
             sendTypingIndicator(client, roomId, false);
             onSendMessage(content);
-            setContent('');
         }
     };
 
