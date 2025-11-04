@@ -109,6 +109,18 @@ const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoom
         }
     }, [drafts]);
 
+    useEffect(() => {
+        const persistDraftsToAccountData = async () => {
+            try {
+                await client.setAccountData(DRAFT_ACCOUNT_DATA_EVENT as any, drafts);
+            } catch (error) {
+                console.error('Failed to persist drafts to Matrix account data', error);
+            }
+        };
+
+        void persistDraftsToAccountData();
+    }, [client, drafts]);
+
     // Handle notification settings
     useEffect(() => {
         localStorage.setItem('matrix-notifications-enabled', String(notificationsEnabled));
@@ -808,12 +820,7 @@ const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoom
             const eventToReplyTo = replyingTo ? room?.findEventById(replyingTo.id) : undefined;
             await sendMessage(client, roomId, content.trim(), eventToReplyTo, threadRootId, roomMembers);
             setReplyingTo(null);
-            setDrafts(prev => {
-                if (prev[roomId] === '') {
-                    return prev;
-                }
-                return { ...prev, [roomId]: '' };
-            });
+            handleDraftChange(roomId, '');
         } catch (error) {
             console.error('Failed to send message:', error);
         } finally {
