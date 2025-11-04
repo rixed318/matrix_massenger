@@ -18,13 +18,15 @@ interface MessageInputProps {
     replyingTo: Message | null;
     onCancelReply: () => void;
     roomMembers: MatrixUser[];
+    draft: string;
+    onDraftChange: (value: string) => void;
 }
 
-const MessageInput: React.FC<MessageInputProps> = ({ 
-    onSendMessage, onSendFile, onSendAudio, onSendSticker, onSendGif, onOpenCreatePoll, onSchedule, 
-    isSending, client, roomId, replyingTo, onCancelReply, roomMembers 
+const MessageInput: React.FC<MessageInputProps> = ({
+    onSendMessage, onSendFile, onSendAudio, onSendSticker, onSendGif, onOpenCreatePoll, onSchedule,
+    isSending, client, roomId, replyingTo, onCancelReply, roomMembers, draft, onDraftChange
 }) => {
-    const [content, setContent] = useState('');
+    const [content, setContent] = useState(draft);
     const [isRecording, setIsRecording] = useState(false);
     const [recordingTime, setRecordingTime] = useState(0);
     const [showMentions, setShowMentions] = useState(false);
@@ -47,6 +49,10 @@ const MessageInput: React.FC<MessageInputProps> = ({
             inputRef.current?.focus();
         }
     }, [replyingTo]);
+
+    useEffect(() => {
+        setContent(draft);
+    }, [draft, roomId]);
 
     useEffect(() => {
         if (!roomId) return;
@@ -86,20 +92,25 @@ const MessageInput: React.FC<MessageInputProps> = ({
         return () => document.removeEventListener('mousedown', handleClickOutside);
     }, []);
 
+    const updateContent = (value: string) => {
+        setContent(value);
+        onDraftChange(value);
+    };
+
     const handleSend = () => {
         if (content.trim() && roomId) {
             if (typingTimeoutRef.current) window.clearTimeout(typingTimeoutRef.current);
             sendTypingIndicator(client, roomId, false);
             onSendMessage(content);
-            setContent('');
+            updateContent('');
         }
     };
-    
+
     const handleSelectMention = (user: MatrixUser) => {
         const parts = content.split(' ');
         parts.pop(); // remove the @-query part
         const newContent = [...parts, `@${user.displayName}`].join(' ') + ' ';
-        setContent(newContent);
+        updateContent(newContent);
         setShowMentions(false);
         inputRef.current?.focus();
     };
@@ -326,7 +337,7 @@ const MessageInput: React.FC<MessageInputProps> = ({
                         ref={inputRef}
                         type="text"
                         value={content}
-                        onChange={(e) => setContent(e.target.value)}
+                        onChange={(e) => updateContent(e.target.value)}
                         onKeyDown={handleKeyPress}
                         placeholder="Type a message..."
                         className="flex-1 bg-transparent p-3 text-text-primary placeholder-text-secondary focus:outline-none"

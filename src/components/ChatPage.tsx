@@ -28,6 +28,8 @@ import { SearchResultItem } from '../services/searchService';
 // FIX: `CallErrorCode` is not an exported member of `matrix-js-sdk`. It has been removed.
 import { NotificationCountType, EventType, MsgType, ClientEvent, RoomEvent, UserEvent, RelationType, CallEvent } from 'matrix-js-sdk';
 
+const DRAFT_STORAGE_KEY = 'matrix-chat-drafts';
+
 interface ChatPageProps {
     client: MatrixClient;
     onLogout: () => void;
@@ -71,6 +73,25 @@ const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoom
     const [notificationsEnabled, setNotificationsEnabled] = useState<boolean>(() => {
         return localStorage.getItem('matrix-notifications-enabled') === 'true';
     });
+    const [drafts, setDrafts] = useState<Record<string, string>>(() => {
+        try {
+            const storedDrafts = localStorage.getItem(DRAFT_STORAGE_KEY);
+            if (storedDrafts) {
+                const parsed = JSON.parse(storedDrafts);
+                if (parsed && typeof parsed === 'object') {
+                    return Object.entries(parsed).reduce<Record<string, string>>((acc, [roomId, value]) => {
+                        if (typeof value === 'string') {
+                            acc[roomId] = value;
+                        }
+                        return acc;
+                    }, {});
+                }
+            }
+        } catch (error) {
+            console.error('Failed to parse stored drafts from localStorage', error);
+        }
+        return {};
+    });
     const [isSearchOpen, setIsSearchOpen] = useState(false);
     const [highlightedMessage, setHighlightedMessage] = useState<{ roomId: string; eventId: string } | null>(null);
     const [pendingScrollTarget, setPendingScrollTarget] = useState<{ roomId: string; eventId: string } | null>(null);
@@ -78,6 +99,14 @@ const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoom
     const scrollContainerRef = useRef<HTMLDivElement>(null);
     const oldScrollHeightRef = useRef<number>(0);
     const focusEventIdRef = useRef<string | null>(null);
+
+    useEffect(() => {
+        try {
+            localStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(drafts));
+        } catch (error) {
+            console.error('Failed to persist drafts to localStorage', error);
+        }
+    }, [drafts]);
 
     // Handle notification settings
     useEffect(() => {
@@ -710,14 +739,39 @@ const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoom
         return () => window.clearTimeout(timeout);
     }, [highlightedMessage]);
 
+    const setDraftForRoom = useCallback((roomId: string, value: string) => {
+        setDrafts(prevDrafts => {
+            if (value.length > 0) {
+                if (prevDrafts[roomId] === value) {
+                    return prevDrafts;
+                }
+                return { ...prevDrafts, [roomId]: value };
+            }
+            if (!(roomId in prevDrafts)) {
+                return prevDrafts;
+            }
+            const { [roomId]: _removed, ...rest } = prevDrafts;
+            return rest;
+        });
+    }, [setDrafts]);
+
+    const handleDraftChange = useCallback((value: string) => {
+        if (!selectedRoomId) {
+            return;
+        }
+        setDraftForRoom(selectedRoomId, value);
+    }, [selectedRoomId, setDraftForRoom]);
+
     const handleSendMessage = async (content: string, threadRootId?: string) => {
-        if (!selectedRoomId || !content.trim()) return;
+        const roomId = selectedRoomId;
+        if (!roomId || !content.trim()) return;
         setIsSending(true);
         try {
-            const room = client.getRoom(selectedRoomId);
+            const room = client.getRoom(roomId);
             const eventToReplyTo = replyingTo ? room?.findEventById(replyingTo.id) : undefined;
-            await sendMessage(client, selectedRoomId, content.trim(), eventToReplyTo, threadRootId, roomMembers);
+            await sendMessage(client, roomId, content.trim(), eventToReplyTo, threadRootId, roomMembers);
             setReplyingTo(null);
+            setDraftForRoom(roomId, '');
         } catch (error) {
             console.error('Failed to send message:', error);
         } finally {
@@ -1139,8 +1193,8 @@ const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoom
                                 </svg>
                             </button>
                         )}
-                        <MessageInput 
-                            onSendMessage={handleSendMessage} 
+                        <MessageInput
+                            onSendMessage={handleSendMessage}
                             onSendFile={handleSendFile}
                             onSendAudio={handleSendAudio}
                             onSendSticker={handleSendSticker}
@@ -1153,6 +1207,8 @@ const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoom
                             replyingTo={replyingTo}
                             onCancelReply={() => setReplyingTo(null)}
                             roomMembers={roomMembers}
+                            draft={selectedRoomId ? drafts[selectedRoomId] ?? '' : ''}
+                            onDraftChange={handleDraftChange}
                         />
                     </>
                 ) : <WelcomeView client={client} />}
