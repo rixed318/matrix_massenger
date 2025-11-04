@@ -21,10 +21,15 @@ import ScheduleMessageModal from './ScheduleMessageModal';
 import ViewScheduledMessagesModal from './ViewScheduledMessagesModal';
 import IncomingCallModal from './IncomingCallModal';
 import CallView from './CallView';
+import SearchModal from './SearchModal';
+import { SearchResultItem } from '../services/searchService';
 // FIX: The `matrix-js-sdk` exports event names as enums. Import them to use with the event emitter.
 // FIX: Import event enums to use with the event emitter instead of string literals, which are not assignable.
 // FIX: `CallErrorCode` is not an exported member of `matrix-js-sdk`. It has been removed.
 import { NotificationCountType, EventType, MsgType, ClientEvent, RoomEvent, UserEvent, RelationType, CallEvent } from 'matrix-js-sdk';
+
+const DRAFT_STORAGE_KEY = 'matrix-chat-drafts';
+const DRAFT_ACCOUNT_DATA_EVENT = 'im.vector.web.room_draft';
 
 interface ChatPageProps {
     client: MatrixClient;
@@ -94,6 +99,27 @@ const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoom
     
     const scrollContainerRef = useRef<HTMLDivElement>(null);
     const oldScrollHeightRef = useRef<number>(0);
+    const focusEventIdRef = useRef<string | null>(null);
+
+    useEffect(() => {
+        try {
+            localStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(drafts));
+        } catch (error) {
+            console.error('Failed to persist drafts to localStorage', error);
+        }
+    }, [drafts]);
+
+    useEffect(() => {
+        const persistDraftsToAccountData = async () => {
+            try {
+                await client.setAccountData(DRAFT_ACCOUNT_DATA_EVENT as any, drafts);
+            } catch (error) {
+                console.error('Failed to persist drafts to Matrix account data', error);
+            }
+        };
+
+        void persistDraftsToAccountData();
+    }, [client, drafts]);
 
     useEffect(() => {
         try {
@@ -129,6 +155,22 @@ const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoom
     // Setup notification listeners on mount
     useEffect(() => {
         setupNotificationListeners();
+    }, []);
+
+    useEffect(() => {
+        const handleShortcut = (event: KeyboardEvent) => {
+            if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
+                const target = event.target as HTMLElement | null;
+                if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) {
+                    return;
+                }
+                event.preventDefault();
+                setIsSearchOpen(true);
+            }
+        };
+
+        window.addEventListener('keydown', handleShortcut);
+        return () => window.removeEventListener('keydown', handleShortcut);
     }, []);
 
     // Load scheduled messages on startup
@@ -366,15 +408,30 @@ const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoom
         };
     }, [client]);
 
-    const loadRoomMessages = useCallback((roomId: string) => {
+    const loadRoomMessages = useCallback((roomId: string, focusEventId?: string | null) => {
         const room = client.getRoom(roomId);
-        if (room) {
-            const mainTimelineEvents = room.getLiveTimeline().getEvents()
-                .filter(event => !event.getRelation() || event.getRelation().rel_type !== 'm.thread');
-            setMessages(mainTimelineEvents.map(parseMatrixEvent));
-            // FIX: Convert RoomMember[] to User[] to match the state type.
-            setRoomMembers(room.getJoinedMembers().map(m => m.user).filter((u): u is MatrixUser => !!u));
+        if (!room) return;
+
+        if (focusEventId !== undefined) {
+            focusEventIdRef.current = focusEventId;
         }
+
+        const effectiveFocusId = focusEventIdRef.current;
+        let timelineEvents = room.getLiveTimeline().getEvents();
+
+        if (effectiveFocusId) {
+            const focusTimeline = room.getTimelineForEvent(effectiveFocusId);
+            if (focusTimeline) {
+                timelineEvents = focusTimeline.getEvents();
+            }
+        }
+
+        const mainTimelineEvents = timelineEvents
+            .filter(event => !event.getRelation() || event.getRelation().rel_type !== 'm.thread');
+
+        setMessages(mainTimelineEvents.map(parseMatrixEvent));
+        // FIX: Convert RoomMember[] to User[] to match the state type.
+        setRoomMembers(room.getJoinedMembers().map(m => m.user).filter((u): u is MatrixUser => !!u));
     }, [client, parseMatrixEvent]);
 
     const loadPinnedMessage = useCallback((roomId: string) => {
@@ -602,6 +659,9 @@ const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoom
         setCanPaginate(true);
         setActiveThread(null); // Close thread view when switching rooms
         setTranslatedMessages({}); // Clear translations when switching rooms
+        setHighlightedMessage(null);
+        setPendingScrollTarget(null);
+        focusEventIdRef.current = null;
         const room = client.getRoom(roomId);
         if (room) {
             setCanPin(room.currentState.maySendStateEvent(EventType.RoomPinnedEvents, client.getUserId()!));
@@ -613,19 +673,59 @@ const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoom
                 await sendReadReceipt(client, roomId, lastEvent.getId()!);
             }
 
-            loadRoomMessages(roomId);
+            loadRoomMessages(roomId, null);
             // FIX: The `getTypingMembers` method does not exist in this SDK version. Use `getMembersWithTyping` instead.
             // FIX: The `getMembersWithTyping` method exists at runtime but is not in the SDK's Room type definition. Cast to `any` to use it.
             setTypingUsers((room as any).getMembersWithTyping().map((m: any) => m.name));
-            
+
             setTimeout(() => scrollToBottom('auto'), 100);
         }
     }, [client, selectedRoomId, scrollToBottom, loadRoomMessages, loadPinnedMessage]);
+
+    const handleJumpToSearchResult = useCallback(async (result: SearchResultItem) => {
+        const eventId = result.event.getId();
+        if (!eventId) {
+            return;
+        }
+
+        setIsSearchOpen(false);
+
+        try {
+            await handleSelectRoom(result.roomId);
+        } catch (error) {
+            console.error('Failed to switch room for search result:', error);
+            return;
+        }
+
+        const room = client.getRoom(result.roomId);
+        if (!room) {
+            return;
+        }
+
+        const timelineSet = room.getLiveTimeline().getTimelineSet();
+        try {
+            await client.getEventTimeline(timelineSet, eventId);
+        } catch (error) {
+            console.warn('Failed to load timeline for search result:', error);
+        }
+
+        loadRoomMessages(result.roomId, eventId);
+
+        if (!room.findEventById(eventId)) {
+            const contextEvents = [...result.context.before, result.event, ...result.context.after];
+            if (contextEvents.length > 0) {
+                setMessages(contextEvents.map(parseMatrixEvent));
+            }
+        }
+
+        setHighlightedMessage({ roomId: result.roomId, eventId });
+        setPendingScrollTarget({ roomId: result.roomId, eventId });
+    }, [client, handleSelectRoom, loadRoomMessages, parseMatrixEvent]);
     
     useEffect(() => {
         const container = scrollContainerRef.current;
         if (!container || isPaginating) return;
-        
+
         const isScrolledToBottom = container.scrollHeight - container.clientHeight <= container.scrollTop + 1;
         if (isScrolledToBottom) {
              scrollToBottom('auto');
@@ -1084,8 +1184,8 @@ const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoom
                 className={`flex-1 flex flex-col bg-bg-tertiary relative transition-all duration-300 bg-cover bg-center ${activeThread ? 'w-1/2' : 'w-full'}`}>
                 {selectedRoom ? (
                     <>
-                        <ChatHeader 
-                            room={selectedRoom} 
+                        <ChatHeader
+                            room={selectedRoom}
                             typingUsers={typingUsers}
                             canInvite={canInvite}
                             onOpenInvite={() => setIsInviteUserOpen(true)}
@@ -1095,11 +1195,12 @@ const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoom
                             onOpenViewScheduled={() => setIsViewScheduledModalOpen(true)}
                             isDirectMessageRoom={selectedRoom.isDirectMessageRoom}
                             onPlaceCall={handlePlaceCall}
+                            onOpenSearch={() => setIsSearchOpen(true)}
                         />
-                        <MessageView 
-                            messages={messages} 
+                        <MessageView
+                            messages={messages}
                             client={client}
-                            onReaction={handleReaction} 
+                            onReaction={handleReaction}
                             onEditMessage={handleEditMessage}
                             onDeleteMessage={handleDeleteMessage}
                             onSetReplyTo={setReplyingTo}
@@ -1117,6 +1218,7 @@ const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoom
                             pinnedEventIds={pinnedEventIds}
                             canPin={canPin}
                             onPinToggle={handlePinToggle}
+                            highlightedMessageId={highlightedMessage?.roomId === selectedRoomId ? highlightedMessage.eventId : null}
                         />
                          {showScrollToBottom && (
                             <button
@@ -1240,9 +1342,18 @@ const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoom
                 />
             )}
              {viewingImageUrl && (
-                <ImageViewerModal 
-                    imageUrl={viewingImageUrl} 
-                    onClose={() => setViewingImageUrl(null)} 
+                <ImageViewerModal
+                    imageUrl={viewingImageUrl}
+                    onClose={() => setViewingImageUrl(null)}
+                />
+            )}
+            {isSearchOpen && (
+                <SearchModal
+                    isOpen={isSearchOpen}
+                    onClose={() => setIsSearchOpen(false)}
+                    client={client}
+                    rooms={rooms}
+                    onSelectResult={handleJumpToSearchResult}
                 />
             )}
             {activeCall && <CallView call={activeCall} onHangup={() => handleHangupCall(false)} client={client} />}

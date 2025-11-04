@@ -14,11 +14,12 @@ interface ChatHeaderProps {
     onOpenViewScheduled: () => void;
     isDirectMessageRoom: boolean;
     onPlaceCall: (type: 'voice' | 'video') => void;
+    onOpenSearch: () => void;
 }
 
-const ChatHeader: React.FC<ChatHeaderProps> = ({ 
+const ChatHeader: React.FC<ChatHeaderProps> = ({
     room, typingUsers = [], canInvite, onOpenInvite, pinnedMessage, onPinToggle,
-    scheduledMessageCount, onOpenViewScheduled, isDirectMessageRoom, onPlaceCall 
+    scheduledMessageCount, onOpenViewScheduled, isDirectMessageRoom, onPlaceCall, onOpenSearch
 }) => {
     const [callMenuOpen, setCallMenuOpen] = useState(false);
     const callMenuRef = useRef<HTMLDivElement>(null);
@@ -61,9 +62,18 @@ const ChatHeader: React.FC<ChatHeaderProps> = ({
                     </p>
                 </div>
                 <div className="ml-auto flex items-center gap-2">
+                    <button
+                        onClick={onOpenSearch}
+                        className="p-2 rounded-full hover:bg-bg-tertiary"
+                        title="Поиск по сообщениям (Ctrl/Cmd + K)"
+                    >
+                        <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                            <path fillRule="evenodd" d="M12.9 14.32a7 7 0 111.414-1.414l4.387 4.387a1 1 0 01-1.414 1.414l-4.387-4.387zM14 9a5 5 0 11-10 0 5 5 0 0110 0z" clipRule="evenodd" />
+                        </svg>
+                    </button>
                      {scheduledMessageCount > 0 && (
-                        <button 
-                            onClick={onOpenViewScheduled} 
+                        <button
+                            onClick={onOpenViewScheduled}
                             className="p-2 rounded-full hover:bg-bg-tertiary relative" 
                             title="View scheduled messages"
                         >
