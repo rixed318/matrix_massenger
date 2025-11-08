@@ -25,6 +25,84 @@ export const login = async (homeserverUrl: string, username: string, password: s
     return client;
 };
 
+export const register = async (homeserverUrl: string, username: string, password: string): Promise<MatrixClient> => {
+    const client = initClient(homeserverUrl);
+    let sessionId: string | null = null;
+    let hasAttemptedDummy = false;
+    let registerResponse: Awaited<ReturnType<typeof client.register>> | null = null;
+
+    while (true) {
+        try {
+            registerResponse = await client.register(
+                username,
+                password,
+                sessionId,
+                sessionId ? { type: "m.login.dummy", session: sessionId } : { type: "m.login.dummy" },
+                undefined,
+                undefined,
+                true,
+            );
+            break;
+        } catch (error: any) {
+            const matrixError = error ?? {};
+            const flows: Array<{ stages?: string[] }> = Array.isArray(matrixError?.data?.flows)
+                ? matrixError.data.flows
+                : [];
+            const stages = flows.flatMap((flow) => flow.stages ?? []);
+
+            if (!hasAttemptedDummy && matrixError?.data?.session && flows.length > 0) {
+                if (stages.every((stage) => stage === "m.login.dummy") && stages.includes("m.login.dummy")) {
+                    sessionId = matrixError.data.session;
+                    hasAttemptedDummy = true;
+                    continue;
+                }
+
+                if (stages.includes("m.login.recaptcha")) {
+                    throw new Error(
+                        "Сервер требует прохождения капчи. Откройте официальный клиент или веб-интерфейс homeserver'а, чтобы завершить регистрацию.",
+                    );
+                }
+
+                if (stages.includes("m.login.email.identity")) {
+                    throw new Error(
+                        "Сервер требует подтверждение email. Завершите регистрацию через официальный клиент и повторите попытку входа.",
+                    );
+                }
+
+                throw new Error(
+                    "Сервер требует дополнительные шаги регистрации, которые пока не поддерживаются. Используйте официальный клиент homeserver'а.",
+                );
+            }
+
+            if (matrixError?.errcode === "M_USER_IN_USE") {
+                throw new Error("Имя пользователя уже занято. Попробуйте другой логин.");
+            }
+
+            if (matrixError?.errcode === "M_INVALID_USERNAME") {
+                throw new Error("Некорректный логин. Используйте только латиницу, цифры и символы -_.");
+            }
+
+            if (matrixError?.errcode === "M_WEAK_PASSWORD") {
+                throw new Error("Пароль слишком простой. Добавьте буквы разного регистра, цифры и символы.");
+            }
+
+            if (matrixError?.errcode === "M_FORBIDDEN") {
+                const rawMessage = (matrixError?.data?.error || matrixError?.message || "").toLowerCase();
+                if (rawMessage.includes("registration") && rawMessage.includes("disabled")) {
+                    throw new Error(
+                        "Регистрация отключена на этом сервере. Свяжитесь с администратором или выберите другой homeserver.",
+                    );
+                }
+            }
+
+            throw new Error(matrixError?.data?.error || matrixError?.message || "Регистрация не удалась.");
+        }
+    }
+
+    const userId = registerResponse?.user_id || username;
+    return login(homeserverUrl, userId, password);
+};
+
 export const findOrCreateSavedMessagesRoom = async (client: MatrixClient): Promise<string> => {
     const userId = client.getUserId()!;
     // FIX: The type 'm.direct' is not present in the SDK's AccountDataEvents type definitions.

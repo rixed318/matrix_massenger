@@ -1,6 +1,6 @@
 import React, { useState, FormEvent, useEffect } from 'react';
 import { MatrixClient } from '../types';
-import { login } from '../services/matrixService';
+import { login, register as registerAccount } from '../services/matrixService';
 
 interface LoginPageProps {
   onLoginSuccess: (client: MatrixClient) => void;
@@ -10,6 +10,19 @@ interface LoginPageProps {
 }
 
 type ConnectionType = 'public' | 'secure' | 'selfhosted';
+type AuthMode = 'choose' | 'login' | 'register';
+
+const getDefaultHomeserver = (connectionType: ConnectionType) => {
+  switch (connectionType) {
+    case 'public':
+      return 'https://matrix.org';
+    case 'secure':
+      return 'https://matrix.secure-messenger.com';
+    case 'selfhosted':
+    default:
+      return '';
+  }
+};
 
 const ConnectionOption: React.FC<{ title: string; description: string; icon: React.ReactElement; onSelect: () => void; }> = ({ title, description, icon, onSelect }) => (
   <button
@@ -24,22 +37,15 @@ const ConnectionOption: React.FC<{ title: string; description: string; icon: Rea
   </button>
 );
 
-const LoginForm: React.FC<{ 
+const LoginForm: React.FC<{
   connectionType: ConnectionType;
   onLogin: (homeserverUrl: string, username: string, password: string) => Promise<void>;
   isLoading: boolean;
   error: string | null;
   onBack: () => void;
-}> = ({ connectionType, onLogin, isLoading, error, onBack }) => {
-  const getInitialUrl = () => {
-    switch(connectionType) {
-      case 'public': return 'https://matrix.org';
-      case 'secure': return 'https://matrix.secure-messenger.com';
-      case 'selfhosted': return '';
-      default: return '';
-    }
-  };
-  const [homeserverUrl, setHomeserverUrl] = useState(getInitialUrl());
+  onSwitchToRegister: () => void;
+}> = ({ connectionType, onLogin, isLoading, error, onBack, onSwitchToRegister }) => {
+  const [homeserverUrl, setHomeserverUrl] = useState(getDefaultHomeserver(connectionType));
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
 
@@ -119,6 +125,134 @@ const LoginForm: React.FC<{
             ) : 'Войти'}
           </button>
         </div>
+        <p className="text-xs text-center text-text-secondary">
+          Нет аккаунта?{' '}
+          <button type="button" className="text-text-accent hover:underline" onClick={onSwitchToRegister}>
+            Зарегистрироваться
+          </button>
+        </p>
+      </form>
+    </div>
+  );
+};
+
+const RegisterForm: React.FC<{
+  connectionType: ConnectionType;
+  onRegister: (homeserverUrl: string, username: string, password: string) => Promise<void>;
+  isLoading: boolean;
+  error: string | null;
+  onBack: () => void;
+  onSwitchToLogin: () => void;
+}> = ({ connectionType, onRegister, isLoading, error, onBack, onSwitchToLogin }) => {
+  const [homeserverUrl, setHomeserverUrl] = useState(getDefaultHomeserver(connectionType));
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [localError, setLocalError] = useState<string | null>(null);
+
+  const handleSubmit = (e: FormEvent) => {
+    e.preventDefault();
+    setLocalError(null);
+    if (password !== confirmPassword) {
+      setLocalError('Пароли не совпадают.');
+      return;
+    }
+    onRegister(homeserverUrl, username, password);
+  };
+
+  const readOnly = connectionType !== 'selfhosted';
+
+  return (
+    <div className="animate-fade-in-fast">
+      <button onClick={onBack} className="flex items-center text-sm text-text-accent hover:underline mb-3">
+        <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 mr-1" viewBox="0 0 20 20" fill="currentColor">
+          <path fillRule="evenodd" d="M12.707 5.293a1 1 0 010 1.414L9.414 10l3.293 3.293a1 1 0 01-1.414 1.414l-4-4a1 1 0 010-1.414l4-4a1 1 0 011.414 0z" clipRule="evenodd" />
+        </svg>
+        Назад
+      </button>
+      <form className="space-y-4" onSubmit={handleSubmit}>
+        <div className="-space-y-px">
+          <div>
+            <label htmlFor="register-homeserver" className="sr-only">Homeserver URL</label>
+            <input
+              id="register-homeserver"
+              name="homeserver"
+              type="text"
+              required
+              readOnly={readOnly}
+              className="appearance-none rounded-none relative block w-full px-3 py-2 border border-border-primary bg-bg-secondary text-text-primary placeholder-text-secondary rounded-t-md focus:outline-none focus:ring-ring-focus focus:border-ring-focus focus:z-10 sm:text-sm read-only:bg-bg-tertiary"
+              placeholder="Homeserver URL"
+              value={homeserverUrl}
+              onChange={(e) => setHomeserverUrl(e.target.value)}
+            />
+          </div>
+          <div>
+            <label htmlFor="register-username" className="sr-only">Username</label>
+            <input
+              id="register-username"
+              name="username"
+              type="text"
+              autoComplete="username"
+              required
+              className="appearance-none rounded-none relative block w-full px-3 py-2 border border-border-primary bg-bg-secondary text-text-primary placeholder-text-secondary focus:outline-none focus:ring-ring-focus focus:border-ring-focus focus:z-10 sm:text-sm"
+              placeholder="Username"
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
+            />
+          </div>
+          <div>
+            <label htmlFor="register-password" className="sr-only">Password</label>
+            <input
+              id="register-password"
+              name="password"
+              type="password"
+              autoComplete="new-password"
+              required
+              className="appearance-none rounded-none relative block w-full px-3 py-2 border border-border-primary bg-bg-secondary text-text-primary placeholder-text-secondary focus:outline-none focus:ring-ring-focus focus:border-ring-focus focus:z-10 sm:text-sm"
+              placeholder="Password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+            />
+          </div>
+          <div>
+            <label htmlFor="register-password-confirm" className="sr-only">Confirm password</label>
+            <input
+              id="register-password-confirm"
+              name="confirmPassword"
+              type="password"
+              autoComplete="new-password"
+              required
+              className="appearance-none rounded-none relative block w-full px-3 py-2 border border-border-primary bg-bg-secondary text-text-primary placeholder-text-secondary rounded-b-md focus:outline-none focus:ring-ring-focus focus:border-ring-focus focus:z-10 sm:text-sm"
+              placeholder="Повторите пароль"
+              value={confirmPassword}
+              onChange={(e) => setConfirmPassword(e.target.value)}
+            />
+          </div>
+        </div>
+        {(localError || error) && <p className="text-error text-sm text-center">{localError || error}</p>}
+        <div>
+          <button
+            type="submit"
+            disabled={isLoading || !homeserverUrl}
+            className="group relative w-full flex justify-center py-2 px-4 border border-transparent text-sm font-medium rounded-md text-text-inverted bg-accent hover:bg-accent-hover focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-ring-focus disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {isLoading ? (
+              <>
+                <svg className="animate-spin -ml-1 mr-3 h-5 w-5 text-text-inverted" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                </svg>
+                Регистрация...
+              </>
+            ) : 'Создать аккаунт'}
+          </button>
+        </div>
+        <p className="text-xs text-center text-text-secondary">
+          Уже есть учётная запись?{' '}
+          <button type="button" className="text-text-accent hover:underline" onClick={onSwitchToLogin}>
+            Войти
+          </button>
+        </p>
       </form>
     </div>
   );
@@ -128,6 +262,7 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess, initialError, sav
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(initialError);
   const [connectionType, setConnectionType] = useState<ConnectionType | null>(null);
+  const [mode, setMode] = useState<AuthMode>('choose');
 
   useEffect(() => setError(initialError), [initialError]);
 
@@ -147,6 +282,26 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess, initialError, sav
     }
   };
 
+  const handleRegister = async (homeserverUrl: string, username: string, password: string) => {
+    setError(null);
+    setIsLoading(true);
+    try {
+      const client = await registerAccount(homeserverUrl, username, password);
+      onLoginSuccess(client);
+    } catch (err: any) {
+      console.error(err);
+      setError(err.message || 'Регистрация не выполнена.');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const resetToChoose = () => {
+    setError(null);
+    setConnectionType(null);
+    setMode('choose');
+  };
+
   const SavedList = () => {
     if (!savedAccounts.length) return null;
     return (
@@ -164,16 +319,33 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess, initialError, sav
   };
 
   const renderContent = () => {
-    if (connectionType) {
+    if (connectionType && mode === 'login') {
       return (
-        <LoginForm 
+        <LoginForm
           connectionType={connectionType}
           onLogin={handleLogin}
           isLoading={isLoading}
           error={error}
-          onBack={() => {
+          onBack={resetToChoose}
+          onSwitchToRegister={() => {
             setError(null);
-            setConnectionType(null);
+            setMode('register');
+          }}
+        />
+      );
+    }
+
+    if (connectionType && mode === 'register') {
+      return (
+        <RegisterForm
+          connectionType={connectionType}
+          onRegister={handleRegister}
+          isLoading={isLoading}
+          error={error}
+          onBack={resetToChoose}
+          onSwitchToLogin={() => {
+            setError(null);
+            setMode('login');
           }}
         />
       );
@@ -192,19 +364,28 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess, initialError, sav
             title="Matrix.org"
             description="Быстрый вход на публичный сервер."
             icon={<svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>}
-            onSelect={() => setConnectionType('public')}
+            onSelect={() => {
+              setConnectionType('public');
+              setMode('login');
+            }}
           />
           <ConnectionOption
             title="Secure Cloud"
             description="Наш управляемый сервер с расширенной защитой."
             icon={<svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 15a4 4 0 004 4h9a5 5 0 10-.1-9.999 5.002 5.002 0 10-9.78 2.096A4.001 4.001 0 003 15z" /></svg>}
-            onSelect={() => setConnectionType('secure')}
+            onSelect={() => {
+              setConnectionType('secure');
+              setMode('login');
+            }}
           />
           <ConnectionOption
             title="Ваш сервер"
             description="Подключение к собственному homeserver'у."
             icon={<svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2m-2-4h.01M17 16h.01" /></svg>}
-            onSelect={() => setConnectionType('selfhosted')}
+            onSelect={() => {
+              setConnectionType('selfhosted');
+              setMode('login');
+            }}
           />
         </div>
         <SavedList />
