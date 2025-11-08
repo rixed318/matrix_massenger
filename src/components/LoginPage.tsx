@@ -1,6 +1,7 @@
 import React, { useState, FormEvent, useEffect } from 'react';
+import type { SecureCloudProfile } from '../services/secureCloudService';
 import { MatrixClient } from '../types';
-import { login, resolveHomeserverBaseUrl, HomeserverDiscoveryError } from '../services/matrixService';
+import { login, resolveHomeserverBaseUrl, HomeserverDiscoveryError, register as registerAccount } from '../services/matrixService';
 
 interface LoginPageProps {
   onLoginSuccess: (client: MatrixClient) => void;
@@ -48,6 +49,13 @@ const LoginForm: React.FC<{
   const [homeserverUrl, setHomeserverUrl] = useState(getDefaultHomeserver(connectionType));
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
+  const [useSecureCloud, setUseSecureCloud] = useState(connectionType === 'secure');
+  const [secureApiUrl, setSecureApiUrl] = useState('');
+  const [metadataToken, setMetadataToken] = useState('');
+  const [enablePremium, setEnablePremium] = useState(connectionType === 'secure');
+  const [enableAnalytics, setEnableAnalytics] = useState(false);
+  const [analyticsToken, setAnalyticsToken] = useState('');
+  const [riskThreshold, setRiskThreshold] = useState('0.6');
   const isSelfHosted = connectionType === 'selfhosted';
 
   const handleSubmit = (e: FormEvent) => {
