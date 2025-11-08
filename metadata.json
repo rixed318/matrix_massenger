@@ -1,0 +1,8 @@
+{
+  "name": "Matrix Messenger",
+  "description": "A Telegram-like chat client built with Tauri, React, TypeScript, and the Matrix protocol. Connect to your own Synapse homeserver and chat securely.",
+  "requestFramePermissions": [
+    "microphone",
+    "camera"
+  ]
+}
