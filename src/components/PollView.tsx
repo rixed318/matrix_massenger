@@ -1,5 +1,5 @@
 import React from 'react';
-import { Poll } from '../types';
+import { Poll } from '@matrix-messenger/core';
 
 interface PollViewProps {
     poll: Poll;

@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { MatrixClient } from '../types';
-import { mxcToHttp, getTranslationSettings, setTranslationSettings } from '../services/matrixService';
+import { MatrixClient } from '@matrix-messenger/core';
+import { mxcToHttp, getTranslationSettings, setTranslationSettings } from '@matrix-messenger/core';
 import Avatar from './Avatar';
 
 interface SettingsModalProps {

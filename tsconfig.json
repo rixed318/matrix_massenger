@@ -21,6 +21,9 @@
     "paths": {
       "@/*": [
         "./*"
+      ],
+      "@matrix-messenger/core": [
+        "./packages/core/src/index.ts"
       ]
     },
     "allowImportingTsExtensions": true,

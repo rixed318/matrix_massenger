@@ -1,6 +1,6 @@
 import React, { useState, KeyboardEvent, useEffect, useRef } from 'react';
-import { MatrixClient, Message, MatrixUser, Sticker, Gif } from '../types';
-import { sendTypingIndicator, getRoomTTL, setRoomTTL, setNextMessageTTL } from '../services/matrixService';
+import { MatrixClient, Message, MatrixUser, Sticker, Gif } from '@matrix-messenger/core';
+import { sendTypingIndicator, getRoomTTL, setRoomTTL, setNextMessageTTL } from '@matrix-messenger/core';
 import MentionSuggestions from './MentionSuggestions';
 import StickerGifPicker from './StickerGifPicker';
 

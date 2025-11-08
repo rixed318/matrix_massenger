@@ -1,5 +1,5 @@
 import React, { useMemo } from 'react';
-import { MatrixUser } from '../types';
+import { MatrixUser } from '@matrix-messenger/core';
 import Avatar from './Avatar';
 
 interface MentionSuggestionsProps {

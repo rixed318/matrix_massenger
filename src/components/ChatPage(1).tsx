@@ -1,8 +1,8 @@
 import React, { useEffect, useMemo, useState, useCallback } from 'react';
 import type { MatrixClient } from 'matrix-js-sdk';
 import ChatHeader from './ChatHeader';
-import { attachSelfDestructMarker, getRoomSelfDestructConfig, scheduleSelfDestructRedaction, ensureCryptoReady, startAutoBackupLoop, onDevicesUpdated } from '../services/e2eeService';
-import { sendMessage } from '../services/matrixService';
+import { attachSelfDestructMarker, getRoomSelfDestructConfig, scheduleSelfDestructRedaction, ensureCryptoReady, startAutoBackupLoop, onDevicesUpdated } from '@matrix-messenger/core';
+import { sendMessage } from '@matrix-messenger/core';
 
 type Props = { client: MatrixClient; room: any; };
 

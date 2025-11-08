@@ -1,5 +1,5 @@
 import React from 'react';
-import { LinkPreviewData } from '../types';
+import { LinkPreviewData } from '@matrix-messenger/core';
 import { openUrl } from '@tauri-apps/plugin-opener';
 
 interface LinkPreviewProps {

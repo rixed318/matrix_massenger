@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Room, Message } from '../types';
+import { Room, Message } from '@matrix-messenger/core';
 import Avatar from './Avatar';
 import PinnedMessageBar from './PinnedMessageBar';
 

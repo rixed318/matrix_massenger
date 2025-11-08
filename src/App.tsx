@@ -3,8 +3,8 @@ import { invoke } from '@tauri-apps/api/core';
 import LoginPage from './components/LoginPage';
 import ChatPage from './components/ChatPage';
 import AppErrorBoundary from './components/AppErrorBoundary';
-import { MatrixClient } from './types';
-import { initClient, findOrCreateSavedMessagesRoom, mxcToHttp } from './services/matrixService';
+import { MatrixClient } from '@matrix-messenger/core';
+import { initClient, findOrCreateSavedMessagesRoom, mxcToHttp } from '@matrix-messenger/core';
 
 type StoredCredentials = {
   homeserver_url: string;

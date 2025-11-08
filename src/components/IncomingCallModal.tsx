@@ -1,7 +1,7 @@
 import React from 'react';
-import { MatrixCall, MatrixClient } from '../types';
+import { MatrixCall, MatrixClient } from '@matrix-messenger/core';
 import Avatar from './Avatar';
-import { mxcToHttp } from '../services/matrixService';
+import { mxcToHttp } from '@matrix-messenger/core';
 
 interface IncomingCallModalProps {
     call: MatrixCall;

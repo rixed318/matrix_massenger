@@ -1,7 +1,7 @@
 
 
 import React from 'react';
-import { MatrixClient } from '../types';
+import { MatrixClient } from '@matrix-messenger/core';
 
 interface WelcomeViewProps {
     client: MatrixClient;

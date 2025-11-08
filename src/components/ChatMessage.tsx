@@ -1,11 +1,11 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Message, Reaction, MatrixClient } from '../types';
+import { Message, Reaction, MatrixClient } from '@matrix-messenger/core';
 import Avatar from './Avatar';
 import { format } from 'date-fns';
 import ReactionPicker from './ReactionPicker';
 import ReactionsDisplay from './ReactionsDisplay';
 import ReplyQuote from './ReplyQuote';
-import { mxcToHttp } from '../services/matrixService';
+import { mxcToHttp } from '@matrix-messenger/core';
 import VoiceMessagePlayer from './VoiceMessagePlayer';
 import PollView from './PollView';
 import { EventType } from 'matrix-js-sdk';
