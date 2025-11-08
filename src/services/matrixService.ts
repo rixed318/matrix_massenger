@@ -1,10 +1,101 @@
 import { MatrixClient, MatrixEvent, MatrixRoom, MatrixUser, Sticker, Gif } from '../types';
 // FIX: `RoomCreateOptions` is not an exported member of `matrix-js-sdk`. Replaced with the correct type `ICreateRoomOpts`.
 // FIX: Import Visibility enum to correctly type room creation options.
-import { createClient, ICreateClientOpts, EventType, MsgType, RelationType, ICreateRoomOpts, Visibility } from 'matrix-js-sdk';
+import {
+    createClient,
+    ICreateClientOpts,
+    EventType,
+    MsgType,
+    RelationType,
+    ICreateRoomOpts,
+    Visibility,
+    AutoDiscovery,
+    AutoDiscoveryAction,
+    AutoDiscoveryError,
+} from 'matrix-js-sdk';
 
 // *** ВАЖНО: Укажите здесь URL вашего сервера для перевода ***
 const TRANSLATION_SERVER_URL = 'https://your-translation-server.com/api/translate';
+
+
+export class HomeserverDiscoveryError extends Error {
+    public constructor(message: string) {
+        super(message);
+        this.name = 'HomeserverDiscoveryError';
+    }
+}
+
+const MATRIX_ID_DOMAIN_PATTERN = /^@[^:]+:(.+)$/;
+
+const normalizeBaseUrl = (value: string): string => {
+    const ensureProtocol = (url: string) => (url.includes('://') ? url : `https://${url}`);
+    let candidate = ensureProtocol(value);
+
+    try {
+        const parsed = new URL(candidate);
+        if (parsed.protocol !== 'https:') {
+            parsed.protocol = 'https:';
+        }
+        parsed.hash = '';
+        parsed.search = '';
+        // remove trailing slash for consistency but keep non-root paths intact
+        const normalised = parsed.toString();
+        return normalised.endsWith('/') && parsed.pathname === '/' ? normalised.slice(0, -1) : normalised;
+    } catch (error) {
+        throw new HomeserverDiscoveryError('Сервер вернул некорректный адрес homeserver.');
+    }
+};
+
+const formatDiscoveryErrorMessage = (error?: AutoDiscoveryError | null): string => {
+    switch (error) {
+        case AutoDiscovery.ERROR_MISSING_WELLKNOWN:
+            return 'На сервере отсутствует /.well-known/matrix/client.';
+        case AutoDiscovery.ERROR_INVALID_HOMESERVER:
+            return 'Указанный сервер не поддерживает Matrix.';
+        case AutoDiscovery.ERROR_INVALID_HS_BASE_URL:
+        case AutoDiscovery.ERROR_INVALID:
+            return 'Сервер вернул некорректные настройки discovery.';
+        case AutoDiscovery.ERROR_GENERIC_FAILURE:
+            return 'Не удалось получить настройки discovery с сервера.';
+        default:
+            return 'Не удалось определить адрес homeserver.';
+    }
+};
+
+export const resolveHomeserverBaseUrl = async (input: string): Promise<string> => {
+    const trimmed = input.trim();
+    if (!trimmed) {
+        throw new HomeserverDiscoveryError('Укажите домен, Matrix ID или URL homeserver.');
+    }
+
+    const matrixIdMatch = trimmed.match(MATRIX_ID_DOMAIN_PATTERN);
+    const withoutMatrixId = matrixIdMatch ? matrixIdMatch[1] : trimmed;
+
+    const stripProtocol = withoutMatrixId.replace(/^https?:\/\//i, '');
+    const discoveryTarget = stripProtocol.split('/')[0];
+
+    if (!discoveryTarget) {
+        throw new HomeserverDiscoveryError('Некорректный адрес homeserver.');
+    }
+
+    let discoveryResult;
+    try {
+        discoveryResult = await AutoDiscovery.findClientConfig(discoveryTarget);
+    } catch (error) {
+        throw new HomeserverDiscoveryError('Не удалось выполнить discovery для указанного сервера.');
+    }
+
+    const homeserverConfig = discoveryResult['m.homeserver'];
+    if (
+        !homeserverConfig ||
+        homeserverConfig.state !== AutoDiscoveryAction.SUCCESS ||
+        !homeserverConfig.base_url
+    ) {
+        throw new HomeserverDiscoveryError(formatDiscoveryErrorMessage(homeserverConfig?.error));
+    }
+
+    return normalizeBaseUrl(homeserverConfig.base_url);
+};
 
 
 export const initClient = (homeserverUrl: string, accessToken?: string, userId?: string): MatrixClient => {
@@ -667,10 +758,14 @@ export async function joinGroupCall(roomId: string, url: string, title = 'Group 
   try {
     // Tauri 2.x global marker
     if (typeof (window as any).__TAURI__ !== 'undefined') {
-      const { WebviewWindow } = await import('@tauri-apps/api/window');
-      const win = new WebviewWindow(`call-${Date.now()}`, { title, url });
-      await win.setFocus();
-      return;
+      const windowApi = await import('@tauri-apps/api/window');
+      const WebviewWindow = (windowApi as any).WebviewWindow;
+      if (WebviewWindow) {
+        const win = new WebviewWindow(`call-${Date.now()}`, { title, url });
+        await win.setFocus();
+        return;
+      }
+      console.warn('Tauri WebviewWindow API не найдена, fallback на браузер.');
     }
   } catch (_) {
     // ignore and fallback

@@ -1,6 +1,6 @@
 import React, { useState, FormEvent, useEffect } from 'react';
 import { MatrixClient } from '../types';
-import { login, register as registerAccount } from '../services/matrixService';
+import { login, resolveHomeserverBaseUrl, HomeserverDiscoveryError } from '../services/matrixService';
 
 interface LoginPageProps {
   onLoginSuccess: (client: MatrixClient) => void;
@@ -48,6 +48,7 @@ const LoginForm: React.FC<{
   const [homeserverUrl, setHomeserverUrl] = useState(getDefaultHomeserver(connectionType));
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
+  const isSelfHosted = connectionType === 'selfhosted';
 
   const handleSubmit = (e: FormEvent) => {
     e.preventDefault();
@@ -71,12 +72,17 @@ const LoginForm: React.FC<{
               name="homeserver"
               type="text"
               required
-              readOnly={connectionType !== 'selfhosted'}
+              readOnly={!isSelfHosted}
               className="appearance-none rounded-none relative block w-full px-3 py-2 border border-border-primary bg-bg-secondary text-text-primary placeholder-text-secondary rounded-t-md focus:outline-none focus:ring-ring-focus focus:border-ring-focus focus:z-10 sm:text-sm read-only:bg-bg-tertiary"
-              placeholder="Homeserver URL"
+              placeholder={isSelfHosted ? 'example.com, @user:domain или https://host:8448' : 'Homeserver URL'}
               value={homeserverUrl}
               onChange={(e) => setHomeserverUrl(e.target.value)}
             />
+            {isSelfHosted && (
+              <p className="mt-2 text-xs text-text-secondary">
+                Введите домен, Matrix ID или IP-адрес с портом. Например: matrix.example.com, 10.0.0.5:8448, @alice:example.com
+              </p>
+            )}
           </div>
           <div>
             <label htmlFor="username" className="sr-only">Username</label>
@@ -266,15 +272,17 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess, initialError, sav
 
   useEffect(() => setError(initialError), [initialError]);
 
-  const handleLogin = async (homeserverUrl: string, username: string, password: string) => {
+  const handleLogin = async (homeserverInput: string, username: string, password: string) => {
     setError(null);
     setIsLoading(true);
     try {
-      const client = await login(homeserverUrl, username, password);
+      const baseUrl = await resolveHomeserverBaseUrl(homeserverInput);
+      const client = await login(baseUrl, username, password);
       onLoginSuccess(client);
     } catch (err: any) {
       console.error(err);
-      if (err.message?.includes('M_FORBIDDEN')) setError('Неверный логин или пароль.');
+      if (err instanceof HomeserverDiscoveryError) setError(err.message);
+      else if (err.message?.includes('M_FORBIDDEN')) setError('Неверный логин или пароль.');
       else if (err.message?.includes('M_UNKNOWN_TOKEN')) setError('Токен недействителен.');
       else setError(err.message || 'Вход не выполнен.');
     } finally {
