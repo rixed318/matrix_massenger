@@ -1,10 +1,10 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 // FIX: Import MatrixRoom to correctly type room objects from the SDK.
-import { Room as UIRoom, Message, MatrixEvent, Reaction, ReplyInfo, MatrixClient, MatrixRoom, ActiveThread, MatrixUser, Poll, PollResult, Folder, ScheduledMessage, MatrixCall, LinkPreviewData, Sticker, Gif } from '../types';
-import RoomList from './RoomList';
+import { Room as UIRoom, Message, MatrixEvent, MatrixClient, MatrixRoom, ActiveThread, MatrixUser, Poll, PollResult, Folder, ScheduledMessage, MatrixCall, LinkPreviewData, Sticker, Gif } from '../types';
+import ChatList from './ChatList';
 import MessageView from './MessageView';
 import ChatHeader from './ChatHeader';
-import MessageInput from './MessageInput';
+import MessageComposer from './MessageComposer';
 import { mxcToHttp, sendReaction, sendTypingIndicator, editMessage, sendMessage, deleteMessage, sendImageMessage, sendReadReceipt, sendFileMessage, setDisplayName, setAvatar, createRoom, inviteUser, forwardMessage, paginateRoomHistory, sendAudioMessage, setPinnedMessages, sendPollStart, sendPollResponse, translateText, sendStickerMessage, sendGifMessage, getSecureCloudProfileForClient } from '../services/matrixService';
 import { startGroupCall, joinGroupCall, getDisplayMedia, enumerateDevices } from '../services/matrixService';
 import {
@@ -40,6 +40,8 @@ import { SearchResultItem } from '../services/searchService';
 import { NotificationCountType, EventType, MsgType, ClientEvent, RoomEvent, UserEvent, RelationType, CallEvent } from 'matrix-js-sdk';
 import { startSecureCloudSession, acknowledgeSuspiciousEvents } from '../services/secureCloudService';
 import type { SuspiciousEventNotice, SecureCloudSession } from '../services/secureCloudService';
+import { parseMatrixEvent as parseMatrixEventUtil } from '../utils/parseMatrixEvent';
+import { useChats } from '../hooks/useChats';
 
 interface ChatPageProps {
     client: MatrixClient;
@@ -51,10 +53,8 @@ const DRAFT_STORAGE_KEY = 'matrix-message-drafts';
 const DRAFT_ACCOUNT_DATA_EVENT = 'econix.message_drafts';
 
 const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoomId }) => {
-    const [rooms, setRooms] = useState<UIRoom[]>([]);
     const [selectedRoomId, setSelectedRoomId] = useState<string | null>(null);
     const [messages, setMessages] = useState<Message[]>([]);
-    const [isLoading, setIsLoading] = useState(true);
     const [isSending, setIsSending] = useState(false);
     const [typingUsers, setTypingUsers] = useState<string[]>([]);
     const [replyingTo, setReplyingTo] = useState<Message | null>(null);
@@ -121,6 +121,19 @@ const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoom
         }
         return {};
     });
+
+    const {
+        rooms: allRooms,
+        filteredRooms,
+        isLoading: isRoomsLoading,
+        searchTerm,
+        setSearchTerm,
+        roomTypeFilter,
+        setRoomTypeFilter,
+        statusFilter,
+        setStatusFilter,
+        refresh: refreshRooms,
+    } = useChats({ client, savedMessagesRoomId });
 
     const scrollContainerRef = useRef<HTMLDivElement>(null);
     const oldScrollHeightRef = useRef<number>(0);
@@ -566,156 +579,7 @@ const handleSetChatBackground = (bgUrl: string) => {
     }, []);
 
     const parseMatrixEvent = useCallback((event: MatrixEvent): Message => {
-        const sender = event.sender;
-        const roomId = event.getRoomId();
-        const room = roomId ? client.getRoom(roomId) : null;
-        
-        const aggregatedReactions: Record<string, Reaction> = {};
-        if (room) {
-             // FIX: The method `getRelationsForEvent` is not available on EventTimelineSet in this SDK version.
-             // Using `getRelatedEventsForEvent` on the room object as a fallback for fetching reactions.
-             // FIX: The method `getRelatedEventsForEvent` exists at runtime but is not in the SDK's Room type definition. Cast to `any` to use it.
-             const reactionEvents = (room as any).getRelatedEventsForEvent(event.getId()!, RelationType.Annotation, EventType.Reaction);
-             if (reactionEvents) {
-                 reactionEvents.forEach((reactionEvent: MatrixEvent) => {
-                     if (reactionEvent.isRedacted()) return;
-                     const key = reactionEvent.getRelation()?.key;
-                     if (!key) return;
-                     if (!aggregatedReactions[key]) {
-                         aggregatedReactions[key] = { count: 0, isOwn: false };
-                     }
-                     aggregatedReactions[key].count++;
-                     if (reactionEvent.getSender() === client.getUserId()) {
-                         aggregatedReactions[key].isOwn = true;
-                         aggregatedReactions[key].ownEventId = reactionEvent.getId();
-                     }
-                 });
-             }
-        }
-        
-        let pollData: Poll | undefined = undefined;
-        const pollStartContent = event.getContent()['m.poll.start'];
-
-        if (event.getType() === 'm.poll.start' && pollStartContent) {
-            const options = pollStartContent.answers.map((ans: any) => ({
-                id: ans.id,
-                text: ans['org.matrix.msc1767.text'],
-            }));
-            
-            const results: Record<string, PollResult> = {};
-            options.forEach((opt: {id: string}) => {
-                results[opt.id] = { votes: 0 };
-            });
-
-            let userVote: string | undefined = undefined;
-
-            if (room) {
-                // FIX: The method `getRelatedEventsForEvent` exists at runtime but is not in the SDK's Room type definition. Cast to `any` to use it.
-                const responseEvents = (room as any).getRelatedEventsForEvent(event.getId()!, 'm.reference', 'm.poll.response');
-                const userVotes: Record<string, string> = {}; // { userId: optionId }
-
-                if (responseEvents) {
-                    responseEvents.forEach((resEvent: MatrixEvent) => {
-                        const senderId = resEvent.getSender();
-                        const answerIds = resEvent.getContent()['m.poll.response']?.answers;
-                        if (senderId && answerIds && Array.isArray(answerIds) && answerIds.length > 0) {
-                            userVotes[senderId] = answerIds[0];
-                        }
-                    });
-                }
-                
-                Object.values(userVotes).forEach(voteId => {
-                    if(results[voteId]) {
-                        results[voteId].votes++;
-                    }
-                });
-
-                userVote = userVotes[client.getUserId()!];
-            }
-
-            pollData = {
-                question: pollStartContent.question['org.matrix.msc1767.text'],
-                options: options,
-                results: results,
-                userVote: userVote,
-            };
-        }
-
-        const replacementEvent = event.replacingEvent();
-        const content = event.isRedacted() 
-            ? { body: 'Message deleted', msgtype: 'm.text' } 
-            : (replacementEvent ? replacementEvent.getContent() : event.getContent());
-        
-        const replyEventId = event.replyEventId;
-        let replyTo: ReplyInfo | null = null;
-        if (replyEventId && room) {
-            const repliedToEvent = room.findEventById(replyEventId);
-            if (repliedToEvent) {
-                replyTo = {
-                    sender: repliedToEvent.sender?.name || 'Unknown User',
-                    body: repliedToEvent.getContent().body,
-                };
-            }
-        }
-        
-        const readBy: Message['readBy'] = {};
-        if (room) {
-            room.getUsersReadUpTo(event).forEach(userId => {
-                const receipt = room.getReadReceiptForUserId(userId);
-                if(receipt) {
-                    readBy[userId] = { ts: receipt.data.ts };
-                }
-            });
-        }
-
-        const threadInfo = event.getThread();
-        // FIX: The 'Thread' object's `replyCount` property is private. Use `.length` to get the count of replies.
-        const threadReplyCount = threadInfo ? threadInfo.length : 0;
-        const relation = event.getRelation();
-        const threadRootId = (relation?.rel_type === 'm.thread') ? relation.event_id : undefined;
-
-        const previewDataRaw = content['custom.url_preview'];
-        let linkPreview: LinkPreviewData | undefined = undefined;
-        if (previewDataRaw) {
-            linkPreview = {
-                url: previewDataRaw.url,
-                image: previewDataRaw.image,
-                title: previewDataRaw.title,
-                description: previewDataRaw.description,
-                siteName: previewDataRaw.siteName,
-            };
-        }
-
-        const isSticker = event.getType() === 'm.sticker';
-        const isGif = content.msgtype === 'm.image' && content.info?.['xyz.amorgan.is_gif'];
-
-        return {
-            id: event.getId()!,
-            sender: {
-                id: sender?.userId || 'unknown',
-                name: sender?.name || 'Unknown User',
-                avatarUrl: sender ? mxcToHttp(client, sender.getMxcAvatarUrl()) : null,
-            },
-            content: {
-                ...content,
-                body: content.body || (pollData ? pollData.question : ''),
-                msgtype: content.msgtype || 'm.text',
-            },
-            timestamp: event.getTs(),
-            isOwn: sender?.userId === client.getUserId(),
-            reactions: Object.keys(aggregatedReactions).length > 0 ? aggregatedReactions : null,
-            isEdited: !!event.replacingEventId(),
-            isRedacted: event.isRedacted(),
-            replyTo,
-            readBy,
-            threadReplyCount,
-            threadRootId,
-            poll: pollData,
-            rawEvent: event,
-            linkPreview,
-            isSticker,
-            isGif,
-        };
+        return parseMatrixEventUtil(client, event);
     }, [client]);
 
     const loadRoomMessages = useCallback((roomId: string, focusEventId?: string | null) => {
@@ -766,70 +630,20 @@ const handleSetChatBackground = (bgUrl: string) => {
     }, [client, parseMatrixEvent]);
 
     useEffect(() => {
-        const loadRooms = () => {
-            const matrixRooms = client.getRooms();
-            const sortedRooms = matrixRooms
-                .filter(room => room.getJoinedMemberCount() > 0) // Show all rooms including self-chats
-                .sort((a, b) => {
-                    const lastEventA = a.timeline[a.timeline.length - 1];
-                    const lastEventB = b.timeline[b.timeline.length - 1];
-                    return (lastEventB?.getTs() || 0) - (lastEventA?.getTs() || 0);
-                });
-
-            let savedMessagesRoom: UIRoom | null = null;
-            
-            const roomData: UIRoom[] = sortedRooms.map(room => {
-                const lastEvent = room.timeline[room.timeline.length - 1];
-                const pinnedEvent = room.currentState.getStateEvents(EventType.RoomPinnedEvents, '');
-                const uiRoom: UIRoom = {
-                    roomId: room.roomId,
-                    name: room.name,
-                    avatarUrl: mxcToHttp(client, room.getMxcAvatarUrl()),
-                    lastMessage: lastEvent ? parseMatrixEvent(lastEvent) : null,
-                    unreadCount: room.getUnreadNotificationCount(NotificationCountType.Total),
-                    pinnedEvents: pinnedEvent?.getContent().pinned || [],
-                    isEncrypted: client.isRoomEncrypted(room.roomId),
-                    isDirectMessageRoom: room.getJoinedMemberCount() === 2,
-                };
-
-                if (room.roomId === savedMessagesRoomId) {
-                    savedMessagesRoom = {
-                        ...uiRoom,
-                        name: 'Saved Messages',
-                        isSavedMessages: true,
-                    };
-                }
-                
-                return uiRoom;
-
-            }).filter(r => r.roomId !== savedMessagesRoomId);
-
-            if (savedMessagesRoom) {
-                setRooms([savedMessagesRoom, ...roomData]);
-            } else {
-                setRooms(roomData);
-            }
-        };
-
-        loadRooms();
-        setIsLoading(false);
-
         const onSync = (state: string) => {
-// Offline indicator
-if (state === 'ERROR' || state === 'STOPPED') {
-    setIsOffline(true);
-} else if (state === 'SYNCING' || state === 'PREPARED' || state === 'SYNCING') {
-    setIsOffline(false);
-}
+            if (state === 'ERROR' || state === 'STOPPED') {
+                setIsOffline(true);
+            } else if (state === 'SYNCING' || state === 'PREPARED') {
+                setIsOffline(false);
+            }
 
-
-             if (state === 'PREPARED') {
-                loadRooms();
+            if (state === 'PREPARED') {
+                refreshRooms();
                 if (selectedRoomId) {
                     loadRoomMessages(selectedRoomId);
                     loadPinnedMessage(selectedRoomId);
                 }
-             }
+            }
         };
 
         const onRoomStateEvent = (event: MatrixEvent) => {
@@ -840,61 +654,54 @@ if (state === 'ERROR' || state === 'STOPPED') {
 
         const onRoomEvent = (event: MatrixEvent) => {
             const roomId = event.getRoomId();
-            if(!roomId) return;
+            if (!roomId) return;
 
             if (notificationsEnabled && !document.hasFocus() && event.getSender() !== client.getUserId() && (event.getType() === EventType.RoomMessage || event.getType() === 'm.sticker') && !event.isRedacted()) {
                 const room = client.getRoom(roomId);
                 const senderName = event.sender?.name || 'Unknown User';
                 const messageBody = event.getContent().body;
-                if (room && room.roomId !== savedMessagesRoomId) { // Do not notify for own saved messages
+                if (room && room.roomId !== savedMessagesRoomId) {
                     sendNotification(room.name, `${senderName}: ${messageBody}`);
                 }
             }
-            
-            const updateRoomList = setTimeout(() => loadRooms(), 500);
+
+            refreshRooms();
 
             if (roomId === selectedRoomId) {
-                // Handle local echo for own messages
                 if ((event.getType() === EventType.RoomMessage || event.getType() === 'm.sticker') && event.getSender() === client.getUserId()) {
-                     const txnId = event.getTxnId();
-                     if (txnId) {
-                         setMessages(prev => prev.filter(m => m.id !== txnId));
-                     }
-                }
-                
-                // If a thread is active, update its messages
-                if (activeThread) {
-                    const relation = event.getRelation();
-                    if(relation?.rel_type === 'm.thread' && relation.event_id === activeThread.rootMessage.id) {
-                         const room = client.getRoom(roomId);
-                         const threadEvents = room?.getThread(activeThread.rootMessage.id)?.events;
-                         setActiveThread(prev => prev ? ({
-                             ...prev,
-                             threadMessages: threadEvents?.map(parseMatrixEvent) || []
-                         }) : null);
+                    const txnId = event.getTxnId();
+                    if (txnId) {
+                        setMessages(prev => prev.filter(m => m.id !== txnId));
                     }
                 }
-                
-                // Always reload main timeline
+
+                if (activeThread) {
+                    const relation = event.getRelation();
+                    if (relation?.rel_type === 'm.thread' && relation.event_id === activeThread.rootMessage.id) {
+                        const room = client.getRoom(roomId);
+                        const threadEvents = room?.getThread(activeThread.rootMessage.id)?.events;
+                        setActiveThread(prev => (prev ? ({
+                            ...prev,
+                            threadMessages: threadEvents?.map(parseMatrixEvent) || []
+                        }) : null));
+                    }
+                }
+
                 loadRoomMessages(roomId);
             }
-             
-             return () => clearTimeout(updateRoomList);
         };
-        
+
         const onTyping = (event: MatrixEvent, room: MatrixRoom) => {
-             if (!selectedRoomId || room.roomId !== selectedRoomId) return;
-             // FIX: The `getTypingMembers` method does not exist in this SDK version. Use `getMembersWithTyping` instead.
-             // FIX: The `getMembersWithTyping` method exists at runtime but is not in the SDK's Room type definition. Cast to `any` to use it.
-             setTypingUsers((room as any).getMembersWithTyping().map((m: any) => m.name));
+            if (!selectedRoomId || room.roomId !== selectedRoomId) return;
+            setTypingUsers((room as any).getMembersWithTyping().map((m: any) => m.name));
         };
-        
+
         const onReceipt = () => {
-             if (!selectedRoomId) return;
-             const room = client.getRoom(selectedRoomId);
-             if (room) {
-                 setMessages(prev => prev.map(m => parseMatrixEvent(room.findEventById(m.id)!)));
-             }
+            if (!selectedRoomId) return;
+            const room = client.getRoom(selectedRoomId);
+            if (room) {
+                setMessages(prev => prev.map(m => parseMatrixEvent(room.findEventById(m.id)!)));
+            }
         };
 
         const onUserProfileChange = () => {
@@ -903,27 +710,22 @@ if (state === 'ERROR' || state === 'STOPPED') {
 
         client.on(ClientEvent.Sync, onSync);
         client.on(RoomEvent.Timeline, onRoomEvent);
-        // FIX: The SDK's event emitter typings are incomplete. Use `as any` to listen to the "Room.state" event.
         client.on("Room.state" as any, onRoomStateEvent);
-        // FIX: The 'Room.typing' event is not in the SDK's enums; cast to `any` to bypass type checking.
         client.on('Room.typing' as any, onTyping);
         client.on(RoomEvent.Receipt, onReceipt);
         client.on(UserEvent.DisplayName, onUserProfileChange);
         client.on(UserEvent.AvatarUrl, onUserProfileChange);
-        client.on(ClientEvent.Room, loadRooms);
+
         return () => {
             client.removeListener(ClientEvent.Sync, onSync);
             client.removeListener(RoomEvent.Timeline, onRoomEvent);
-            // FIX: The SDK's event emitter typings are incomplete. Use `as any` to remove the "Room.state" listener.
             client.removeListener("Room.state" as any, onRoomStateEvent);
-            // FIX: The 'Room.typing' event is not in the SDK's enums; cast to `any` to bypass type checking.
             client.removeListener('Room.typing' as any, onTyping);
             client.removeListener(RoomEvent.Receipt, onReceipt);
             client.removeListener(UserEvent.DisplayName, onUserProfileChange);
             client.removeListener(UserEvent.AvatarUrl, onUserProfileChange);
-            client.removeListener(ClientEvent.Room, loadRooms);
         };
-    }, [client, selectedRoomId, parseMatrixEvent, loadRoomMessages, activeThread, loadPinnedMessage, notificationsEnabled, savedMessagesRoomId]);
+    }, [client, selectedRoomId, parseMatrixEvent, loadRoomMessages, activeThread, loadPinnedMessage, notificationsEnabled, savedMessagesRoomId, refreshRooms]);
 
     useEffect(() => {
         const onCallIncoming = (call: MatrixCall) => {
@@ -1522,8 +1324,8 @@ if (isOffline) {
     };
 
 
-    const selectedRoom = rooms.find(r => r.roomId === selectedRoomId);
-    const savedMessagesRoom = rooms.find(r => r.roomId === savedMessagesRoomId);
+    const selectedRoom = allRooms.find(r => r.roomId === selectedRoomId);
+    const savedMessagesRoom = allRooms.find(r => r.roomId === savedMessagesRoomId);
     const matrixRoom = selectedRoomId ? client.getRoom(selectedRoomId) : null;
     const canInvite = matrixRoom?.canInvite(client.getUserId()!) || false;
     const scheduledForThisRoom = selectedRoomId
@@ -1533,12 +1335,13 @@ if (isOffline) {
 
     return (
         <div className="flex h-screen">
-            <RoomList
+            <ChatList
                 key={userProfileVersion}
-                rooms={rooms}
+                rooms={filteredRooms}
+                allRooms={allRooms}
                 selectedRoomId={selectedRoomId}
                 onSelectRoom={handleSelectRoom}
-                isLoading={isLoading}
+                isLoading={isRoomsLoading}
                 onLogout={onLogout}
                 client={client}
                 onOpenSettings={() => setIsSettingsOpen(true)}
@@ -1547,6 +1350,12 @@ if (isOffline) {
                 activeFolderId={activeFolderId}
                 onSelectFolder={setActiveFolderId}
                 onManageFolders={() => setIsManageFoldersOpen(true)}
+                searchTerm={searchTerm}
+                onSearchTermChange={setSearchTerm}
+                roomTypeFilter={roomTypeFilter}
+                onRoomTypeFilterChange={setRoomTypeFilter}
+                statusFilter={statusFilter}
+                onStatusFilterChange={setStatusFilter}
             />
             <main
                 style={{ backgroundImage: chatBackground ? `url(${chatBackground})` : 'none' }}
@@ -1565,6 +1374,7 @@ if (isOffline) {
                             isDirectMessageRoom={selectedRoom.isDirectMessageRoom}
                             onPlaceCall={handlePlaceCall}
                             onOpenSearch={() => setIsSearchOpen(true)}
+                            connectionStatus={isOffline ? 'offline' : 'online'}
                         />
                         {isSecureCloudActive && (
                             <div className="px-4 pt-3 space-y-3">
@@ -1703,7 +1513,7 @@ if (isOffline) {
                                 </svg>
                             </button>
                         )}
-                        <MessageInput
+                        <MessageComposer
                             onSendMessage={handleSendMessage}
                             onSendFile={handleSendFile}
                             onSendAudio={handleSendAudio}
@@ -1719,6 +1529,7 @@ if (isOffline) {
                             roomMembers={roomMembers}
                             draftContent={selectedRoomId ? drafts[selectedRoomId] ?? '' : ''}
                             onDraftChange={handleActiveDraftChange}
+                            isOffline={isOffline}
                         />
                     </>
                 ) : <WelcomeView client={client} />}
@@ -1770,7 +1581,7 @@ if (isOffline) {
                     onClose={() => setIsManageFoldersOpen(false)}
                     onSave={handleSaveFolders}
                     initialFolders={folders}
-                    allRooms={rooms}
+                    allRooms={allRooms}
                 />
             )}
             
@@ -1807,7 +1618,7 @@ if (isOffline) {
                     isOpen={!!forwardingMessage}
                     onClose={() => setForwardingMessage(null)}
                     onForward={handleConfirmForward}
-                    rooms={rooms.filter(r => r.roomId !== selectedRoomId && r.roomId !== savedMessagesRoomId)}
+                    rooms={allRooms.filter(r => r.roomId !== selectedRoomId && r.roomId !== savedMessagesRoomId)}
                     message={forwardingMessage}
                     client={client}
                     savedMessagesRoom={savedMessagesRoom || null}
@@ -1824,7 +1635,7 @@ if (isOffline) {
                     isOpen={isSearchOpen}
                     onClose={() => setIsSearchOpen(false)}
                     client={client}
-                    rooms={rooms}
+                    rooms={allRooms}
                     onSelectResult={handleJumpToSearchResult}
                 />
             )}

@@ -44,6 +44,10 @@ export interface Room {
   isEncrypted: boolean;
   isDirectMessageRoom: boolean;
   isSavedMessages?: boolean;
+  roomType?: 'direct' | 'group' | 'saved';
+  status?: 'joined' | 'invited' | 'left';
+  lastMessagePreview?: string | null;
+  lastMessageAt?: number | null;
 }
 
 export interface LinkPreviewData {

@@ -21,6 +21,8 @@
   --color-mention-text: #a5b4fc; /* indigo-300 */
   --color-mention-self-bg: rgba(234, 179, 8, 0.5); /* yellow-500/50 */
   --color-mention-self-text: #fde047; /* yellow-200 */
+  --color-chip-selected: rgba(99, 102, 241, 0.25);
+  --color-status-offline: #f97316;
 }
 
 .theme-light {
@@ -42,6 +44,8 @@
   --color-mention-text: #3730a3; /* indigo-800 */
   --color-mention-self-bg: rgba(250, 204, 21, 0.3);
   --color-mention-self-text: #ca8a04;
+  --color-chip-selected: rgba(79, 70, 229, 0.15);
+  --color-status-offline: #ea580c;
 }
 
 .theme-midnight {
@@ -63,6 +67,8 @@
   --color-mention-text: #80b6ff;
   --color-mention-self-bg: rgba(210, 153, 34, 0.2);
   --color-mention-self-text: #e3b341;
+  --color-chip-selected: rgba(88, 166, 255, 0.25);
+  --color-status-offline: #f97316;
 }
 
 @keyframes fadeIn {
