@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import LoginPage from './components/LoginPage';
 import ChatPage from './components/ChatPage';
+import AppErrorBoundary from './components/AppErrorBoundary';
 import { MatrixClient } from './types';
 import { initClient, findOrCreateSavedMessagesRoom, mxcToHttp } from './services/matrixService';
 
@@ -168,11 +169,13 @@ const App: React.FC = () => {
     <div className="h-screen w-screen bg-bg-primary text-text-primary font-sans">
       {active ? (
         <>
-          <ChatPage
-            client={active.client}
-            onLogout={() => removeAccount(activeKey || undefined)}
-            savedMessagesRoomId={active.savedMessagesRoomId || ''}
-          />
+          <AppErrorBoundary key={activeKey || 'chat'}>
+            <ChatPage
+              client={active.client}
+              onLogout={() => removeAccount(activeKey || undefined)}
+              savedMessagesRoomId={active.savedMessagesRoomId || ''}
+            />
+          </AppErrorBoundary>
           {isAddAccountOpen && (
             <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
               <div className="w-full max-w-md bg-bg-primary rounded-lg shadow-xl p-4">
@@ -180,18 +183,22 @@ const App: React.FC = () => {
                   <h3 className="text-lg font-semibold">Добавить аккаунт</h3>
                   <button className="p-2 hover:bg-bg-terтиary rounded-md" onClick={() => setAddAccountOpen(false)}>✕</button>
                 </div>
-                <LoginPage
-                  onLoginSuccess={handleLoginSuccess}
-                  initialError={error}
-                  savedAccounts={Object.values(accounts).map(a => a.creds)}
-                  isEmbedded
-                />
+                <AppErrorBoundary key={`embedded-login-${activeKey || 'new'}`}>
+                  <LoginPage
+                    onLoginSuccess={handleLoginSuccess}
+                    initialError={error}
+                    savedAccounts={Object.values(accounts).map(a => a.creds)}
+                    isEmbedded
+                  />
+                </AppErrorBoundary>
               </div>
             </div>
           )}
         </>
       ) : (
-        <LoginPage onLoginSuccess={handleLoginSuccess} initialError={error} savedAccounts={[]} />
+        <AppErrorBoundary key="primary-login">
+          <LoginPage onLoginSuccess={handleLoginSuccess} initialError={error} savedAccounts={[]} />
+        </AppErrorBoundary>
       )}
 
       <MultiAccountBridge
