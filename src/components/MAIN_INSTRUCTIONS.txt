@@ -1,0 +1,24 @@
+Add to Cargo.toml:
+[dependencies]
+aes-gcm = "0.10"
+anyhow = "1"
+argon2 = "0.5"
+base64 = "0.22"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+In src-tauri/src/main.rs:
+--------------------------------
+mod secure_store;
+
+fn main() {
+  tauri::Builder::default()
+    .invoke_handler(tauri::generate_handler![
+      secure_store::secure_store_save_seed,
+      secure_store::secure_store_load_seed,
+    ])
+    .run(tauri::generate_context!())
+    .expect("error while running tauri application");
+}
+--------------------------------
