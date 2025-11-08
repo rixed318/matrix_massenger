@@ -5,6 +5,7 @@ import ChatPage from './components/ChatPage';
 import AppErrorBoundary from './components/AppErrorBoundary';
 import { MatrixClient } from './types';
 import { initClient, findOrCreateSavedMessagesRoom, mxcToHttp } from './services/matrixService';
+import { attachAccountToPluginHost } from './services/pluginHost';
 
 type StoredCredentials = {
   homeserver_url: string;
@@ -20,6 +21,7 @@ type AccountRuntime = {
   unread: number;
   avatarUrl?: string | null;
   displayName?: string | null;
+  pluginCleanup?: () => void;
 };
 
 type AccountsMap = Record<string, AccountRuntime>;
@@ -78,16 +80,34 @@ const App: React.FC = () => {
     const avatarUrl = mxcToHttp(client, user?.avatarUrl);
     const displayName = user?.displayName || acc.user_id;
 
-    const runtime: AccountRuntime = {
-      creds: acc,
-      client,
-      savedMessagesRoomId,
-      unread: computeUnread(client),
-      avatarUrl,
-      displayName
-    };
-    attachRealtimeCounters(acc.key, client);
-    return runtime;
+    let pluginCleanup: (() => void) | undefined;
+    try {
+      pluginCleanup = attachAccountToPluginHost({
+        key: acc.key,
+        client,
+        userId: acc.user_id,
+        homeserverUrl: acc.homeserver_url,
+        displayName,
+        avatarUrl,
+      });
+
+      const runtime: AccountRuntime = {
+        creds: acc,
+        client,
+        savedMessagesRoomId,
+        unread: computeUnread(client),
+        avatarUrl,
+        displayName,
+        pluginCleanup,
+      };
+      attachRealtimeCounters(acc.key, client);
+      return runtime;
+    } catch (error) {
+      if (pluginCleanup) {
+        try { pluginCleanup(); } catch { /* ignore */ }
+      }
+      throw error;
+    }
   };
 
   useEffect(() => {
@@ -141,6 +161,9 @@ const App: React.FC = () => {
     const k = key || activeKey;
     if (!k) return;
     const acc = accounts[k];
+    if (acc?.pluginCleanup) {
+      try { acc.pluginCleanup(); } catch (err) { console.warn('plugin cleanup failed', err); }
+    }
     try { await acc.client.logout(); } catch {}
     try { await invoke('clear_credentials', { key: k }); } catch (err) { console.warn('clear store failed', err); }
     setAccounts(prev => {
