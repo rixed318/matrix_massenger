@@ -1,0 +1,15 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": "./.test-dist",
+    "declaration": false,
+    "emitDeclarationOnly": false,
+    "sourceMap": false,
+    "allowImportingTsExtensions": false,
+    "types": []
+  },
+  "include": [
+    "src/services/matrixService.ts"
+  ]
+}

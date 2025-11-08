@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "build:test": "tsc --project tsconfig.tests.json",
+    "test": "npm run build:test && node --test tests",
     "tauri": "tauri"
   },
   "dependencies": {
