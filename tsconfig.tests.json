@@ -10,6 +10,7 @@
     "types": []
   },
   "include": [
-    "src/services/matrixService.ts"
+    "src/services/matrixService.ts",
+    "src/types/**/*.d.ts"
   ]
 }

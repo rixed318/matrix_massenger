@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { MatrixClient } from '../types';
 import { mxcToHttp, getTranslationSettings, setTranslationSettings } from '../services/matrixService';
 import Avatar from './Avatar';
+import SecuritySettings from './SecuritySettings';
 
 interface SettingsModalProps {
     isOpen: boolean;
@@ -50,6 +51,7 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, onSave, 
     const [currentTheme, setCurrentTheme] = useState(document.documentElement.className || '');
     const [translationUrl, setTranslationUrl] = useState<string>('');
     const [translationApiKey, setTranslationApiKey] = useState<string>('');
+    const [isSecurityOpen, setIsSecurityOpen] = useState(false);
     const fileInputRef = useRef<HTMLInputElement>(null);
     const bgFileInputRef = useRef<HTMLInputElement>(null);
 
@@ -60,26 +62,34 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, onSave, 
         setAvatarFile(null);
     }, [isOpen, user, client]);
 
-useEffect(() => {
-    // Load translation settings from account data or localStorage
-    try {
-        const s = getTranslationSettings(client);
-        setTranslationUrl((s?.baseUrl as string) || '');
-        setTranslationApiKey((s?.apiKey as string) || '');
-    } catch (_) { /* noop */ }
-}, [isOpen, client]);
+    useEffect(() => {
+        // Load translation settings from account data or localStorage
+        try {
+            const s = getTranslationSettings(client);
+            setTranslationUrl((s?.baseUrl as string) || '');
+            setTranslationApiKey((s?.apiKey as string) || '');
+        } catch (_) {
+            /* noop */
+        }
+    }, [isOpen, client]);
 
-// Persist translation settings to localStorage and Matrix account data
-useEffect(() => {
-    const t = setTimeout(() => {
-        const payload = {
-            baseUrl: (translationUrl || '').trim(),
-            apiKey: (translationApiKey || '').trim() || undefined,
-        };
-        setTranslationSettings(client, payload);
-    }, 400);
-    return () => clearTimeout(t);
-}, [translationUrl, translationApiKey, client]);
+    // Persist translation settings to localStorage and Matrix account data
+    useEffect(() => {
+        const t = setTimeout(() => {
+            const payload = {
+                baseUrl: (translationUrl || '').trim(),
+                apiKey: (translationApiKey || '').trim() || undefined,
+            };
+            setTranslationSettings(client, payload);
+        }, 400);
+        return () => clearTimeout(t);
+    }, [translationUrl, translationApiKey, client]);
+
+    useEffect(() => {
+        if (!isOpen) {
+            setIsSecurityOpen(false);
+        }
+    }, [isOpen]);
 
     if (!isOpen) return null;
 
@@ -205,6 +215,19 @@ useEffect(() => {
                         </div>
                     </div>
 
+                    <div className="pt-6 border-t border-border-primary">
+                        <h3 className="text-lg font-semibold text-text-primary mb-3">Security</h3>
+                        <p className="text-sm text-text-secondary mb-4">
+                            Управляйте доверенными устройствами, ключами шифрования и резервными копиями прямо из приложения.
+                        </p>
+                        <button
+                            onClick={() => setIsSecurityOpen(true)}
+                            className="px-4 py-2 rounded-md border border-border-primary text-sm font-medium text-text-primary hover:bg-bg-tertiary focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-ring-focus focus:ring-offset-bg-primary"
+                        >
+                            Открыть настройки безопасности
+                        </button>
+                    </div>
+
 <div className="pt-6 border-t border-border-primary">
     <h3 className="text-lg font-semibold text-text-primary mb-3">Перевод сообщений</h3>
     <div className="space-y-4">
@@ -275,6 +298,8 @@ useEffect(() => {
                 </div>
             </div>
         </div>
+        <SecuritySettings client={client} isOpen={isSecurityOpen} onClose={() => setIsSecurityOpen(false)} />
+    </div>
     );
 };
 

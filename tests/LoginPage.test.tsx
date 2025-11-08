@@ -38,7 +38,7 @@ describe('LoginPage', () => {
   it('enables editing homeserver details for self-hosted connections', () => {
     render(<LoginPage onLoginSuccess={vi.fn()} initialError={null} />);
 
-    fireEvent.click(screen.getByRole('button', { name: /Ваш сервер/i }));
+    fireEvent.click(screen.getByRole('button', { name: /Существующий сервер/i }));
 
     const homeserverInput = screen.getByLabelText(/Homeserver URL/i) as HTMLInputElement;
     expect(homeserverInput.readOnly).toBe(false);
@@ -67,7 +67,7 @@ describe('LoginPage', () => {
     });
 
     expect(resolveMock).toHaveBeenCalledWith('https://matrix.org');
-    expect(loginMock).toHaveBeenCalledWith('https://resolved.example', 'alice', 'secret', undefined);
+    expect(loginMock).toHaveBeenCalledWith('https://resolved.example', 'alice', 'secret');
   });
 
   it('submits registration form and calls register handler', async () => {

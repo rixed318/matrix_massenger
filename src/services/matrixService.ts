@@ -11,8 +11,10 @@ import {
     Visibility,
     AutoDiscovery,
     AutoDiscoveryAction,
-    AutoDiscoveryError, 
+    AutoDiscoveryError,
     IndexedDBStore, IndexedDBCryptoStore, ClientEvent, MemoryStore, MatrixScheduler} from 'matrix-js-sdk';
+import { exportRoomKeysAsJson, importRoomKeysFromJson, saveEncryptedSeed, loadEncryptedSeed } from './e2eeService';
+import { SecureCloudProfile } from './secureCloudService';
 
 
 // ===== Offline Outbox Queue (IndexedDB/SQLite) =====
@@ -322,28 +324,299 @@ export const resolveHomeserverBaseUrl = async (input: string): Promise<string> =
 
 
 // ===== E2EE bootstrap helpers =====
-let _idbStore: IndexedDBStore | null = null;
+let _idbStore: IndexedDBStore | MemoryStore | null = null;
 let _cryptoStore: IndexedDBCryptoStore | null = null;
 let _scheduler: MatrixScheduler | null = null;
+let rustCryptoInitPromise: Promise<boolean> | null = null;
+
+export const ensureRustCrypto = async (): Promise<boolean> => {
+    if (!rustCryptoInitPromise) {
+        rustCryptoInitPromise = (async () => {
+            try {
+                const wasm: any = await import('@matrix-org/matrix-sdk-crypto-wasm');
+                if (typeof wasm?.initAsync === 'function') {
+                    await wasm.initAsync();
+                    return true;
+                }
+            } catch (e) {
+                console.warn('matrix-sdk-crypto-wasm init failed', e);
+            }
+            return false;
+        })();
+    }
+    return rustCryptoInitPromise;
+};
+
+export type CryptoBackendKind = 'rust' | 'legacy' | 'none';
+
+export const initCryptoBackend = async (client: MatrixClient): Promise<CryptoBackendKind> => {
+    const anyClient = client as any;
+
+    if (typeof anyClient.initRustCrypto === 'function') {
+        const rustReady = await ensureRustCrypto();
+        if (rustReady) {
+            try {
+                await anyClient.initRustCrypto();
+                anyClient.setGlobalErrorOnUnknownDevices?.(false);
+                return 'rust';
+            } catch (e) {
+                console.warn('initRustCrypto failed, falling back to legacy Olm backend', e);
+            }
+        }
+    }
+
+    const olmReady = await ensureOlm();
+    if (olmReady && typeof anyClient.initCrypto === 'function') {
+        try {
+            await anyClient.initCrypto();
+            anyClient.setGlobalErrorOnUnknownDevices?.(false);
+            return 'legacy';
+        } catch (e) {
+            console.warn('initCrypto failed', e);
+        }
+    }
+
+    return 'none';
+};
+
+export interface EncryptionSessionState {
+    roomId: string;
+    isEncrypted: boolean;
+    algorithm: string | null;
+    lastPreparedAt: number | null;
+    lastRotatedAt: number | null;
+    error?: string | null;
+}
+
+const encryptionSessions = new Map<string, EncryptionSessionState>();
+
+const ensureSessionEntry = (roomId: string): EncryptionSessionState => {
+    const existing = encryptionSessions.get(roomId);
+    if (existing) return existing;
+    const created: EncryptionSessionState = {
+        roomId,
+        isEncrypted: false,
+        algorithm: null,
+        lastPreparedAt: null,
+        lastRotatedAt: null,
+        error: null,
+    };
+    encryptionSessions.set(roomId, created);
+    return created;
+};
+
+const updateSession = (roomId: string, patch: Partial<EncryptionSessionState>): EncryptionSessionState => {
+    const base = ensureSessionEntry(roomId);
+    const next = { ...base, ...patch } as EncryptionSessionState;
+    encryptionSessions.set(roomId, next);
+    return next;
+};
+
+const getRoomEncryptionEvent = (room: MatrixRoom | null | undefined): any => {
+    try {
+        const event = room?.currentState?.getStateEvents?.(EventType.RoomEncryption, '') as any;
+        return event?.getContent?.() ?? null;
+    } catch (e) {
+        console.warn('Failed to read room encryption event', e);
+        return null;
+    }
+};
+
+export const getEncryptionSessionState = (roomId: string): EncryptionSessionState | null => {
+    return encryptionSessions.get(roomId) ?? null;
+};
+
+export const listEncryptionSessionStates = (): EncryptionSessionState[] => {
+    return Array.from(encryptionSessions.values());
+};
+
+export interface EnsureRoomEncryptionOptions {
+    algorithm?: string;
+    rotationPeriodMs?: number;
+    rotationPeriodMsgs?: number;
+}
+
+export const ensureRoomEncryption = async (
+    client: MatrixClient,
+    roomId: string,
+    options?: EnsureRoomEncryptionOptions,
+): Promise<EncryptionSessionState> => {
+    const room = client.getRoom(roomId);
+    if (!room) {
+        throw new Error(`Room ${roomId} not found`);
+    }
+
+    const targetAlgorithm = options?.algorithm ?? 'm.megolm.v1.aes-sha2';
+
+    if (!client.isRoomEncrypted(roomId)) {
+        try {
+            await client.setRoomEncryption(roomId, {
+                algorithm: targetAlgorithm,
+                rotation_period_ms: options?.rotationPeriodMs,
+                rotation_period_msgs: options?.rotationPeriodMsgs,
+            } as any);
+        } catch (error) {
+            const msg = error instanceof Error ? error.message : String(error ?? 'unknown error');
+            return updateSession(roomId, { isEncrypted: false, error: msg });
+        }
+    }
+
+    const crypto = client.getCrypto?.();
+    try {
+        if (crypto?.prepareToEncrypt) {
+            crypto.prepareToEncrypt(room);
+        } else {
+            (client as any).prepareToEncrypt?.(room);
+        }
+        const content = getRoomEncryptionEvent(room);
+        return updateSession(roomId, {
+            isEncrypted: client.isRoomEncrypted(roomId),
+            algorithm: (content?.algorithm as string) ?? targetAlgorithm,
+            lastPreparedAt: Date.now(),
+            error: null,
+        });
+    } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error ?? 'unknown error');
+        return updateSession(roomId, {
+            isEncrypted: client.isRoomEncrypted(roomId),
+            algorithm: targetAlgorithm,
+            lastPreparedAt: Date.now(),
+            error: msg,
+        });
+    }
+};
+
+export const rotateRoomMegolmSession = (client: MatrixClient, roomId: string): EncryptionSessionState => {
+    const crypto = client.getCrypto?.();
+    try {
+        if (crypto?.forceDiscardSession) {
+            crypto.forceDiscardSession(roomId);
+        } else {
+            (client as any).forceDiscardSession?.(roomId);
+        }
+    } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error ?? 'unknown error');
+        return updateSession(roomId, { lastRotatedAt: Date.now(), error: msg });
+    }
+    return updateSession(roomId, { lastRotatedAt: Date.now(), error: null });
+};
+
+const KEY_BACKUP_LABEL = 'econix.matrix.keys.backup';
+let keyBackupStopper: (() => void) | null = null;
+let lastKeyBackupAt: number | null = null;
+
+const performKeyBackup = async (client: MatrixClient, passphrase: string): Promise<void> => {
+    const payload = await exportRoomKeysAsJson(client);
+    await saveEncryptedSeed(KEY_BACKUP_LABEL, payload, passphrase);
+    lastKeyBackupAt = Date.now();
+};
+
+export const backupRoomKeysOnce = async (client: MatrixClient, passphrase: string): Promise<boolean> => {
+    if (!passphrase) return false;
+    await performKeyBackup(client, passphrase);
+    return true;
+};
+
+export const restoreRoomKeysFromBackup = async (client: MatrixClient, passphrase: string): Promise<boolean> => {
+    if (!passphrase) return false;
+    const payload = await loadEncryptedSeed(KEY_BACKUP_LABEL, passphrase);
+    if (!payload) return false;
+    await importRoomKeysFromJson(client, payload);
+    return true;
+};
+
+export const startManagedKeyBackup = (
+    client: MatrixClient,
+    passphraseProvider: () => Promise<string>,
+): (() => void) => {
+    stopManagedKeyBackup();
+
+    let stopped = false;
+    let timer: number | null = null;
+
+    const run = async () => {
+        try {
+            const pass = await passphraseProvider();
+            if (!pass) return;
+            await performKeyBackup(client, pass);
+        } catch (err) {
+            console.warn('Managed key backup failed', err);
+        }
+    };
+
+    const schedule = () => {
+        if (stopped) return;
+        timer = window.setTimeout(async () => {
+            await run();
+            schedule();
+        }, 5 * 60 * 1000);
+    };
+
+    const beforeUnload = () => { void run(); };
+    const onDevicesUpdated = () => { void run(); };
+
+    void run();
+    schedule();
+    window.addEventListener('beforeunload', beforeUnload);
+    (client as any)?.on?.('crypto.devicesUpdated', onDevicesUpdated);
+
+    const stop = () => {
+        stopped = true;
+        if (timer) window.clearTimeout(timer);
+        window.removeEventListener('beforeunload', beforeUnload);
+        (client as any)?.removeListener?.('crypto.devicesUpdated', onDevicesUpdated);
+        keyBackupStopper = null;
+    };
+
+    keyBackupStopper = stop;
+    return stop;
+};
+
+export const stopManagedKeyBackup = (): void => {
+    if (keyBackupStopper) {
+        const stopper = keyBackupStopper;
+        keyBackupStopper = null;
+        stopper();
+    }
+};
+
+export const getKeyBackupStatus = (): { active: boolean; lastBackupAt: number | null; label: string } => ({
+    active: keyBackupStopper !== null,
+    lastBackupAt: lastKeyBackupAt,
+    label: KEY_BACKUP_LABEL,
+});
 
 /**
  * Dynamically load Olm if available. Works in browser and Tauri.
  * Safe to call many times.
  */
-export const ensureOlm = async (): Promise<void> => {
+let olmInitPromise: Promise<boolean> | null = null;
+
+export const ensureOlm = async (): Promise<boolean> => {
     if ((globalThis as any).Olm && typeof (globalThis as any).Olm.init === 'function') {
-        await (globalThis as any).Olm.init();
-        return;
-    }
-    try {
-        const mod: any = await import(/* webpackIgnore: true */ '@matrix-org/olm');
-        if (mod?.init) {
-            await mod.init();
-            (globalThis as any).Olm = mod;
+        try {
+            await (globalThis as any).Olm.init();
+            return true;
+        } catch (e) {
+            console.warn('Olm init failed', e);
         }
-    } catch (e) {
-        console.warn('Olm not available. E2EE will be disabled.', e);
     }
+    if (!olmInitPromise) {
+        olmInitPromise = (async () => {
+            try {
+                const mod: any = await import('@matrix-org/olm');
+                if (mod?.init) {
+                    await mod.init();
+                    (globalThis as any).Olm = mod;
+                    return true;
+                }
+            } catch (e) {
+                console.warn('Olm not available. Falling back to Rust crypto if possible.', e);
+            }
+            return false;
+        })();
+    }
+    return olmInitPromise;
 };
 
 /**
@@ -383,31 +656,30 @@ export const initClient = async (homeserverUrl: string, accessToken?: string, us
             _cryptoStore = null;
         }
     }
-    
-if (!_idbStore) {
-    try {
-        _idbStore = new MemoryStore({ localStorage: (globalThis as any).localStorage } as any);
-        await (_idbStore as any).startup?.();
-    } catch (e) {
-        console.warn('MemoryStore unavailable.', e);
-        _idbStore = null;
-    }
-}
 
-if (_idbStore) {
+    if (!_idbStore) {
+        try {
+            _idbStore = new MemoryStore({ localStorage: (globalThis as any).localStorage } as any);
+            await (_idbStore as any).startup?.();
+        } catch (e) {
+            console.warn('MemoryStore unavailable.', e);
+            _idbStore = null;
+        }
+    }
+
+    if (_idbStore) {
         (options as any).store = _idbStore;
     }
     if (_cryptoStore) {
         (options as any).cryptoStore = _cryptoStore as any;
     }
-    
 
-if (!_scheduler) {
-    _scheduler = new MatrixScheduler();
-}
-(options as any).scheduler = _scheduler as any;
+    if (!_scheduler) {
+        _scheduler = new MatrixScheduler();
+    }
+    (options as any).scheduler = _scheduler as any;
 
-if (accessToken && userId) {
+    if (accessToken && userId) {
         options.accessToken = accessToken;
         options.userId = userId;
     }
@@ -424,31 +696,24 @@ export const login = async (
 ): Promise<MatrixClient> => {
     const client = await initClient(homeserverUrl);
     await client.loginWithPassword(username, password);
-    await ensureOlm();
-    try {
-        await (client as any).initCrypto();
-        (client as any).setGlobalErrorOnUnknownDevices?.(false);
-    } catch (e) {
-        console.warn('initCrypto failed or not supported', e);
-    }
+    await initCryptoBackend(client);
     const firstSync = waitForFirstSync(client);
     await (client as any).startClient({ initialSyncLimit: 30, cryptoStore: _cryptoStore } as any);
 
-try {
-    await (client as any).store?.startup?.();
-} catch (e) {
-    console.warn('client.store.startup failed or not available', e);
-}
-try {
-    // Preload local history from the persistent store before network responses arrive
-    const rs = client.getRooms();
-    for (const r of rs) {
-        try { r.getLiveTimeline(); } catch (_) {}
+    try {
+        await (client as any).store?.startup?.();
+    } catch (e) {
+        console.warn('client.store.startup failed or not available', e);
     }
-} catch (e) {
-    console.warn('Preload local history failed', e);
-}
-
+    try {
+        // Preload local history from the persistent store before network responses arrive
+        const rs = client.getRooms();
+        for (const r of rs) {
+            try { r.getLiveTimeline(); } catch (_) {}
+        }
+    } catch (e) {
+        console.warn('Preload local history failed', e);
+    }
 
     await firstSync;
     try { bindOutboxToClient(client); } catch (e) { console.warn('bindOutboxToClient failed', e); }
@@ -601,138 +866,108 @@ export const mxcToHttp = (client: MatrixClient, mxcUrl: string | null | undefine
 const URL_REGEX = /(https?:\/\/[^\s]+)/;
 
 
-export const sendMessage = async (
+export function sendMessage(
     client: MatrixClient,
     roomId: string,
     body: string,
     replyToEvent?: MatrixEvent,
     threadRootId?: string,
     roomMembers: MatrixUser[] = []
-): Promise<{ event_id: string }> => {
-    const mentionedUserIds = new Set<string>();
-    const formattedBodyParts: string[] = [];
-    const parts = body.split(/(@[a-zA-Z0-9\._-]*)/g);
+): Promise<{ event_id: string }> {
+    return (async () => {
+        const mentionedUserIds = new Set<string>();
+        const formattedBodyParts: string[] = [];
+        const parts = body.split(/(@[a-zA-Z0-9\._-]*)/g);
 
-    parts.forEach(part => {
-        if (part.startsWith('@')) {
-            const member = roomMembers.find(m => m.displayName === part.substring(1) || m.userId === part);
-            if (member) {
-                mentionedUserIds.add(member.userId);
-                formattedBodyParts.push(`<a href="https://matrix.to/#/${member.userId}">${member.displayName}</a>`);
-                return;
-            }
-        }
-        formattedBodyParts.push(part.replace(/</g, '&lt;').replace(/>/g, '&gt;'));
-    });
-
-    const content: any = {
-        msgtype: MsgType.Text,
-        body: body,
-    };
-
-    if (mentionedUserIds.size > 0) {
-        content.format = 'org.matrix.custom.html';
-        content.formatted_body = formattedBodyParts.join('');
-        content['m.mentions'] = {
-            user_ids: Array.from(mentionedUserIds),
-        };
-    }
-
-    const urlMatch = body.match(/(https?:\/\/[^\s]+)/);
-    if (urlMatch) {
-        try {
-            const previewData = await client.getUrlPreview(urlMatch[0], Date.now());
-            if (previewData && Object.keys(previewData).length > 0) {
-                const imageUrl = previewData['og:image'] ? mxcToHttp(client, previewData['og:image']) : undefined;
-                content['custom.url_preview'] = {
-                    url: previewData['og:url'] || urlMatch[0],
-                    image: imageUrl,
-                    title: previewData['og:title'],
-                    description: previewData['og:description'],
-                    siteName: previewData['og:site_name'],
-                };
-            }
-        } catch (e) { /* ignore preview errors */ }
-    }
-
-    if (threadRootId) {
-        content['m.relates_to'] = {
-            'rel_type': 'm.thread',
-            'event_id': threadRootId,
-            ...(replyToEvent && {
-                "m.in_reply_to": { "event_id": replyToEvent.getId() }
-            })
-        };
-    } else if (replyToEvent) {
-        content['m.relates_to'] = { "m.in_reply_to": { "event_id": replyToEvent.getId() } };
-    }
-
-    // If offline or not yet syncing, enqueue to outbox and return local id.
-    if (!navigator.onLine) {
-        const localId = await enqueueOutbox(roomId, EventType.RoomMessage as any, content, { threadRootId, replyToEventId: replyToEvent?.getId?.() });
-        return { event_id: localId };
-    }
-
-    try {
-        const res = await client.sendEvent(roomId, EventType.RoomMessage, content as any);
-        return res;
-    } catch (err) {
-        // Network/server issue: save to outbox for retry
-        const localId = await enqueueOutbox(roomId, EventType.RoomMessage as any, content, { threadRootId, replyToEventId: replyToEvent?.getId?.() });
-        return { event_id: localId };
-    }
-};
-
-
-    if (mentionedUserIds.size > 0) {
-        content.format = 'org.matrix.custom.html';
-        content.formatted_body = formattedBodyParts.join('');
-        content['m.mentions'] = {
-            user_ids: Array.from(mentionedUserIds),
-        };
-    }
-
-    const urlMatch = body.match(URL_REGEX);
-    if (urlMatch) {
-        try {
-            // FIX: The `getUrlPreview` method requires a timestamp as its second argument. Passing `Date.now()` to satisfy this requirement.
-            const previewData = await client.getUrlPreview(urlMatch[0], Date.now());
-            if (previewData && Object.keys(previewData).length > 0) {
-                const imageUrl = previewData['og:image'] ? mxcToHttp(client, previewData['og:image']) : undefined;
-                
-                content['custom.url_preview'] = {
-                    url: previewData['og:url'] || urlMatch[0],
-                    image: imageUrl,
-                    title: previewData['og:title'],
-                    description: previewData['og:description'],
-                    siteName: previewData['og:site_name'],
-                };
-            }
-        } catch (e) {
-            console.warn("Failed to get URL preview:", e);
-        }
-    }
-    
-    if (threadRootId) {
-        content['m.relates_to'] = {
-            'rel_type': 'm.thread',
-            'event_id': threadRootId,
-            ...(replyToEvent && {
-                "m.in_reply_to": {
-                    "event_id": replyToEvent.getId(),
+        parts.forEach(part => {
+            if (part.startsWith('@')) {
+                const member = roomMembers.find(m => m.displayName === part.substring(1) || m.userId === part);
+                if (member) {
+                    mentionedUserIds.add(member.userId);
+                    formattedBodyParts.push(`<a href="https://matrix.to/#/${member.userId}">${member.displayName}</a>`);
+                    return;
                 }
-            })
-        };
-    } else if (replyToEvent) {
-        content['m.relates_to'] = {
-            "m.in_reply_to": {
-                "event_id": replyToEvent.getId(),
-            },
-        };
-    }
+            }
+            formattedBodyParts.push(part.replace(/</g, '&lt;').replace(/>/g, '&gt;'));
+        });
 
-    return client.sendEvent(roomId, EventType.RoomMessage, content);
-};
+        const content: any = {
+            msgtype: MsgType.Text,
+            body: body,
+        };
+
+        if (mentionedUserIds.size > 0) {
+            content.format = 'org.matrix.custom.html';
+            content.formatted_body = formattedBodyParts.join('');
+            content['m.mentions'] = {
+                user_ids: Array.from(mentionedUserIds),
+            };
+        }
+
+        const urlMatch = body.match(URL_REGEX);
+        if (urlMatch) {
+            try {
+                // FIX: The `getUrlPreview` method requires a timestamp as its second argument. Passing `Date.now()` to satisfy this requirement.
+                const previewData = await client.getUrlPreview(urlMatch[0], Date.now());
+                if (previewData && Object.keys(previewData).length > 0) {
+                    const imageUrl = previewData['og:image'] ? mxcToHttp(client, previewData['og:image']) : undefined;
+
+                    content['custom.url_preview'] = {
+                        url: previewData['og:url'] || urlMatch[0],
+                        image: imageUrl,
+                        title: previewData['og:title'],
+                        description: previewData['og:description'],
+                        siteName: previewData['og:site_name'],
+                    };
+                }
+            } catch (e) {
+                console.warn('Failed to get URL preview:', e);
+            }
+        }
+
+        if (threadRootId) {
+            content['m.relates_to'] = {
+                'rel_type': 'm.thread',
+                'event_id': threadRootId,
+                ...(replyToEvent && {
+                    'm.in_reply_to': {
+                        'event_id': replyToEvent.getId(),
+                    }
+                }),
+            };
+        } else if (replyToEvent) {
+            content['m.relates_to'] = {
+                'm.in_reply_to': {
+                    'event_id': replyToEvent.getId(),
+                },
+            };
+        }
+
+        const queueOutbox = async () => {
+            const localId = await enqueueOutbox(roomId, EventType.RoomMessage, content, {
+                threadRootId,
+                replyToEventId: replyToEvent?.getId(),
+            });
+            return { event_id: localId };
+        };
+
+        const isOffline = () => typeof navigator !== 'undefined' && navigator.onLine === false;
+        if (isOffline()) {
+            return queueOutbox();
+        }
+
+        try {
+            return await client.sendEvent(roomId, EventType.RoomMessage, content);
+        } catch (error: any) {
+            const message = typeof error?.message === 'string' ? error.message : '';
+            const shouldQueue = isOffline() || /network|fetch/i.test(message);
+            if (shouldQueue) {
+                return queueOutbox();
+            }
+            throw error;
+        }
+    })();
+}
 
 export const compressImage = (file: File, maxWidth = 1280): Promise<File> => {
     if (!file.type.startsWith('image/')) {

@@ -226,9 +226,14 @@ export function onDevicesUpdated(client: MatrixClient, cb: (userIds: string[])=>
   const handler = (userIds: string[]) => cb(userIds);
   anyClient?.on?.('crypto.devicesUpdated', handler);
   // Back-compat alias sometimes seen in older apps
-  anyClient?.on?.(ClientEvent.DeviceListUpdated as any, handler);
+  const legacyEvent = (ClientEvent as any)?.DeviceListUpdated;
+  if (legacyEvent) {
+    anyClient?.on?.(legacyEvent as any, handler);
+  }
   return () => {
     anyClient?.removeListener?.('crypto.devicesUpdated', handler);
-    anyClient?.removeListener?.(ClientEvent.DeviceListUpdated as any, handler);
+    if (legacyEvent) {
+      anyClient?.removeListener?.(legacyEvent as any, handler);
+    }
   };
 }
