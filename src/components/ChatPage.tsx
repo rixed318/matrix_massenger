@@ -5,7 +5,7 @@ import RoomList from './RoomList';
 import MessageView from './MessageView';
 import ChatHeader from './ChatHeader';
 import MessageInput from './MessageInput';
-import { mxcToHttp, sendReaction, sendTypingIndicator, editMessage, sendMessage, deleteMessage, sendImageMessage, sendReadReceipt, sendFileMessage, setDisplayName, setAvatar, createRoom, inviteUser, forwardMessage, paginateRoomHistory, sendAudioMessage, setPinnedMessages, sendPollStart, sendPollResponse, translateText, sendStickerMessage, sendGifMessage } from '../services/matrixService';
+import { mxcToHttp, sendReaction, sendTypingIndicator, editMessage, sendMessage, deleteMessage, sendImageMessage, sendReadReceipt, sendFileMessage, setDisplayName, setAvatar, createRoom, inviteUser, forwardMessage, paginateRoomHistory, sendAudioMessage, setPinnedMessages, sendPollStart, sendPollResponse, translateText, sendStickerMessage, sendGifMessage, getSecureCloudProfileForClient } from '../services/matrixService';
 import { startGroupCall, joinGroupCall, getDisplayMedia, enumerateDevices } from '../services/matrixService';
 import {
     getScheduledMessages,
@@ -38,6 +38,8 @@ import { SearchResultItem } from '../services/searchService';
 // FIX: Import event enums to use with the event emitter instead of string literals, which are not assignable.
 // FIX: `CallErrorCode` is not an exported member of `matrix-js-sdk`. It has been removed.
 import { NotificationCountType, EventType, MsgType, ClientEvent, RoomEvent, UserEvent, RelationType, CallEvent } from 'matrix-js-sdk';
+import { startSecureCloudSession, acknowledgeSuspiciousEvents } from '../services/secureCloudService';
+import type { SuspiciousEventNotice, SecureCloudSession } from '../services/secureCloudService';
 
 interface ChatPageProps {
     client: MatrixClient;
@@ -95,6 +97,9 @@ const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoom
         return localStorage.getItem('matrix-notifications-enabled') === 'true';
     });
     const [isSearchOpen, setIsSearchOpen] = useState(false);
+    const [secureCloudAlerts, setSecureCloudAlerts] = useState<Record<string, SuspiciousEventNotice[]>>({});
+    const [secureCloudError, setSecureCloudError] = useState<string | null>(null);
+    const [isSecureCloudActive, setIsSecureCloudActive] = useState(false);
     const [drafts, setDrafts] = useState<Record<string, string>>(() => {
         try {
             const storedDrafts = localStorage.getItem(DRAFT_STORAGE_KEY);
@@ -114,10 +119,11 @@ const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoom
         }
         return {};
     });
-    
+
     const scrollContainerRef = useRef<HTMLDivElement>(null);
     const oldScrollHeightRef = useRef<number>(0);
     const focusEventIdRef = useRef<string | null>(null);
+    const secureSessionRef = useRef<SecureCloudSession | null>(null);
 
     useEffect(() => {
         try {
@@ -126,6 +132,46 @@ const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoom
             console.error('Failed to persist drafts to localStorage', error);
         }
     }, [drafts]);
+
+    useEffect(() => {
+        const profile = getSecureCloudProfileForClient(client);
+        if (!profile || profile.mode === 'disabled') {
+            setIsSecureCloudActive(false);
+            setSecureCloudAlerts({});
+            secureSessionRef.current?.stop();
+            secureSessionRef.current = null;
+            return;
+        }
+
+        setIsSecureCloudActive(true);
+        setSecureCloudError(null);
+        setSecureCloudAlerts({});
+
+        const session = startSecureCloudSession(client, profile, {
+            onSuspiciousEvent: (notice) => {
+                setSecureCloudAlerts(prev => {
+                    const roomAlerts = prev[notice.roomId] ?? [];
+                    if (roomAlerts.some(existing => existing.eventId === notice.eventId)) {
+                        return prev;
+                    }
+                    return { ...prev, [notice.roomId]: [...roomAlerts, notice] };
+                });
+            },
+            onError: (error) => {
+                setSecureCloudError(error.message);
+            },
+        });
+
+        secureSessionRef.current?.stop();
+        secureSessionRef.current = session;
+
+        return () => {
+            session.stop();
+            if (secureSessionRef.current === session) {
+                secureSessionRef.current = null;
+            }
+        };
+    }, [client]);
 
     useEffect(() => {
         if (!client.getUserId()) {
@@ -264,6 +310,21 @@ const handleLayoutChange = useCallback((layout: 'grid'|'spotlight') => {
         setChatBackground('');
         localStorage.removeItem('matrix-chat-bg');
     };
+
+    const handleDismissSecureAlert = useCallback((roomId: string, eventId?: string) => {
+        setSecureCloudAlerts(prev => {
+            const existing = prev[roomId] ?? [];
+            const nextAlerts = eventId ? existing.filter(alert => alert.eventId !== eventId) : [];
+            const next: Record<string, SuspiciousEventNotice[]> = { ...prev };
+            if (nextAlerts.length === 0) {
+                delete next[roomId];
+            } else {
+                next[roomId] = nextAlerts;
+            }
+            return next;
+        });
+        acknowledgeSuspiciousEvents(client, roomId, eventId ? [eventId] : undefined);
+    }, [client]);
 
     // Scheduler check loop
     useEffect(() => {
@@ -1295,6 +1356,7 @@ const handleLayoutChange = useCallback((layout: 'grid'|'spotlight') => {
     const scheduledForThisRoom = selectedRoomId
         ? allScheduledMessages.filter(m => m.roomId === selectedRoomId && m.status !== 'sent')
         : [];
+    const activeRoomAlerts = selectedRoomId ? (secureCloudAlerts[selectedRoomId] ?? []) : [];
 
     return (
         <div className="flex h-screen">
@@ -1331,6 +1393,62 @@ const handleLayoutChange = useCallback((layout: 'grid'|'spotlight') => {
                             onPlaceCall={handlePlaceCall}
                             onOpenSearch={() => setIsSearchOpen(true)}
                         />
+                        {isSecureCloudActive && (
+                            <div className="px-4 pt-3 space-y-3">
+                                {secureCloudError && (
+                                    <div className="rounded-md border border-red-500/60 bg-red-500/10 px-3 py-2 text-sm text-red-600 flex items-start justify-between gap-4">
+                                        <span>Secure Cloud: {secureCloudError}</span>
+                                        <button
+                                            type="button"
+                                            onClick={() => setSecureCloudError(null)}
+                                            className="text-xs font-semibold uppercase tracking-wide text-red-600/80 hover:text-red-600"
+                                        >
+                                            Скрыть
+                                        </button>
+                                    </div>
+                                )}
+                                {activeRoomAlerts.length > 0 ? (
+                                    <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-700 space-y-2">
+                                        <div className="flex items-center justify-between gap-4">
+                                            <span className="font-semibold">Secure Cloud обнаружил подозрительную активность</span>
+                                            <button
+                                                type="button"
+                                                onClick={() => selectedRoomId && handleDismissSecureAlert(selectedRoomId)}
+                                                className="text-xs uppercase tracking-wide text-amber-700/80 hover:text-amber-700"
+                                            >
+                                                Очистить всё
+                                            </button>
+                                        </div>
+                                        <ul className="space-y-2 max-h-40 overflow-auto pr-1">
+                                            {activeRoomAlerts.map(alert => (
+                                                <li key={alert.eventId} className="flex items-start justify-between gap-3 text-xs text-amber-700/90">
+                                                    <div className="flex-1 min-w-0">
+                                                        <div className="flex items-center gap-2">
+                                                            <span className="font-medium truncate">{alert.sender}</span>
+                                                            <span className="text-[10px] uppercase tracking-wide">Риск {Math.round(alert.riskScore * 100)}%</span>
+                                                        </div>
+                                                        <p className="mt-1 break-words text-text-primary/90">{alert.summary || 'Без текста'}</p>
+                                                    </div>
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => handleDismissSecureAlert(alert.roomId, alert.eventId)}
+                                                        className="text-[10px] uppercase tracking-wide text-amber-700/70 hover:text-amber-700"
+                                                    >
+                                                        Скрыть
+                                                    </button>
+                                                </li>
+                                            ))}
+                                        </ul>
+                                    </div>
+                                ) : (
+                                    !secureCloudError && (
+                                        <div className="rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-700">
+                                            Secure Cloud активен. Мониторинг незашифрованных комнат выполняется локально.
+                                        </div>
+                                    )
+                                )}
+                            </div>
+                        )}
                         <MessageView
                             messages={messages}
                             client={client}

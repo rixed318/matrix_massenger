@@ -2,9 +2,24 @@ import { MatrixClient, MatrixEvent, MatrixRoom, MatrixUser, Sticker, Gif } from 
 // FIX: `RoomCreateOptions` is not an exported member of `matrix-js-sdk`. Replaced with the correct type `ICreateRoomOpts`.
 // FIX: Import Visibility enum to correctly type room creation options.
 import { createClient, ICreateClientOpts, EventType, MsgType, RelationType, ICreateRoomOpts, Visibility } from 'matrix-js-sdk';
+import type { SecureCloudProfile } from './secureCloudService';
 
 // *** ВАЖНО: Укажите здесь URL вашего сервера для перевода ***
 const TRANSLATION_SERVER_URL = 'https://your-translation-server.com/api/translate';
+
+const secureCloudProfiles = new WeakMap<MatrixClient, SecureCloudProfile>();
+
+export const setSecureCloudProfileForClient = (client: MatrixClient, profile: SecureCloudProfile | null): void => {
+    if (!profile || profile.mode === 'disabled') {
+        secureCloudProfiles.delete(client);
+        return;
+    }
+    secureCloudProfiles.set(client, profile);
+};
+
+export const getSecureCloudProfileForClient = (client: MatrixClient): SecureCloudProfile | null => {
+    return secureCloudProfiles.get(client) ?? null;
+};
 
 
 export const initClient = (homeserverUrl: string, accessToken?: string, userId?: string): MatrixClient => {
@@ -18,10 +33,18 @@ export const initClient = (homeserverUrl: string, accessToken?: string, userId?:
     return createClient(options);
 };
 
-export const login = async (homeserverUrl: string, username: string, password: string): Promise<MatrixClient> => {
+export const login = async (
+    homeserverUrl: string,
+    username: string,
+    password: string,
+    secureProfile?: SecureCloudProfile,
+): Promise<MatrixClient> => {
     const client = initClient(homeserverUrl);
     await client.loginWithPassword(username, password);
     await client.startClient({ initialSyncLimit: 10 });
+    if (secureProfile) {
+        setSecureCloudProfileForClient(client, secureProfile);
+    }
     return client;
 };
 

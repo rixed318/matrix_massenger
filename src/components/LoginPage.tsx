@@ -1,6 +1,7 @@
 import React, { useState, FormEvent, useEffect } from 'react';
 import { MatrixClient } from '../types';
 import { login } from '../services/matrixService';
+import type { SecureCloudProfile } from '../services/secureCloudService';
 
 interface LoginPageProps {
   onLoginSuccess: (client: MatrixClient) => void;
@@ -26,7 +27,7 @@ const ConnectionOption: React.FC<{ title: string; description: string; icon: Rea
 
 const LoginForm: React.FC<{ 
   connectionType: ConnectionType;
-  onLogin: (homeserverUrl: string, username: string, password: string) => Promise<void>;
+  onLogin: (homeserverUrl: string, username: string, password: string, secureProfile?: SecureCloudProfile) => Promise<void>;
   isLoading: boolean;
   error: string | null;
   onBack: () => void;
@@ -42,10 +43,55 @@ const LoginForm: React.FC<{
   const [homeserverUrl, setHomeserverUrl] = useState(getInitialUrl());
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
+  const [useSecureCloud, setUseSecureCloud] = useState(connectionType === 'secure');
+  const [secureApiUrl, setSecureApiUrl] = useState(connectionType === 'secure' ? 'https://secure-cloud.api.yourcompany.com' : '');
+  const [metadataToken, setMetadataToken] = useState('');
+  const [enablePremium, setEnablePremium] = useState(connectionType === 'secure');
+  const [enableAnalytics, setEnableAnalytics] = useState(false);
+  const [analyticsToken, setAnalyticsToken] = useState('');
+  const [riskThreshold, setRiskThreshold] = useState('0.6');
+
+  useEffect(() => {
+    setHomeserverUrl(getInitialUrl());
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [connectionType]);
+
+  useEffect(() => {
+    if (connectionType === 'secure') {
+      setUseSecureCloud(true);
+      setEnablePremium(true);
+      setSecureApiUrl(prev => prev || 'https://secure-cloud.api.yourcompany.com');
+    } else if (connectionType === 'selfhosted') {
+      setUseSecureCloud(false);
+      setEnablePremium(false);
+    }
+    setMetadataToken('');
+    setAnalyticsToken('');
+    setEnableAnalytics(false);
+    setRiskThreshold('0.6');
+  }, [connectionType]);
 
   const handleSubmit = (e: FormEvent) => {
     e.preventDefault();
-    onLogin(homeserverUrl, username, password);
+    const thresholdValue = Number.parseFloat(riskThreshold);
+    const normalisedThreshold = Number.isFinite(thresholdValue)
+      ? Math.min(1, Math.max(0, thresholdValue))
+      : 0.6;
+
+    const shouldAttachSecure = connectionType === 'secure' || useSecureCloud;
+    const secureProfile: SecureCloudProfile | undefined = shouldAttachSecure
+      ? {
+          mode: connectionType === 'secure' ? 'managed' : 'self-hosted',
+          apiBaseUrl: (secureApiUrl || homeserverUrl).trim(),
+          metadataToken: metadataToken.trim() ? metadataToken.trim() : undefined,
+          analyticsToken: enableAnalytics ? (analyticsToken.trim() || undefined) : undefined,
+          enablePremium,
+          enableAnalytics,
+          riskThreshold: normalisedThreshold,
+        }
+      : undefined;
+
+    onLogin(homeserverUrl, username, password, secureProfile);
   };
 
   return (
@@ -101,6 +147,104 @@ const LoginForm: React.FC<{
             />
           </div>
         </div>
+        {(connectionType === 'secure' || connectionType === 'selfhosted') && (
+          <div className="space-y-3 border border-border-primary rounded-md p-3 bg-bg-tertiary/30">
+            <div className="flex items-start justify-between">
+              <div>
+                <p className="text-sm font-semibold text-text-primary">Secure Cloud фильтрация</p>
+                <p className="text-xs text-text-secondary mt-1">
+                  Локальные правила анализируют незашифрованные комнаты и отправляют только метаданные в облако.
+                </p>
+              </div>
+              <label className="flex items-center space-x-2 text-xs">
+                <input
+                  type="checkbox"
+                  className="form-checkbox h-4 w-4 text-accent"
+                  disabled={connectionType === 'secure'}
+                  checked={useSecureCloud}
+                  onChange={(e) => setUseSecureCloud(e.target.checked)}
+                />
+                <span className="uppercase tracking-wide text-text-secondary">
+                  {connectionType === 'secure' ? 'Вкл.' : 'Включить'}
+                </span>
+              </label>
+            </div>
+            {useSecureCloud && (
+              <div className="space-y-2">
+                <div>
+                  <label htmlFor="secure-api" className="block text-xs font-medium text-text-secondary uppercase">Secure Cloud API</label>
+                  <input
+                    id="secure-api"
+                    name="secure-api"
+                    type="url"
+                    className="mt-1 block w-full rounded-md border border-border-primary bg-bg-secondary px-3 py-2 text-sm text-text-primary focus:outline-none focus:ring-ring-focus focus:border-ring-focus"
+                    placeholder="https://secure-cloud.api.yourcompany.com"
+                    value={secureApiUrl}
+                    onChange={(e) => setSecureApiUrl(e.target.value)}
+                    required={connectionType === 'secure'}
+                  />
+                </div>
+                <div>
+                  <label htmlFor="metadata-token" className="block text-xs font-medium text-text-secondary uppercase">Метаданные: токен</label>
+                  <input
+                    id="metadata-token"
+                    name="metadata-token"
+                    type="text"
+                    className="mt-1 block w-full rounded-md border border-border-primary bg-bg-secondary px-3 py-2 text-sm text-text-primary focus:outline-none focus:ring-ring-focus focus:border-ring-focus"
+                    placeholder="Bearer токен от Secure Cloud"
+                    value={metadataToken}
+                    onChange={(e) => setMetadataToken(e.target.value)}
+                  />
+                </div>
+                <div className="flex items-center justify-between">
+                  <label className="flex items-center space-x-2 text-sm text-text-primary">
+                    <input
+                      type="checkbox"
+                      className="form-checkbox h-4 w-4 text-accent"
+                      checked={enablePremium}
+                      onChange={(e) => setEnablePremium(e.target.checked)}
+                    />
+                    <span>Премиум-функции (анализ ссылок, превентивные баны)</span>
+                  </label>
+                </div>
+                <div className="space-y-2">
+                  <label className="flex items-center space-x-2 text-sm text-text-primary">
+                    <input
+                      type="checkbox"
+                      className="form-checkbox h-4 w-4 text-accent"
+                      checked={enableAnalytics}
+                      onChange={(e) => setEnableAnalytics(e.target.checked)}
+                    />
+                    <span>Включить аналитику администраторов</span>
+                  </label>
+                  {enableAnalytics && (
+                    <input
+                      type="text"
+                      className="block w-full rounded-md border border-border-primary bg-bg-secondary px-3 py-2 text-sm text-text-primary focus:outline-none focus:ring-ring-focus focus:border-ring-focus"
+                      placeholder="Analytics token"
+                      value={analyticsToken}
+                      onChange={(e) => setAnalyticsToken(e.target.value)}
+                    />
+                  )}
+                </div>
+                <div>
+                  <label htmlFor="risk-threshold" className="block text-xs font-medium text-text-secondary uppercase">Порог риска (0-1)</label>
+                  <input
+                    id="risk-threshold"
+                    name="risk-threshold"
+                    type="number"
+                    min={0}
+                    max={1}
+                    step={0.05}
+                    className="mt-1 block w-full rounded-md border border-border-primary bg-bg-secondary px-3 py-2 text-sm text-text-primary focus:outline-none focus:ring-ring-focus focus:border-ring-focus"
+                    value={riskThreshold}
+                    onChange={(e) => setRiskThreshold(e.target.value)}
+                  />
+                </div>
+              </div>
+            )}
+          </div>
+        )}
         {error && <p className="text-error text-sm text-center">{error}</p>}
         <div>
           <button
@@ -131,11 +275,11 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess, initialError, sav
 
   useEffect(() => setError(initialError), [initialError]);
 
-  const handleLogin = async (homeserverUrl: string, username: string, password: string) => {
+  const handleLogin = async (homeserverUrl: string, username: string, password: string, secureProfile?: SecureCloudProfile) => {
     setError(null);
     setIsLoading(true);
     try {
-      const client = await login(homeserverUrl, username, password);
+      const client = await login(homeserverUrl, username, password, secureProfile);
       onLoginSuccess(client);
     } catch (err: any) {
       console.error(err);
