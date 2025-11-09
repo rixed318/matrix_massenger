@@ -1,6 +1,17 @@
 import React from 'react';
 import { Message, Reaction, MatrixClient } from '@matrix-messenger/core';
+import { EventType } from 'matrix-js-sdk';
 import ChatMessage from './ChatMessage';
+
+interface PendingQueueEntry {
+    id: string;
+    type: string;
+    content: any;
+    attempts: number;
+    error?: string;
+    attachments?: { name?: string; kind?: string }[];
+    ts?: number;
+}
 
 interface MessageViewProps {
     messages: Message[];
@@ -24,6 +35,10 @@ interface MessageViewProps {
     canPin: boolean;
     onPinToggle: (messageId: string) => void;
     highlightedMessageId?: string | null;
+    pendingMessages?: Message[];
+    pendingQueue?: PendingQueueEntry[];
+    onRetryPending?: (id: string) => void;
+    onCancelPending?: (id: string) => void;
 }
 
 
@@ -192,13 +207,15 @@ const MessageView: React.FC<MessageViewProps> = ({
     onSetReplyTo, onForwardMessage, onImageClick, onOpenThread, onPollVote,
     onTranslateMessage, translatedMessages,
     scrollContainerRef, onScroll, onPaginate, isPaginating, canPaginate,
-    pinnedEventIds, canPin, onPinToggle, highlightedMessageId
+    pinnedEventIds, canPin, onPinToggle, highlightedMessageId,
+    pendingMessages = [], pendingQueue = [], onRetryPending, onCancelPending,
 }) => {
     
     const paginationSnapshotRef = React.useRef<{ scrollHeight: number; scrollTop: number } | null>(null);
     const heightCacheRef = React.useRef<Map<string, number>>(new Map());
     const [measurementVersion, setMeasurementVersion] = React.useState(0);
     const [scrollState, setScrollState] = React.useState({ scrollTop: 0, viewportHeight: 0 });
+    const displayMessages = React.useMemo(() => [...messages, ...pendingMessages], [messages, pendingMessages]);
 
     const registerHeight = React.useCallback((messageId: string, height: number) => {
         const normalizedHeight = Math.max(1, Math.round(height));
@@ -209,12 +226,31 @@ const MessageView: React.FC<MessageViewProps> = ({
         }
     }, []);
 
+    const renderQueueLabel = React.useCallback((entry: PendingQueueEntry) => {
+        if (entry.type === EventType.RoomMessage) {
+            const body = typeof entry.content?.body === 'string' ? entry.content.body.trim() : '';
+            if (body) {
+                return body;
+            }
+            const attachmentName = entry.attachments?.find(att => att?.name)?.name;
+            if (attachmentName) {
+                return attachmentName;
+            }
+            return 'Сообщение';
+        }
+        if (entry.type === EventType.Reaction) {
+            const key = entry.content?.['m.relates_to']?.key;
+            return key ? `Реакция ${key}` : 'Реакция';
+        }
+        return entry.type;
+    }, []);
+
     const measurements = React.useMemo<VirtualMeasurement[]>(() => {
         const result: VirtualMeasurement[] = [];
         let offset = 0;
 
-        for (let index = 0; index < messages.length; index += 1) {
-            const message = messages[index];
+        for (let index = 0; index < displayMessages.length; index += 1) {
+            const message = displayMessages[index];
             const size = heightCacheRef.current.get(message.id) ?? ESTIMATED_ITEM_HEIGHT;
             const start = offset;
             const end = start + size;
@@ -223,7 +259,7 @@ const MessageView: React.FC<MessageViewProps> = ({
         }
 
         return result;
-    }, [messages, measurementVersion]);
+    }, [displayMessages, measurementVersion]);
 
     const totalHeight = measurements.length > 0 ? measurements[measurements.length - 1].end : 0;
 
@@ -300,7 +336,7 @@ const MessageView: React.FC<MessageViewProps> = ({
             if (state.scrollTop === nextScrollTop) return state;
             return { ...state, scrollTop: nextScrollTop };
         });
-    }, [messages, scrollContainerRef]);
+    }, [displayMessages, scrollContainerRef]);
 
     return (
         <div
@@ -326,7 +362,7 @@ const MessageView: React.FC<MessageViewProps> = ({
                 }}
             >
                 {virtualItems.map((virtualItem) => {
-                    const msg = messages[virtualItem.index];
+                    const msg = displayMessages[virtualItem.index];
                     if (!msg) return null;
 
                     return (
@@ -334,7 +370,7 @@ const MessageView: React.FC<MessageViewProps> = ({
                             key={msg.id}
                             message={msg}
                             start={virtualItem.start}
-                            isLast={virtualItem.index === messages.length - 1}
+                            isLast={virtualItem.index === displayMessages.length - 1}
                             registerHeight={registerHeight}
                         >
                             <ChatMessage
@@ -360,6 +396,59 @@ const MessageView: React.FC<MessageViewProps> = ({
                     );
                 })}
             </div>
+            {pendingQueue.length > 0 && (
+                <div className="mt-4 space-y-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-100">
+                    <div className="flex items-center justify-between gap-2">
+                        <span className="font-semibold text-sm text-amber-200">
+                            Несинхронизированные события ({pendingQueue.length})
+                        </span>
+                        <span className="text-[11px] text-amber-200/70">
+                            Автоотправка при восстановлении связи
+                        </span>
+                    </div>
+                    <ul className="space-y-1">
+                        {pendingQueue.map((entry) => {
+                            const timeLabel = entry.ts ? new Date(entry.ts).toLocaleTimeString() : null;
+                            return (
+                                <li key={entry.id} className="flex items-start justify-between gap-3">
+                                    <div className="flex-1 min-w-0">
+                                        <p className="text-xs text-amber-100 truncate">{renderQueueLabel(entry)}</p>
+                                        <p className="text-[11px] text-amber-200/80 mt-1">
+                                            Попыток: {entry.attempts}
+                                            {timeLabel ? ` • ${timeLabel}` : ''}
+                                        </p>
+                                        {entry.error && (
+                                            <p className="text-[11px] text-amber-300/90 mt-1 line-clamp-2">
+                                                Ошибка: {entry.error}
+                                            </p>
+                                        )}
+                                    </div>
+                                    <div className="flex items-center gap-2 shrink-0">
+                                        {onRetryPending && (
+                                            <button
+                                                type="button"
+                                                onClick={() => onRetryPending(entry.id)}
+                                                className="text-[11px] font-semibold uppercase tracking-wide text-amber-100/90 hover:text-amber-50"
+                                            >
+                                                Повторить
+                                            </button>
+                                        )}
+                                        {onCancelPending && (
+                                            <button
+                                                type="button"
+                                                onClick={() => onCancelPending(entry.id)}
+                                                className="text-[11px] font-semibold uppercase tracking-wide text-amber-100/60 hover:text-amber-50"
+                                            >
+                                                Отменить
+                                            </button>
+                                        )}
+                                    </div>
+                                </li>
+                            );
+                        })}
+                    </ul>
+                </div>
+            )}
         </div>
     );
 };

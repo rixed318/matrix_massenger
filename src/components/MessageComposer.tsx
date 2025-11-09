@@ -2,6 +2,16 @@ import React from 'react';
 import MessageInput from './MessageInput';
 import { Gif, MatrixClient, MatrixUser, Message, Sticker, DraftContent, SendKeyBehavior } from '../types';
 
+interface PendingQueueEntry {
+    id: string;
+    type: string;
+    content: any;
+    attempts: number;
+    error?: string;
+    attachments?: { name?: string; kind?: string }[];
+    ts?: number;
+}
+
 interface MessageComposerProps {
     onSendMessage: (content: { body: string; formattedBody?: string }, threadRootId?: string) => Promise<void> | void;
     onSendFile: (file: File) => Promise<void> | void;
@@ -20,6 +30,9 @@ interface MessageComposerProps {
     onDraftChange: (content: DraftContent) => void;
     isOffline: boolean;
     sendKeyBehavior: SendKeyBehavior;
+    pendingQueue?: PendingQueueEntry[];
+    onRetryPending?: (id: string) => void;
+    onCancelPending?: (id: string) => void;
 }
 
 const MessageComposer: React.FC<MessageComposerProps> = ({
@@ -40,13 +53,69 @@ const MessageComposer: React.FC<MessageComposerProps> = ({
     onDraftChange,
     isOffline,
     sendKeyBehavior,
+    pendingQueue = [],
+    onRetryPending,
+    onCancelPending,
 }) => {
+    const renderQueueLabel = React.useCallback((entry: PendingQueueEntry) => {
+        if (entry.type === 'm.room.message') {
+            const body = typeof entry.content?.body === 'string' ? entry.content.body.trim() : '';
+            if (body) return body;
+            const attachmentName = entry.attachments?.find(att => att?.name)?.name;
+            if (attachmentName) return attachmentName;
+            return 'Сообщение';
+        }
+        if (entry.type === 'm.reaction') {
+            const key = entry.content?.['m.relates_to']?.key;
+            return key ? `Реакция ${key}` : 'Реакция';
+        }
+        return entry.type;
+    }, []);
+
     return (
         <div className="border-t border-border-secondary bg-bg-primary">
             {isOffline && (
                 <div className="px-4 py-2 text-xs text-text-inverted bg-status-offline flex items-center gap-2">
                     <span role="img" aria-label="offline">⚠️</span>
                     You are offline. Messages will be sent when connection is restored.
+                </div>
+            )}
+            {pendingQueue.length > 0 && (
+                <div className="px-4 py-2 text-[11px] text-amber-100 bg-amber-500/10 border-b border-amber-500/40 space-y-1">
+                    <div className="flex items-center justify-between gap-2">
+                        <span className="font-semibold uppercase tracking-wide text-amber-200">
+                            Несинхронизированные события
+                        </span>
+                        <span className="text-amber-200/70">{pendingQueue.length}</span>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                        {pendingQueue.map(entry => (
+                            <div
+                                key={entry.id}
+                                className="flex items-center gap-2 rounded-full bg-amber-500/20 px-3 py-1"
+                            >
+                                <span className="truncate max-w-[160px] text-amber-100">{renderQueueLabel(entry)}</span>
+                                {onRetryPending && (
+                                    <button
+                                        type="button"
+                                        onClick={() => onRetryPending(entry.id)}
+                                        className="text-[10px] uppercase tracking-wide text-amber-100/90 hover:text-amber-50"
+                                    >
+                                        ↻
+                                    </button>
+                                )}
+                                {onCancelPending && (
+                                    <button
+                                        type="button"
+                                        onClick={() => onCancelPending(entry.id)}
+                                        className="text-[10px] uppercase tracking-wide text-amber-100/70 hover:text-amber-50"
+                                    >
+                                        ✕
+                                    </button>
+                                )}
+                            </div>
+                        ))}
+                    </div>
                 </div>
             )}
             <MessageInput
