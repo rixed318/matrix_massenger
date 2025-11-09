@@ -93,8 +93,9 @@ const ChatList: React.FC<ChatListProps> = ({
                     <div className="flex items-center gap-3">
                         <Avatar name={user?.displayName || user?.userId || 'You'} imageUrl={userAvatarUrl || undefined} />
                         <div>
-                            <p className="text-sm text-text-secondary">Logged in as</p>
+                            <p className="text-[11px] uppercase tracking-wide text-text-secondary">Активный профиль</p>
                             <p className="font-semibold text-text-primary max-w-[160px] truncate">{user?.displayName || user?.userId}</p>
+                            <p className="text-xs text-text-secondary max-w-[160px] truncate">{client.getHomeserverUrl?.() ?? ''}</p>
                         </div>
                     </div>
                     <div className="flex items-center gap-2">

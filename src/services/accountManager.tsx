@@ -9,6 +9,7 @@ import {
   createMatrixSession,
   createMatrixSessionFromExistingClient,
 } from './matrixRuntime';
+import { matrixProfileManager, getSecureCloudProfileForClient } from './matrixService';
 
 const RESTORE_ERROR_MESSAGE = 'Не удалось восстановить сессии. Авторизуйтесь заново.';
 
@@ -103,6 +104,19 @@ export const createAccountStore = () => {
         try { session.client.stopClient?.(); } catch (error) { console.warn('stopClient failed', error); }
       });
 
+      const secureProfile = getSecureCloudProfileForClient(session.client);
+      matrixProfileManager.registerProfile(
+        {
+          id: account.key,
+          homeserverUrl: account.homeserver_url,
+          userId: account.user_id,
+          accessToken: account.access_token,
+          label: session.displayName ?? account.user_id,
+          secureProfile: secureProfile ?? undefined,
+        },
+        { client: session.client },
+      );
+
       return {
         creds: account,
         client: session.client,
@@ -151,9 +165,15 @@ export const createAccountStore = () => {
           activeKey: firstKey,
           error: runtimes.length === 0 ? RESTORE_ERROR_MESSAGE : null,
         });
+        if (firstKey && accounts[firstKey]) {
+          matrixProfileManager.setActiveProfile(firstKey, accounts[firstKey].client);
+        } else {
+          matrixProfileManager.clearActiveProfile();
+        }
       } catch (error) {
         console.error('restore failed', error);
         set({ accounts: {}, activeKey: null, error: RESTORE_ERROR_MESSAGE });
+        matrixProfileManager.clearActiveProfile();
       } finally {
         set({ isBooting: false });
       }
@@ -181,6 +201,7 @@ export const createAccountStore = () => {
         isAddAccountOpen: false,
         error: null,
       }));
+      matrixProfileManager.setActiveProfile(key, runtime.client);
     };
 
     const removeAccount: AccountStoreState['removeAccount'] = async (key) => {
@@ -211,17 +232,49 @@ export const createAccountStore = () => {
           activeKey: state.activeKey === targetKey ? (remainingKeys[0] ?? null) : state.activeKey,
         };
       });
+
+      await matrixProfileManager.removeProfile(targetKey);
+      const nextActiveKey = get().activeKey;
+      if (nextActiveKey) {
+        const nextRuntime = get().accounts[nextActiveKey];
+        if (nextRuntime) {
+          matrixProfileManager.setActiveProfile(nextActiveKey, nextRuntime.client);
+        }
+      } else {
+        matrixProfileManager.clearActiveProfile();
+      }
     };
 
     const setActiveKey: AccountStoreState['setActiveKey'] = (key) => {
       if (!key) {
+        matrixProfileManager.clearActiveProfile();
         set({ activeKey: null });
         return;
       }
       const runtime = get().accounts[key];
-      if (runtime) {
-        set({ activeKey: key });
+      if (!runtime) {
+        return;
       }
+      set({ activeKey: key, error: null });
+      void (async () => {
+        cleanupSession(key);
+        try {
+          const client = await matrixProfileManager.activateProfile(key, { forceRecreate: true });
+          const refreshed = await toRuntime(runtime.creds, client);
+          set(state => ({
+            accounts: { ...state.accounts, [key]: refreshed },
+            activeKey: key,
+          }));
+          matrixProfileManager.setActiveProfile(key, refreshed.client);
+        } catch (error) {
+          console.error('Failed to switch account', error);
+          set(state => ({
+            activeKey: null,
+            error: 'Не удалось переключить аккаунт. Авторизуйтесь заново.',
+          }));
+          matrixProfileManager.clearActiveProfile();
+        }
+      })();
     };
 
     const openAddAccount = () => set({ isAddAccountOpen: true, error: null });
@@ -239,6 +292,18 @@ export const createAccountStore = () => {
           [key]: { ...current, creds: updatedCreds },
         },
       }));
+      const secureProfile = getSecureCloudProfileForClient(current.client);
+      matrixProfileManager.registerProfile(
+        {
+          id: updatedCreds.key,
+          homeserverUrl: updatedCreds.homeserver_url,
+          userId: updatedCreds.user_id,
+          accessToken: updatedCreds.access_token,
+          label: current.displayName ?? updatedCreds.user_id,
+          secureProfile: secureProfile ?? undefined,
+        },
+        { client: current.client, active: key === get().activeKey },
+      );
       await persistAccount(updatedCreds);
     };
 

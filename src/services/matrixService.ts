@@ -67,6 +67,8 @@ class SimpleEmitter {
     emit(ev: OutboxEvent) { this.listeners.forEach(l => { try { l(ev); } catch { /* ignore */ } }); }
 }
 const _outboxEmitter = new SimpleEmitter();
+const clientSyncHandlers = new WeakMap<MatrixClient, (state: any) => void>();
+let _networkHandlersBound = false;
 
 export const onOutboxEvent = (fn: OutboxListener) => _outboxEmitter.on(fn);
 
@@ -116,6 +118,19 @@ const idbDelete = async (id: string) => {
         tx.objectStore(OUTBOX_STORE).delete(id);
         tx.oncomplete = () => resolve();
         tx.onerror = () => reject(tx.error);
+    });
+    db.close();
+};
+
+const idbClearAll = async () => {
+    const db = await idbOpen();
+    await new Promise<void>((resolve, reject) => {
+        const tx = db.transaction(OUTBOX_STORE, 'readwrite');
+        const store = tx.objectStore(OUTBOX_STORE);
+        const request = store.clear();
+        request.onsuccess = () => resolve();
+        request.onerror = () => reject(request.error ?? tx.error ?? new Error('Failed to clear outbox'));
+        tx.onerror = () => reject(tx.error ?? new Error('Failed to clear outbox transaction'));
     });
     db.close();
 };
@@ -181,17 +196,52 @@ const updateStatus = () => {
     _outboxEmitter.emit({ kind: 'status', online: navigator.onLine, syncing: _isSyncing });
 };
 
+export const unbindOutboxFromClient = (client: MatrixClient | null | undefined) => {
+    if (!client) return;
+    const handler = clientSyncHandlers.get(client);
+    if (handler) {
+        try {
+            client.removeListener(ClientEvent.Sync as any, handler);
+        } catch (error) {
+            console.warn('Failed to remove outbox listener', error);
+        }
+        clientSyncHandlers.delete(client);
+    }
+    if (_boundClient === client) {
+        _boundClient = null;
+        _isSyncing = false;
+        updateStatus();
+    }
+};
+
 export const bindOutboxToClient = (client: MatrixClient) => {
+    if (_boundClient && _boundClient !== client) {
+        unbindOutboxFromClient(_boundClient);
+    }
     _boundClient = client;
-    client.on(ClientEvent.Sync as any, (state: any) => {
+    const existingHandler = clientSyncHandlers.get(client);
+    if (existingHandler) {
+        try {
+            client.removeListener(ClientEvent.Sync as any, existingHandler);
+        } catch (error) {
+            console.warn('Failed to cleanup previous outbox handler', error);
+        }
+    }
+    const handler = (state: any) => {
         _isSyncing = state === 'SYNCING' || state === 'PREPARED';
         updateStatus();
         if (_isSyncing && navigator.onLine) {
             void flushOutbox();
         }
-    });
-    window.addEventListener('online', () => { updateStatus(); void flushOutbox(); });
-    window.addEventListener('offline', () => updateStatus());
+    };
+    clientSyncHandlers.set(client, handler);
+    client.on(ClientEvent.Sync as any, handler);
+    if (typeof window !== 'undefined' && !_networkHandlersBound) {
+        window.addEventListener('online', () => { updateStatus(); void flushOutbox(); });
+        window.addEventListener('offline', () => updateStatus());
+        _networkHandlersBound = true;
+    }
+    updateStatus();
 };
 
 const randomId = () => 'loc_' + Math.random().toString(36).slice(2) + Date.now().toString(36);
@@ -203,6 +253,323 @@ const shouldQueueFromError = (error: unknown) => {
     const message = typeof (error as any)?.message === 'string' ? (error as any).message : '';
     return /network|fetch|timeout|offline|abort/i.test(message);
 };
+
+const sanitizeHomeserverUrl = (value: string): string => {
+    const trimmed = typeof value === 'string' ? value.trim() : '';
+    if (!trimmed) return '';
+    return trimmed.replace(/\/+$/, '');
+};
+
+const cloneMetadata = (metadata?: Record<string, unknown>): Record<string, unknown> | undefined => {
+    if (!metadata) return undefined;
+    return { ...metadata };
+};
+
+const teardownMatrixClient = async (client: MatrixClient): Promise<void> => {
+    try {
+        unbindOutboxFromClient(client);
+    } catch (_) {}
+    try {
+        (client as any).removeAllListeners?.();
+    } catch (_) {}
+    try {
+        await (client as any).stopClient?.();
+    } catch (_) {}
+    try {
+        await (client as any).crypto?.stop?.();
+    } catch (_) {}
+    try {
+        await (client as any).store?.deleteAllData?.();
+    } catch (_) {}
+    try {
+        await (client as any).clearStores?.();
+    } catch (_) {}
+};
+
+function resetMatrixServiceCaches(): void {
+    try {
+        encryptionSessions.clear();
+    } catch (error) {
+        console.warn('Failed to clear encryption session cache', error);
+    }
+    try {
+        thumbnailCache.clear();
+    } catch (error) {
+        console.warn('Failed to clear thumbnail cache', error);
+    }
+    try {
+        roomTTLCache.clear();
+    } catch (error) {
+        console.warn('Failed to clear room TTL cache', error);
+    }
+    try {
+        nextMessageTTLCache.clear();
+    } catch (error) {
+        console.warn('Failed to clear next-message TTL cache', error);
+    }
+    _translationSettingsCache = null;
+    secureCloudProfiles = new WeakMap<MatrixClient, SecureCloudProfile>();
+}
+
+export interface MatrixProfileRecord {
+    id: string;
+    homeserverUrl: string;
+    userId: string;
+    accessToken: string;
+    label?: string;
+    secureProfile?: SecureCloudProfile | null;
+    metadata?: Record<string, unknown>;
+    lastUsedAt?: number;
+}
+
+export type MatrixProfileEvent =
+    | { type: 'added'; profile: MatrixProfileRecord }
+    | { type: 'updated'; profile: MatrixProfileRecord }
+    | { type: 'removed'; profileId: string }
+    | { type: 'activated'; profile: MatrixProfileRecord; client: MatrixClient }
+    | { type: 'error'; profileId: string; error: Error };
+
+interface MatrixProfileState {
+    profile: MatrixProfileRecord;
+    client: MatrixClient | null;
+    status: 'idle' | 'starting' | 'ready' | 'error';
+    error?: Error;
+}
+
+type MatrixProfileListener = (event: MatrixProfileEvent) => void;
+
+class MatrixProfileManager {
+    private profiles = new Map<string, MatrixProfileState>();
+    private listeners = new Set<MatrixProfileListener>();
+    private activeId: string | null = null;
+
+    private emit(event: MatrixProfileEvent): void {
+        this.listeners.forEach(listener => {
+            try {
+                listener(event);
+            } catch (error) {
+                console.warn('MatrixProfileManager listener failed', error);
+            }
+        });
+    }
+
+    private cloneProfile(profile: MatrixProfileRecord): MatrixProfileRecord {
+        return {
+            ...profile,
+            metadata: cloneMetadata(profile.metadata),
+            secureProfile: profile.secureProfile ? { ...profile.secureProfile } : profile.secureProfile,
+        };
+    }
+
+    private normaliseProfile(profile: MatrixProfileRecord): MatrixProfileRecord {
+        if (!profile.id) {
+            throw new Error('Matrix profile id is required');
+        }
+        const homeserverUrl = sanitizeHomeserverUrl(profile.homeserverUrl) || profile.homeserverUrl;
+        const userId = typeof profile.userId === 'string' ? profile.userId.trim() : profile.userId;
+        const accessToken = typeof profile.accessToken === 'string' ? profile.accessToken : profile.accessToken;
+        const label = profile.label?.trim() || undefined;
+        let secureProfile: SecureCloudProfile | null | undefined = profile.secureProfile;
+        if (profile.secureProfile) {
+            try {
+                secureProfile = normaliseSecureCloudProfile(profile.secureProfile);
+            } catch (error) {
+                console.warn('Failed to normalise secure profile', error);
+            }
+        }
+        return {
+            id: profile.id,
+            homeserverUrl,
+            userId,
+            accessToken,
+            label,
+            secureProfile: secureProfile ?? (profile.secureProfile === null ? null : undefined),
+            metadata: cloneMetadata(profile.metadata),
+            lastUsedAt: profile.lastUsedAt,
+        };
+    }
+
+    public on(listener: MatrixProfileListener): () => void {
+        this.listeners.add(listener);
+        return () => this.listeners.delete(listener);
+    }
+
+    public registerProfile(profile: MatrixProfileRecord, options: { client?: MatrixClient; active?: boolean } = {}): MatrixProfileRecord {
+        const normalized = this.normaliseProfile(profile);
+        const existing = this.profiles.get(normalized.id);
+        if (existing) {
+            existing.profile = {
+                ...existing.profile,
+                ...normalized,
+                metadata: normalized.metadata ?? existing.profile.metadata,
+                secureProfile:
+                    normalized.secureProfile !== undefined
+                        ? normalized.secureProfile
+                        : existing.profile.secureProfile,
+            };
+            if (options.client) {
+                existing.client = options.client;
+                existing.status = 'ready';
+                existing.error = undefined;
+                if (existing.profile.secureProfile) {
+                    setSecureCloudProfileForClient(options.client, existing.profile.secureProfile);
+                }
+            }
+            if (options.active) {
+                this.setActiveProfile(normalized.id, options.client ?? existing.client);
+            } else if (options.client && this.activeId === normalized.id) {
+                this.setActiveProfile(normalized.id, options.client);
+            } else {
+                this.emit({ type: 'updated', profile: this.cloneProfile(existing.profile) });
+            }
+            return this.cloneProfile(existing.profile);
+        }
+
+        const state: MatrixProfileState = {
+            profile: normalized,
+            client: options.client ?? null,
+            status: options.client ? 'ready' : 'idle',
+        };
+        this.profiles.set(normalized.id, state);
+        if (options.client && normalized.secureProfile) {
+            setSecureCloudProfileForClient(options.client, normalized.secureProfile);
+        }
+        this.emit({ type: 'added', profile: this.cloneProfile(normalized) });
+        if (options.active) {
+            this.setActiveProfile(normalized.id, options.client ?? null);
+        }
+        return this.cloneProfile(normalized);
+    }
+
+    public listProfiles(): MatrixProfileRecord[] {
+        return Array.from(this.profiles.values())
+            .map(state => this.cloneProfile(state.profile))
+            .sort((a, b) => (b.lastUsedAt ?? 0) - (a.lastUsedAt ?? 0));
+    }
+
+    public getProfile(id: string): MatrixProfileRecord | null {
+        const state = this.profiles.get(id);
+        return state ? this.cloneProfile(state.profile) : null;
+    }
+
+    public getActiveProfile(): MatrixProfileRecord | null {
+        return this.activeId ? this.getProfile(this.activeId) : null;
+    }
+
+    public getActiveClient(): MatrixClient | null {
+        return this.activeId ? this.profiles.get(this.activeId)?.client ?? null : null;
+    }
+
+    public clearActiveProfile(): void {
+        if (!this.activeId) return;
+        const current = this.profiles.get(this.activeId);
+        if (current?.client) {
+            unbindOutboxFromClient(current.client);
+        }
+        this.activeId = null;
+    }
+
+    public async removeProfile(id: string): Promise<void> {
+        const state = this.profiles.get(id);
+        if (!state) return;
+        if (state.client) {
+            await teardownMatrixClient(state.client);
+        }
+        this.profiles.delete(id);
+        if (this.activeId === id) {
+            this.activeId = null;
+        }
+        this.emit({ type: 'removed', profileId: id });
+    }
+
+    public setActiveProfile(id: string, client?: MatrixClient | null): void {
+        const state = this.profiles.get(id);
+        if (!state) {
+            return;
+        }
+        if (client) {
+            state.client = client;
+            state.status = 'ready';
+            state.error = undefined;
+            if (state.profile.secureProfile) {
+                setSecureCloudProfileForClient(client, state.profile.secureProfile);
+            }
+        }
+        const resolvedClient = client ?? state.client;
+        this.activeId = id;
+        state.profile.lastUsedAt = Date.now();
+        if (resolvedClient) {
+            bindOutboxToClient(resolvedClient);
+            this.emit({ type: 'activated', profile: this.cloneProfile(state.profile), client: resolvedClient });
+        } else {
+            this.emit({ type: 'updated', profile: this.cloneProfile(state.profile) });
+        }
+    }
+
+    public async activateProfile(
+        id: string,
+        options: { forceRecreate?: boolean; secureProfileOverride?: SecureCloudProfile | null } = {},
+    ): Promise<MatrixClient> {
+        const state = this.profiles.get(id);
+        if (!state) {
+            throw new Error(`Matrix profile ${id} not found`);
+        }
+
+        if (this.activeId && this.activeId !== id) {
+            const current = this.profiles.get(this.activeId);
+            if (current?.client) {
+                await teardownMatrixClient(current.client);
+                current.client = null;
+                current.status = 'idle';
+            }
+        }
+
+        const shouldRecreate = options.forceRecreate || !state.client;
+        if (shouldRecreate) {
+            resetMatrixServiceCaches();
+            await clearOutbox();
+            const secureProfile =
+                options.secureProfileOverride !== undefined
+                    ? options.secureProfileOverride
+                    : state.profile.secureProfile ?? undefined;
+            try {
+                const client = await initClient(state.profile.homeserverUrl, state.profile.accessToken, state.profile.userId);
+                const normalizedSecureProfile =
+                    secureProfile && secureProfile !== null
+                        ? normaliseSecureCloudProfile(secureProfile)
+                        : secureProfile ?? undefined;
+                await bootstrapAuthenticatedClient(client, normalizedSecureProfile ?? undefined);
+                state.client = client;
+                state.status = 'ready';
+                state.error = undefined;
+                if (normalizedSecureProfile !== undefined) {
+                    state.profile.secureProfile = normalizedSecureProfile ?? null;
+                }
+            } catch (error) {
+                state.status = 'error';
+                state.error = error as Error;
+                this.emit({ type: 'error', profileId: id, error: error as Error });
+                throw error;
+            }
+        }
+
+        if (!state.client) {
+            throw new Error(`Matrix profile ${id} does not have an active client`);
+        }
+
+        if (options.secureProfileOverride !== undefined) {
+            state.profile.secureProfile = options.secureProfileOverride;
+        }
+
+        this.setActiveProfile(id, state.client);
+        return state.client;
+    }
+}
+
+export const matrixProfileManager = new MatrixProfileManager();
+export const getClient = () => matrixProfileManager.getActiveClient();
+export const getActiveProfile = () => matrixProfileManager.getActiveProfile();
+export const listProfiles = () => matrixProfileManager.listProfiles();
 
 export const getOutboxPending = async (roomId?: string): Promise<OutboxPayload[]> => {
     const all = await idbGetAll();
@@ -293,6 +660,15 @@ export const retryOutboxItem = async (id: string) => {
     _outboxEmitter.emit({ kind: 'enqueued', item: updated });
     if (navigator.onLine) {
         void flushOutbox();
+    }
+};
+
+export const clearOutbox = async () => {
+    try {
+        await idbClearAll();
+        updateStatus();
+    } catch (error) {
+        console.warn('Failed to clear outbox storage', error);
     }
 };
 
@@ -391,7 +767,7 @@ export function setTranslationErrorHandler(handler: TranslationErrorHandler | nu
 }
 
 
-const secureCloudProfiles = new WeakMap<MatrixClient, SecureCloudProfile>();
+let secureCloudProfiles = new WeakMap<MatrixClient, SecureCloudProfile>();
 
 export const setSecureCloudProfileForClient = (client: MatrixClient, profile: SecureCloudProfile | null): void => {
     if (!profile || profile.mode === 'disabled') {

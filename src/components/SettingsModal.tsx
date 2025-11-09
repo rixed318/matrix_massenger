@@ -131,12 +131,13 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, onSave, 
     };
 
     return (
-        <div className="fixed inset-0 bg-bg-secondary/60 flex items-center justify-center z-50 animate-fade-in-fast" onClick={onClose}>
-            <div className="bg-bg-primary rounded-lg shadow-xl w-full max-w-md animate-slide-up" onClick={e => e.stopPropagation()}>
-                <div className="p-6 border-b border-border-primary">
-                    <h2 className="text-xl font-bold">Settings</h2>
-                </div>
-                <div className="p-6 space-y-6 max-h-[70vh] overflow-y-auto">
+        <>
+            <div className="fixed inset-0 bg-bg-secondary/60 flex items-center justify-center z-50 animate-fade-in-fast" onClick={onClose}>
+                <div className="bg-bg-primary rounded-lg shadow-xl w-full max-w-md animate-slide-up" onClick={e => e.stopPropagation()}>
+                    <div className="p-6 border-b border-border-primary">
+                        <h2 className="text-xl font-bold">Settings</h2>
+                    </div>
+                    <div className="p-6 space-y-6 max-h-[70vh] overflow-y-auto">
                     <h3 className="text-lg font-semibold text-text-primary">Profile</h3>
                     <div className="flex items-center gap-4">
                         <div className="relative cursor-pointer" onClick={() => fileInputRef.current?.click()}>
@@ -345,9 +346,9 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, onSave, 
                     </button>
                 </div>
             </div>
-        </div>
-        <SecuritySettings client={client} isOpen={isSecurityOpen} onClose={() => setIsSecurityOpen(false)} />
-    </div>
+            </div>
+            <SecuritySettings client={client} isOpen={isSecurityOpen} onClose={() => setIsSecurityOpen(false)} />
+        </>
     );
 };
 
