@@ -33,6 +33,7 @@ import CallView from './CallView';
 import GroupCallView from './GroupCallView';
 import CallParticipantsPanel from './CallParticipantsPanel';
 import SearchModal from './SearchModal';
+import PluginCatalogModal from './PluginCatalogModal';
 import { SearchResultItem } from '@matrix-messenger/core';
 import type { DraftContent, SendKeyBehavior, DraftAttachment, DraftAttachmentKind } from '../types';
 import SharedMediaPanel from './SharedMediaPanel';
@@ -137,6 +138,7 @@ const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, s
     const [sharedMediaData, setSharedMediaData] = useState<RoomMediaSummary | null>(null);
     const [isSharedMediaLoading, setIsSharedMediaLoading] = useState(false);
     const [isSharedMediaPaginating, setIsSharedMediaPaginating] = useState(false);
+    const [isPluginCatalogOpen, setIsPluginCatalogOpen] = useState(false);
     const [outboxItems, setOutboxItems] = useState<Record<string, { payload: OutboxPayload; attempts: number; error?: string }>>({});
     const normalizeAttachments = (attachments: unknown): DraftAttachment[] => {
         if (!Array.isArray(attachments)) return [];
@@ -1960,6 +1962,7 @@ const handleLayoutChange = useCallback((layout: 'grid'|'spotlight') => {
                 onLogout={logout}
                 client={client}
                 onOpenSettings={() => setIsSettingsOpen(true)}
+                onOpenPlugins={() => setIsPluginCatalogOpen(true)}
                 onOpenCreateRoom={() => setIsCreateRoomOpen(true)}
                 folders={folders}
                 activeFolderId={activeFolderId}
@@ -2303,6 +2306,10 @@ const handleLayoutChange = useCallback((layout: 'grid'|'spotlight') => {
                     onSelectResult={handleJumpToSearchResult}
                 />
             )}
+            <PluginCatalogModal
+                isOpen={isPluginCatalogOpen}
+                onClose={() => setIsPluginCatalogOpen(false)}
+            />
             <SharedMediaPanel
                 isOpen={isSharedMediaOpen}
                 onClose={() => setIsSharedMediaOpen(false)}
