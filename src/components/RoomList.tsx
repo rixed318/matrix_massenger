@@ -1,8 +1,9 @@
-import React, { useEffect, useState } from 'react';
+import React, { useState } from 'react';
 import { Room, MatrixClient, Folder } from '@matrix-messenger/core';
 import RoomListItem from './RoomListItem';
 import Avatar from './Avatar';
 import { mxcToHttp } from '@matrix-messenger/core';
+import { AccountListItemSnapshot } from '../services/accountManager';
 
 interface RoomListProps {
   rooms: Room[];
@@ -17,33 +18,20 @@ interface RoomListProps {
   activeFolderId: string;
   onSelectFolder: (folderId: string) => void;
   onManageFolders: () => void;
+  accounts: AccountListItemSnapshot[];
+  activeAccountKey: string | null;
+  onSwitchAccount: (key: string) => void;
+  onAddAccount: () => void;
 }
 
-const useMultiAccount = () => {
-  const [state, setState] = useState<{accounts: any[]; activeKey: string | null}>({accounts: [], activeKey: null});
-  useEffect(() => {
-    const i = setInterval(() => {
-      const snap = (window as any).__MM_ACCOUNTS__;
-      if (snap && (JSON.stringify(snap) !== JSON.stringify(state))) {
-        setState(snap);
-      }
-    }, 500);
-    return () => clearInterval(i);
-  }, [state]);
-  const switchAccount = (key: string) => window.dispatchEvent(new CustomEvent('mm:switch-account', { detail: { key } }));
-  const addAccount = () => window.dispatchEvent(new CustomEvent('mm:add-account'));
-  return { ...state, switchAccount, addAccount };
-};
-
-const RoomList: React.FC<RoomListProps> = ({ 
-  rooms, selectedRoomId, onSelectRoom, isLoading, onLogout, client, 
-  onOpenSettings, onOpenCreateRoom, folders, activeFolderId, onSelectFolder, onManageFolders 
+const RoomList: React.FC<RoomListProps> = ({
+  rooms, selectedRoomId, onSelectRoom, isLoading, onLogout, client,
+  onOpenSettings, onOpenCreateRoom, folders, activeFolderId, onSelectFolder, onManageFolders,
+  accounts, activeAccountKey, onSwitchAccount, onAddAccount,
 }) => {
   const user = client.getUser(client.getUserId());
   const userAvatarUrl = mxcToHttp(client, user?.avatarUrl);
   const [searchQuery, setSearchQuery] = useState('');
-
-  const { accounts, activeKey, switchAccount, addAccount } = useMultiAccount();
 
   const filteredRoomsByFolder = (activeFolderId === 'all'
     ? rooms
@@ -88,7 +76,7 @@ const RoomList: React.FC<RoomListProps> = ({
                 <path fillRule="evenodd" d="M10 3a1 1 0 011 1v5h5a1 1 0 110 2h-5v5a1 1 0 11-2 0v-5H4a1 1 0 110-2h5V4a1 1 0 011-1z" clipRule="evenodd" />
               </svg>
             </button>
-            <button onClick={addAccount} className="p-2 rounded-full hover:bg-bg-tertiary" title="Add account">
+            <button onClick={onAddAccount} className="p-2 rounded-full hover:bg-bg-tertiary" title="Add account">
               <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 24 24" fill="currentColor"><path d="M12 7a5 5 0 100 10 5 5 0 000-10zm-1 6H8v-2h3V8h2v3h3v2h-3v3h-2v-3z"/></svg>
             </button>
             <button onClick={onLogout} className="p-2 rounded-full hover:bg-bg-tertiary" title="Logout active">
@@ -100,17 +88,17 @@ const RoomList: React.FC<RoomListProps> = ({
         </div>
 
         <div className="mt-3 flex items-center gap-2 overflow-x-auto">
-          {accounts.map((a: any) => (
+          {accounts.map(account => (
             <button
-              key={a.key}
-              onClick={() => switchAccount(a.key)}
-              className={`relative p-1 rounded-full ${a.key === activeKey ? 'ring-2 ring-accent' : ''}`}
-              title={`${a.displayName || a.userId}`}
+              key={account.key}
+              onClick={() => onSwitchAccount(account.key)}
+              className={`relative p-1 rounded-full ${account.key === activeAccountKey ? 'ring-2 ring-accent' : ''}`}
+              title={`${account.displayName || account.userId}`}
             >
-              <Avatar name={a.displayName || a.userId} imageUrl={a.avatarUrl || undefined} size="sm" />
-              {a.unread > 0 && (
+              <Avatar name={account.displayName || account.userId} imageUrl={account.avatarUrl || undefined} size="sm" />
+              {account.unread > 0 && (
                 <span className="absolute -top-1 -right-1 bg-accent text-text-inverted text-[10px] leading-none px-1.5 py-0.5 rounded-full">
-                  {a.unread}
+                  {account.unread}
                 </span>
               )}
             </button>

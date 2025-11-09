@@ -326,3 +326,25 @@ export const useAccountStore = <T,>(selector: (state: AccountStoreState) => T): 
   const store = useContext(AccountStoreContext);
   return useStore(store, selector);
 };
+
+export interface AccountListItemSnapshot {
+  key: string;
+  userId: string;
+  displayName?: string | null;
+  avatarUrl?: string | null;
+  unread: number;
+}
+
+export const useAccountListSnapshot = () =>
+  useAccountStore(state => ({
+    accounts: Object.values(state.accounts).map<AccountListItemSnapshot>(runtime => ({
+      key: runtime.creds.key,
+      userId: runtime.creds.user_id,
+      displayName: runtime.displayName ?? runtime.creds.user_id,
+      avatarUrl: runtime.avatarUrl ?? null,
+      unread: runtime.unread,
+    })),
+    activeKey: state.activeKey,
+    setActiveKey: state.setActiveKey,
+    openAddAccount: state.openAddAccount,
+  }));
