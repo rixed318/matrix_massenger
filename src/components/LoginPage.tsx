@@ -1,6 +1,13 @@
 import React, { useState, FormEvent, useEffect } from 'react';
-import { MatrixClient } from '@matrix-messenger/core';
-import { login, resolveHomeserverBaseUrl, HomeserverDiscoveryError, register as registerAccount } from '@matrix-messenger/core';
+import type { MatrixClient, SecureCloudProfile } from '@matrix-messenger/core';
+import {
+  login,
+  resolveHomeserverBaseUrl,
+  HomeserverDiscoveryError,
+  register as registerAccount,
+  TotpRequiredError,
+  type LoginOptions,
+} from '@matrix-messenger/core';
 import ServerDeploymentWizard from './ServerDeploymentWizard';
 import { useAccountStore } from '../services/accountManager';
 
@@ -41,12 +48,29 @@ const ConnectionOption: React.FC<{ title: string; description: string; icon: Rea
 
 const LoginForm: React.FC<{
   connectionType: ConnectionType;
-  onLogin: (homeserverUrl: string, username: string, password: string, secureProfile?: SecureCloudProfile) => Promise<void>;
+  onLogin: (homeserverUrl: string, username: string, password: string, options?: LoginOptions) => Promise<void>;
   isLoading: boolean;
   error: string | null;
   onBack: () => void;
   onSwitchToRegister: () => void;
-}> = ({ connectionType, onLogin, isLoading, error, onBack, onSwitchToRegister }) => {
+  totpRequired: boolean;
+  totpCode: string;
+  onTotpCodeChange: (value: string) => void;
+  totpValidationError: string | null;
+  onResetTotp: () => void;
+}> = ({
+  connectionType,
+  onLogin,
+  isLoading,
+  error,
+  onBack,
+  onSwitchToRegister,
+  totpRequired,
+  totpCode,
+  onTotpCodeChange,
+  totpValidationError,
+  onResetTotp,
+}) => {
   const [homeserverUrl, setHomeserverUrl] = useState(getDefaultHomeserver(connectionType));
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
@@ -74,6 +98,7 @@ const LoginForm: React.FC<{
     setEnableAnalytics(false);
     setAnalyticsToken('');
     setRiskThreshold('0.6');
+    onResetTotp();
   }, [connectionType]);
 
   // Load saved Secure Cloud settings on mount or connectionType change.
@@ -170,7 +195,9 @@ const handleSubmit = (e: FormEvent) => {
         }
       : undefined;
 
-    onLogin(homeserverUrl, username, password, secureProfile)
+    const options = secureProfile ? { secureProfile } : undefined;
+
+    onLogin(homeserverUrl, username, password, options)
       .then(() => { try { persistSecureSettings(); } catch {} });
   };
 
@@ -232,6 +259,33 @@ const handleSubmit = (e: FormEvent) => {
             />
           </div>
         </div>
+        {totpRequired && (
+          <div className="space-y-2 border border-border-primary rounded-md p-3 bg-bg-tertiary/30">
+            <div>
+              <label htmlFor="totp" className="block text-xs font-medium text-text-secondary uppercase">Код 2FA (TOTP)</label>
+              <input
+                id="totp"
+                name="totp"
+                type="text"
+                inputMode="numeric"
+                autoComplete="one-time-code"
+                pattern="[0-9]*"
+                className="mt-1 block w-full rounded-md border border-border-primary bg-bg-secondary px-3 py-2 text-sm text-text-primary focus:outline-none focus:ring-ring-focus focus:border-ring-focus"
+                placeholder="123 456"
+                value={totpCode}
+                onChange={(e) => onTotpCodeChange(e.target.value)}
+                required
+                disabled={isLoading}
+              />
+            </div>
+            <p className="text-xs text-text-secondary">
+              Введите код из приложения-аутентификатора. Если код истёк, дождитесь следующего и попробуйте снова.
+            </p>
+            {totpValidationError && (
+              <p className="text-xs text-error" role="alert">{totpValidationError}</p>
+            )}
+          </div>
+        )}
         {(connectionType === 'secure' || connectionType === 'selfhosted') && (
           <div className="space-y-3 border border-border-primary rounded-md p-3 bg-bg-tertiary/30">
             <div className="flex items-start justify-between">
@@ -496,6 +550,25 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess, initialError, sav
   const [connectionType, setConnectionType] = useState<ConnectionType | null>(null);
   const [mode, setMode] = useState<AuthMode>('choose');
   const [showDeploymentWizard, setShowDeploymentWizard] = useState(false);
+  const [totpRequired, setTotpRequired] = useState(false);
+  const [totpSessionId, setTotpSessionId] = useState<string | null>(null);
+  const [totpCode, setTotpCode] = useState('');
+  const [totpValidationError, setTotpValidationError] = useState<string | null>(null);
+
+  const resetTotpState = () => {
+    setTotpRequired(false);
+    setTotpSessionId(null);
+    setTotpCode('');
+    setTotpValidationError(null);
+  };
+
+  const handleTotpCodeChange = (value: string) => {
+    setTotpCode(value);
+    if (totpValidationError) {
+      setTotpValidationError(null);
+      applyError(null);
+    }
+  };
 
   const applyError = (value: string | null) => {
     setErrorState(value);
@@ -506,19 +579,54 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess, initialError, sav
     applyError(initialErrorValue);
   }, [initialErrorValue]);
 
-  const handleLogin = async (homeserverInput: string, username: string, password: string) => {
+  const handleLogin = async (
+    homeserverInput: string,
+    username: string,
+    password: string,
+    loginOptions?: LoginOptions,
+  ) => {
     applyError(null);
+    setTotpValidationError(null);
     setIsLoading(true);
     try {
       const baseUrl = await resolveHomeserverBaseUrl(homeserverInput);
-      const client = await login(baseUrl, username, password);
+      const options: LoginOptions = {};
+      if (loginOptions?.secureProfile) options.secureProfile = loginOptions.secureProfile;
+      const trimmedTotp = totpCode.trim();
+      if (trimmedTotp) {
+        options.totpCode = trimmedTotp;
+        if (totpSessionId) options.totpSessionId = totpSessionId;
+      }
+
+      const client = Object.keys(options).length
+        ? await login(baseUrl, username, password, options)
+        : await login(baseUrl, username, password);
       await resolvedOnLoginSuccess(client);
+      resetTotpState();
     } catch (err: any) {
       console.error(err);
-      if (err instanceof HomeserverDiscoveryError) applyError(err.message);
-      else if (err.message?.includes('M_FORBIDDEN')) applyError('Неверный логин или пароль.');
-      else if (err.message?.includes('M_UNKNOWN_TOKEN')) applyError('Токен недействителен.');
-      else applyError(err.message || 'Вход не выполнен.');
+      if (err instanceof HomeserverDiscoveryError) {
+        resetTotpState();
+        applyError(err.message);
+      } else if (err instanceof TotpRequiredError) {
+        setTotpRequired(true);
+        setTotpSessionId(err.sessionId ?? totpSessionId);
+        if (!err.isValidationError) {
+          setTotpCode('');
+        }
+        const validationMessage = err.message || 'Неверный одноразовый код или код истёк.';
+        setTotpValidationError(err.isValidationError ? validationMessage : null);
+        applyError(validationMessage);
+      } else if (err.message?.includes('M_FORBIDDEN')) {
+        resetTotpState();
+        applyError('Неверный логин или пароль.');
+      } else if (err.message?.includes('M_UNKNOWN_TOKEN')) {
+        resetTotpState();
+        applyError('Токен недействителен.');
+      } else {
+        resetTotpState();
+        applyError(err.message || 'Вход не выполнен.');
+      }
     } finally {
       setIsLoading(false);
     }
@@ -540,30 +648,14 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess, initialError, sav
 
   const resetToChoose = () => {
     applyError(null);
+    resetTotpState();
     setConnectionType(null);
     setMode('choose');
   };
 
   const handleDeploymentComplete = async (homeserverUrl: string, username: string, password: string) => {
     setShowDeploymentWizard(false);
-    setIsLoading(true);
-    applyError(null);
-
-    try {
-      const resolvedUrl = await resolveHomeserverBaseUrl(homeserverUrl);
-      const client = await login(resolvedUrl, username, password);
-      await resolvedOnLoginSuccess(client);
-    } catch (err) {
-      if (err instanceof HomeserverDiscoveryError) {
-        applyError(err.message);
-      } else if (err instanceof Error) {
-        applyError(err.message);
-      } else {
-        applyError('Failed to connect to deployed server. Please try manual login.');
-      }
-    } finally {
-      setIsLoading(false);
-    }
+    await handleLogin(homeserverUrl, username, password);
   };
 
   const SavedList = () => {
@@ -593,8 +685,14 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess, initialError, sav
           onBack={resetToChoose}
           onSwitchToRegister={() => {
             applyError(null);
+            resetTotpState();
             setMode('register');
           }}
+          totpRequired={totpRequired}
+          totpCode={totpCode}
+          onTotpCodeChange={handleTotpCodeChange}
+          totpValidationError={totpValidationError}
+          onResetTotp={resetTotpState}
         />
       );
     }
@@ -609,6 +707,7 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess, initialError, sav
           onBack={resetToChoose}
           onSwitchToLogin={() => {
             applyError(null);
+            resetTotpState();
             setMode('login');
           }}
         />
@@ -629,6 +728,7 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess, initialError, sav
             description="Быстрый вход на публичный сервер."
             icon={<svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>}
             onSelect={() => {
+              resetTotpState();
               setConnectionType('public');
               setMode('login');
             }}
@@ -638,6 +738,7 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess, initialError, sav
             description="Наш управляемый сервер с расширенной защитой."
             icon={<svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 15a4 4 0 004 4h9a5 5 0 10-.1-9.999 5.002 5.002 0 10-9.78 2.096A4.001 4.001 0 003 15z" /></svg>}
             onSelect={() => {
+              resetTotpState();
               setConnectionType('secure');
               setMode('login');
             }}
@@ -647,6 +748,7 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess, initialError, sav
             description="Подключиться к уже установленному Matrix серверу (требуется URL)"
             icon={<svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2m-2-4h.01M17 16h.01" /></svg>}
             onSelect={() => {
+              resetTotpState();
               setConnectionType('selfhosted');
               setMode('login');
             }}
@@ -663,7 +765,11 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess, initialError, sav
         </div>
 
         <button
-          onClick={() => setShowDeploymentWizard(true)}
+          onClick={() => {
+            resetTotpState();
+            applyError(null);
+            setShowDeploymentWizard(true);
+          }}
           className="w-full flex flex-col items-center justify-center gap-2 px-4 py-4 bg-gradient-to-r from-indigo-600 to-purple-600 text-white rounded-lg hover:from-indigo-700 hover:to-purple-700 transition-all shadow-lg"
         >
           <div className="flex items-center gap-2">

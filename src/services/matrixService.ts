@@ -687,16 +687,132 @@ export const initClient = async (homeserverUrl: string, accessToken?: string, us
     return createClient(options);
 };
 
+export interface LoginOptions {
+    secureProfile?: SecureCloudProfile;
+    totpCode?: string;
+    totpSessionId?: string;
+}
+
+export class TotpRequiredError extends Error {
+    public readonly sessionId?: string;
+    public readonly flows: Array<{ stages?: string[] }>;
+    public readonly isValidationError: boolean;
+
+    constructor(
+        message: string,
+        options: {
+            sessionId?: string | null;
+            flows?: Array<{ stages?: string[] }>;
+            validationError?: boolean;
+            cause?: unknown;
+        } = {},
+    ) {
+        super(message);
+        this.name = 'TotpRequiredError';
+        this.sessionId = options.sessionId ?? undefined;
+        this.flows = options.flows ?? [];
+        this.isValidationError = Boolean(options.validationError);
+        if (options.cause !== undefined) {
+            try {
+                (this as any).cause = options.cause;
+            } catch {
+                // ignore assignment failures in restricted environments
+            }
+        }
+    }
+}
+
 export const login = async (
 
     homeserverUrl: string,
     username: string,
     password: string,
-    secureProfile?: SecureCloudProfile,
+    options: LoginOptions = {},
 
 ): Promise<MatrixClient> => {
     const client = await initClient(homeserverUrl);
-    await client.loginWithPassword(username, password);
+
+    const identifier = {
+        type: 'm.id.user',
+        user: username,
+    } as const;
+
+    const trimmedTotp = typeof options.totpCode === 'string' ? options.totpCode.trim() : undefined;
+    let authPayload: { type: string; code: string; session?: string } | undefined = undefined;
+    let totpAttempted = false;
+    let sessionHint = options.totpSessionId ?? undefined;
+
+    const performLogin = async () => {
+        const payload: Record<string, any> = {
+            identifier,
+            password,
+        };
+        if (authPayload) {
+            payload.auth = authPayload;
+        }
+        return await client.login('m.login.password', payload);
+    };
+
+    while (true) {
+        if (trimmedTotp && !totpAttempted && !authPayload) {
+            authPayload = {
+                type: 'm.login.totp',
+                code: trimmedTotp,
+                ...(sessionHint ? { session: sessionHint } : {}),
+            };
+            totpAttempted = true;
+        }
+
+        try {
+            await performLogin();
+            break;
+        } catch (error: any) {
+            const matrixError = error ?? {};
+            const flows: Array<{ stages?: string[] }> = Array.isArray(matrixError?.data?.flows)
+                ? matrixError.data.flows
+                : [];
+            const sessionId = matrixError?.data?.session ?? sessionHint;
+            const requiresTotp = flows.some((flow) => Array.isArray(flow?.stages) && flow.stages.includes('m.login.totp'));
+
+            if (matrixError?.errcode === 'M_FORBIDDEN' && requiresTotp) {
+                sessionHint = sessionId ?? sessionHint;
+                if (trimmedTotp) {
+                    if (totpAttempted && authPayload) {
+                        throw new TotpRequiredError(
+                            matrixError?.data?.error || matrixError?.message || 'Неверный одноразовый код или код истёк.',
+                            {
+                                sessionId: sessionHint,
+                                flows,
+                                validationError: true,
+                                cause: error,
+                            },
+                        );
+                    }
+
+                    authPayload = {
+                        type: 'm.login.totp',
+                        code: trimmedTotp,
+                        ...(sessionHint ? { session: sessionHint } : {}),
+                    };
+                    totpAttempted = true;
+                    continue;
+                }
+
+                throw new TotpRequiredError(
+                    'Эта учётная запись защищена двухфакторной аутентификацией. Введите код из приложения TOTP.',
+                    {
+                        sessionId: sessionHint,
+                        flows,
+                        validationError: false,
+                        cause: error,
+                    },
+                );
+            }
+
+            throw new Error(matrixError?.data?.error || matrixError?.message || 'Вход не выполнен.');
+        }
+    }
+
     await initCryptoBackend(client);
     const firstSync = waitForFirstSync(client);
     await (client as any).startClient({ initialSyncLimit: 30, cryptoStore: _cryptoStore } as any);
@@ -718,8 +834,8 @@ export const login = async (
 
     await firstSync;
     try { bindOutboxToClient(client); } catch (e) { console.warn('bindOutboxToClient failed', e); }
-    if (secureProfile) {
-        setSecureCloudProfileForClient(client, secureProfile);
+    if (options.secureProfile) {
+        setSecureCloudProfileForClient(client, options.secureProfile);
     }
     return client;
 };

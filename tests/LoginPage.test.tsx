@@ -3,17 +3,27 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 
-vi.mock('../src/services/matrixService', () => {
+vi.mock('@matrix-messenger/core', () => {
   return {
     login: vi.fn(),
     resolveHomeserverBaseUrl: vi.fn(),
     register: vi.fn(),
     HomeserverDiscoveryError: class HomeserverDiscoveryError extends Error {},
+    TotpRequiredError: class TotpRequiredError extends Error {
+      constructor(message?: string, _options?: { validationError?: boolean; sessionId?: string | null }) {
+        super(message);
+        this.name = 'TotpRequiredError';
+        this.isValidationError = Boolean(_options?.validationError);
+        this.sessionId = _options?.sessionId ?? null;
+      }
+      public readonly isValidationError: boolean;
+      public readonly sessionId: string | null;
+    },
   };
 });
 
 import LoginPage from '../src/components/LoginPage';
-import { login as loginService, resolveHomeserverBaseUrl, register as registerService } from '../src/services/matrixService';
+import { login as loginService, resolveHomeserverBaseUrl, register as registerService } from '@matrix-messenger/core';
 
 describe('LoginPage', () => {
   beforeEach(() => {
