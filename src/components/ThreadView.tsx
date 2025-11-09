@@ -1,5 +1,6 @@
 import React, { useRef, useEffect } from 'react';
 import { ActiveThread, MatrixClient, MatrixRoom, MatrixUser } from '@matrix-messenger/core';
+import type { SendKeyBehavior } from '../types';
 import ChatMessage from './ChatMessage';
 import MessageInput from './MessageInput';
 
@@ -8,11 +9,12 @@ interface ThreadViewProps {
     activeThread: ActiveThread;
     onClose: () => void;
     client: MatrixClient;
-    onSendMessage: (content: string, threadRootId?: string) => Promise<void>;
+    onSendMessage: (content: { body: string; formattedBody?: string }, threadRootId?: string) => Promise<void>;
     onImageClick: (url: string) => void;
+    sendKeyBehavior: SendKeyBehavior;
 }
 
-const ThreadView: React.FC<ThreadViewProps> = ({ room, activeThread, onClose, client, onSendMessage, onImageClick }) => {
+const ThreadView: React.FC<ThreadViewProps> = ({ room, activeThread, onClose, client, onSendMessage, onImageClick, sendKeyBehavior }) => {
     const scrollContainerRef = useRef<HTMLDivElement>(null);
 
     useEffect(() => {
@@ -22,7 +24,7 @@ const ThreadView: React.FC<ThreadViewProps> = ({ room, activeThread, onClose, cl
         });
     }, [activeThread.threadMessages]);
     
-    const handleSendMessageInThread = async (content: string) => {
+    const handleSendMessageInThread = async (content: { body: string; formattedBody?: string }) => {
         await onSendMessage(content, activeThread.rootMessage.id);
     };
 
@@ -106,8 +108,9 @@ const ThreadView: React.FC<ThreadViewProps> = ({ room, activeThread, onClose, cl
                 replyingTo={null}
                 onCancelReply={() => {}}
                 roomMembers={roomMembers}
-                draftContent=""
+                draftContent={null}
                 onDraftChange={() => {}}
+                sendKeyBehavior={sendKeyBehavior}
             />
         </aside>
     );

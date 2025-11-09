@@ -1,10 +1,11 @@
 import React, { useState } from 'react';
+import type { DraftContent } from '../types';
 
 interface ScheduleMessageModalProps {
     isOpen: boolean;
     onClose: () => void;
     onConfirm: (sendAt: number) => void;
-    messageContent: string;
+    messageContent: DraftContent | null;
 }
 
 const ScheduleMessageModal: React.FC<ScheduleMessageModalProps> = ({ isOpen, onClose, onConfirm, messageContent }) => {
@@ -39,8 +40,17 @@ const ScheduleMessageModal: React.FC<ScheduleMessageModalProps> = ({ isOpen, onC
                 </div>
                 <div className="p-6 space-y-6">
                     <div>
-                        <p className="text-sm text-gray-400 mb-1">Message:</p>
-                        <p className="p-3 bg-gray-900/50 rounded-md text-white truncate">{messageContent}</p>
+                        <p className="text-sm text-gray-400 mb-1">Message preview:</p>
+                        {messageContent?.formatted ? (
+                            <div
+                                className="p-3 bg-gray-900/50 rounded-md text-white text-sm whitespace-pre-wrap break-words max-h-48 overflow-y-auto"
+                                dangerouslySetInnerHTML={{ __html: messageContent.formatted }}
+                            />
+                        ) : (
+                            <p className="p-3 bg-gray-900/50 rounded-md text-white text-sm whitespace-pre-wrap break-words">
+                                {messageContent?.plain || 'No message content'}
+                            </p>
+                        )}
                     </div>
                     <div>
                         <label htmlFor="scheduleTime" className="block text-sm font-medium text-gray-300 mb-1">

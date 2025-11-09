@@ -1,24 +1,25 @@
 import React from 'react';
 import MessageInput from './MessageInput';
-import { Gif, MatrixClient, MatrixUser, Message, Sticker } from '../types';
+import { Gif, MatrixClient, MatrixUser, Message, Sticker, DraftContent, SendKeyBehavior } from '../types';
 
 interface MessageComposerProps {
-    onSendMessage: (content: string, threadRootId?: string) => Promise<void> | void;
+    onSendMessage: (content: { body: string; formattedBody?: string }, threadRootId?: string) => Promise<void> | void;
     onSendFile: (file: File) => Promise<void> | void;
     onSendAudio: (file: Blob, duration: number) => Promise<void> | void;
     onSendSticker: (sticker: Sticker) => Promise<void> | void;
     onSendGif: (gif: Gif) => Promise<void> | void;
     onOpenCreatePoll: () => void;
-    onSchedule: (content: string) => void;
+    onSchedule: (content: DraftContent) => void;
     isSending: boolean;
     client: MatrixClient;
     roomId: string | null;
     replyingTo: Message | null;
     onCancelReply: () => void;
     roomMembers: MatrixUser[];
-    draftContent: string;
-    onDraftChange: (content: string) => void;
+    draftContent: DraftContent | null;
+    onDraftChange: (content: DraftContent) => void;
     isOffline: boolean;
+    sendKeyBehavior: SendKeyBehavior;
 }
 
 const MessageComposer: React.FC<MessageComposerProps> = ({
@@ -38,6 +39,7 @@ const MessageComposer: React.FC<MessageComposerProps> = ({
     draftContent,
     onDraftChange,
     isOffline,
+    sendKeyBehavior,
 }) => {
     return (
         <div className="border-t border-border-secondary bg-bg-primary">
@@ -48,7 +50,7 @@ const MessageComposer: React.FC<MessageComposerProps> = ({
                 </div>
             )}
             <MessageInput
-                onSendMessage={content => onSendMessage(content)}
+                onSendMessage={payload => onSendMessage(payload)}
                 onSendFile={onSendFile}
                 onSendAudio={onSendAudio}
                 onSendSticker={onSendSticker}
@@ -63,6 +65,7 @@ const MessageComposer: React.FC<MessageComposerProps> = ({
                 roomMembers={roomMembers}
                 draftContent={draftContent}
                 onDraftChange={onDraftChange}
+                sendKeyBehavior={sendKeyBehavior}
             />
         </div>
     );

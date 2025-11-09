@@ -6,7 +6,7 @@ import { MatrixClient } from '../../src/types';
 const mockSendMessage = vi.fn();
 
 const mockInput = vi.fn((props: any) => (
-    <button onClick={() => props.onSendMessage('hello')} data-testid="mock-input">
+    <button onClick={() => props.onSendMessage({ body: 'hello' })} data-testid="mock-input">
         send
     </button>
 ));
@@ -42,14 +42,15 @@ describe('MessageComposer', () => {
                 replyingTo={null}
                 onCancelReply={vi.fn()}
                 roomMembers={[]}
-                draftContent=""
+                draftContent={null}
                 onDraftChange={vi.fn()}
                 isOffline
+                sendKeyBehavior="enter"
             />
         );
 
         expect(screen.getByText(/You are offline/i)).toBeTruthy();
         fireEvent.click(screen.getByTestId('mock-input'));
-        expect(mockSendMessage).toHaveBeenCalledWith('hello');
+        expect(mockSendMessage).toHaveBeenCalledWith({ body: 'hello' });
     });
 });

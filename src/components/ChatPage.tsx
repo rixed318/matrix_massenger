@@ -34,6 +34,7 @@ import GroupCallView from './GroupCallView';
 import CallParticipantsPanel from './CallParticipantsPanel';
 import SearchModal from './SearchModal';
 import { SearchResultItem } from '@matrix-messenger/core';
+import type { DraftContent, SendKeyBehavior, DraftAttachment } from '../types';
 // FIX: The `matrix-js-sdk` exports event names as enums. Import them to use with the event emitter.
 // FIX: Import event enums to use with the event emitter instead of string literals, which are not assignable.
 // FIX: `CallErrorCode` is not an exported member of `matrix-js-sdk`. It has been removed.
@@ -73,7 +74,7 @@ const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, s
     const [isManageFoldersOpen, setIsManageFoldersOpen] = useState(false);
     const [isScheduleModalOpen, setIsScheduleModalOpen] = useState(false);
     const [isViewScheduledModalOpen, setIsViewScheduledModalOpen] = useState(false);
-    const [contentToSchedule, setContentToSchedule] = useState('');
+    const [contentToSchedule, setContentToSchedule] = useState<DraftContent | null>(null);
     const [allScheduledMessages, setAllScheduledMessages] = useState<ScheduledMessage[]>([]);
     const [userProfileVersion, setUserProfileVersion] = useState(0); // Used to force-refresh components
     const [isPaginating, setIsPaginating] = useState(false);
@@ -99,24 +100,75 @@ const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, s
     const [translatedMessages, setTranslatedMessages] = useState<Record<string, { text: string; isLoading: boolean }>>({});
     const [chatBackground, setChatBackground] = useState<string>('');
     const [notificationsEnabled, setNotificationsEnabled] = useState<boolean>(() => {
-
-    const [isOffline, setIsOffline] = useState(false);
         return localStorage.getItem('matrix-notifications-enabled') === 'true';
     });
+    const [sendKeyBehavior, setSendKeyBehavior] = useState<SendKeyBehavior>(() => {
+        const stored = localStorage.getItem('matrix-send-key') as SendKeyBehavior | null;
+        return stored === 'ctrlEnter' || stored === 'altEnter' || stored === 'enter' ? stored : 'enter';
+    });
+    const [isOffline, setIsOffline] = useState(false);
     const [isSearchOpen, setIsSearchOpen] = useState(false);
     const [secureCloudAlerts, setSecureCloudAlerts] = useState<Record<string, SuspiciousEventNotice[]>>({});
     const [secureCloudError, setSecureCloudError] = useState<string | null>(null);
     const [isSecureCloudActive, setIsSecureCloudActive] = useState(false);
-    const [drafts, setDrafts] = useState<Record<string, string>>(() => {
+    const normalizeAttachments = (attachments: unknown): DraftAttachment[] => {
+        if (!Array.isArray(attachments)) return [];
+        return attachments.flatMap(item => {
+            if (!item || typeof item !== 'object') return [];
+            const { id, name, size, mimeType, dataUrl, kind } = item as Partial<DraftAttachment> & Record<string, unknown>;
+            if (typeof id !== 'string' || typeof name !== 'string' || typeof dataUrl !== 'string') {
+                return [];
+            }
+            return [{
+                id,
+                name,
+                size: typeof size === 'number' ? size : 0,
+                mimeType: typeof mimeType === 'string' ? mimeType : 'application/octet-stream',
+                dataUrl,
+                kind: kind === 'file' ? 'file' : 'file',
+            }];
+        });
+    };
+
+    const areAttachmentsEqual = (a: DraftAttachment[], b: DraftAttachment[]) => {
+        if (a.length !== b.length) return false;
+        return a.every((att, index) => {
+            const other = b[index];
+            return other
+                && att.id === other.id
+                && att.name === other.name
+                && att.mimeType === other.mimeType
+                && att.size === other.size
+                && att.dataUrl === other.dataUrl;
+        });
+    };
+
+    const normalizeDraft = (value: unknown): DraftContent => {
+        if (value && typeof value === 'object') {
+            const draft = value as Record<string, unknown>;
+            const plain = typeof draft.plain === 'string'
+                ? draft.plain
+                : typeof draft.content === 'string'
+                    ? draft.content
+                    : '';
+            const formatted = typeof draft.formatted === 'string' ? draft.formatted : plain;
+            const attachments = normalizeAttachments(draft.attachments);
+            return { plain, formatted, attachments };
+        }
+        if (typeof value === 'string') {
+            return { plain: value, formatted: value, attachments: [] };
+        }
+        return { plain: '', formatted: '', attachments: [] };
+    };
+
+    const [drafts, setDrafts] = useState<Record<string, DraftContent>>(() => {
         try {
             const storedDrafts = localStorage.getItem(DRAFT_STORAGE_KEY);
             if (storedDrafts) {
                 const parsed = JSON.parse(storedDrafts);
                 if (parsed && typeof parsed === 'object') {
-                    return Object.entries(parsed).reduce<Record<string, string>>((acc, [roomId, value]) => {
-                        if (typeof value === 'string') {
-                            acc[roomId] = value;
-                        }
+                    return Object.entries(parsed).reduce<Record<string, DraftContent>>((acc, [roomId, value]) => {
+                        acc[roomId] = normalizeDraft(value);
                         return acc;
                     }, {});
                 }
@@ -147,11 +199,23 @@ const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, s
 
     useEffect(() => {
         try {
-            localStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(drafts));
+            const serialized = Object.entries(drafts).reduce<Record<string, DraftContent>>((acc, [roomId, draft]) => {
+                acc[roomId] = draft;
+                return acc;
+            }, {});
+            localStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(serialized));
         } catch (error) {
             console.error('Failed to persist drafts to localStorage', error);
         }
     }, [drafts]);
+
+    useEffect(() => {
+        try {
+            localStorage.setItem('matrix-send-key', sendKeyBehavior);
+        } catch (error) {
+            console.error('Failed to persist send key behavior', error);
+        }
+    }, [sendKeyBehavior]);
 
     useEffect(() => {
         const profile = getSecureCloudProfileForClient(client);
@@ -357,7 +421,7 @@ const handleLayoutChange = useCallback((layout: 'grid'|'spotlight') => {
 // ===== Offline outbox (IndexedDB) =====
 const OUTBOX_DB = 'econix-offline';
 const OUTBOX_STORE = 'outbox';
-type OutboxItem = { id: string; roomId: string; content: string; ts: number; threadRootId?: string };
+type OutboxItem = { id: string; roomId: string; content: { body: string; formattedBody?: string }; ts: number; threadRootId?: string };
 
 const outboxOpen = (): Promise<IDBDatabase> => {
     return new Promise((resolve, reject) => {
@@ -434,6 +498,10 @@ const handleSetChatBackground = (bgUrl: string) => {
         setChatBackground('');
         localStorage.removeItem('matrix-chat-bg');
     };
+
+    const handleSendKeyBehaviorChange = useCallback((behavior: SendKeyBehavior) => {
+        setSendKeyBehavior(behavior);
+    }, []);
     const handleAcceptVerification = async (req: any) => {
         try {
             await req.accept?.();
@@ -942,7 +1010,7 @@ const handleSetChatBackground = (bgUrl: string) => {
             if (prev[selectedRoomId] !== undefined) {
                 return prev;
             }
-            return { ...prev, [selectedRoomId]: '' };
+            return { ...prev, [selectedRoomId]: { plain: '', formatted: '', attachments: [] } };
         });
 
         let isActive = true;
@@ -959,8 +1027,14 @@ const handleSetChatBackground = (bgUrl: string) => {
                     let hasChanges = false;
                     const nextDrafts = { ...prev };
                     Object.entries(content).forEach(([roomId, value]) => {
-                        if (typeof value === 'string' && nextDrafts[roomId] !== value) {
-                            nextDrafts[roomId] = value;
+                        const normalized = normalizeDraft(value);
+                        const existing = nextDrafts[roomId];
+                        if (!existing
+                            || existing.plain !== normalized.plain
+                            || existing.formatted !== normalized.formatted
+                            || !areAttachmentsEqual(existing.attachments, normalized.attachments)
+                        ) {
+                            nextDrafts[roomId] = normalized;
                             hasChanges = true;
                         }
                     });
@@ -979,62 +1053,79 @@ const handleSetChatBackground = (bgUrl: string) => {
         };
     }, [client, selectedRoomId]);
 
-    const handleDraftChange = useCallback((roomId: string, value: string) => {
+    const handleDraftChange = useCallback((roomId: string, value: DraftContent) => {
         setDrafts(prev => {
-            const currentValue = prev[roomId] ?? '';
-            if (currentValue === value) {
+            const currentValue = prev[roomId];
+            if (currentValue
+                && currentValue.plain === value.plain
+                && currentValue.formatted === value.formatted
+                && areAttachmentsEqual(currentValue.attachments, value.attachments)
+            ) {
                 return prev;
             }
             return { ...prev, [roomId]: value };
         });
     }, []);
 
-    const handleActiveDraftChange = useCallback((value: string) => {
+    const handleActiveDraftChange = useCallback((value: DraftContent) => {
         if (!selectedRoomId) return;
         handleDraftChange(selectedRoomId, value);
     }, [handleDraftChange, selectedRoomId]);
 
-    const handleSendMessage = async (content: string, threadRootId?: string) => {
-if (isOffline) {
-    const roomId = selectedRoomId;
-    const id = `outbox-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    await outboxPut({ id, roomId, content: content.trim(), ts: Date.now(), threadRootId });
-    // Local echo
-    const user = client.getUser(client.getUserId()!);
-    const tempMessage: Message = {
-        id,
-        sender: {
-            id: client.getUserId()!,
-            name: user?.displayName || 'Me',
-            avatarUrl: mxcToHttp(client, user?.avatarUrl),
-        },
-        content: { body: content.trim(), msgtype: MsgType.Text },
-        timestamp: Date.now(),
-        isOwn: true,
-        reactions: null, isEdited: false, isRedacted: false, replyTo: null, readBy: {}, threadReplyCount: 0,
-        isUploading: true
-    } as any;
-    setMessages(prev => [...prev, tempMessage]);
-    setReplyingTo(null);
-    setDrafts(prev => ({ ...prev, [roomId]: '' }));
-    setIsSending(false);
-    return;
-}
+    const handleSendMessage = async (content: { body: string; formattedBody?: string }, threadRootId?: string) => {
+        const trimmedBody = content.body.trim();
+        if (!trimmedBody) {
+            return;
+        }
+
+        if (isOffline) {
+            const roomId = selectedRoomId;
+            if (!roomId) {
+                setIsSending(false);
+                return;
+            }
+            const id = `outbox-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+            await outboxPut({ id, roomId, content: { body: trimmedBody, formattedBody: content.formattedBody }, ts: Date.now(), threadRootId });
+            const user = client.getUser(client.getUserId()!);
+            const tempMessage: Message = {
+                id,
+                sender: {
+                    id: client.getUserId()!,
+                    name: user?.displayName || 'Me',
+                    avatarUrl: mxcToHttp(client, user?.avatarUrl),
+                },
+                content: {
+                    body: trimmedBody,
+                    msgtype: MsgType.Text,
+                    ...(content.formattedBody ? { formatted_body: content.formattedBody, format: 'org.matrix.custom.html' } : {}),
+                },
+                timestamp: Date.now(),
+                isOwn: true,
+                reactions: null, isEdited: false, isRedacted: false, replyTo: null, readBy: {}, threadReplyCount: 0,
+                isUploading: true
+            } as any;
+            setMessages(prev => [...prev, tempMessage]);
+            setDrafts(prev => ({ ...prev, [roomId]: { plain: '', formatted: '', attachments: [] } }));
+            setReplyingTo(null);
+            setIsSending(false);
+            return;
+        }
 
 
-        if (!selectedRoomId || !content.trim()) return;
+        if (!selectedRoomId) return;
         const roomId = selectedRoomId;
         setIsSending(true);
         try {
             const room = client.getRoom(roomId);
             const eventToReplyTo = replyingTo ? room?.findEventById(replyingTo.id) : undefined;
-            await sendMessage(client, roomId, content.trim(), eventToReplyTo, threadRootId, roomMembers);
+            await sendMessage(client, roomId, { body: trimmedBody, formattedBody: content.formattedBody }, eventToReplyTo, threadRootId, roomMembers);
             setReplyingTo(null);
             setDrafts(prev => {
-                if (prev[roomId] === '') {
+                const existing = prev[roomId];
+                if (existing && existing.plain === '' && existing.attachments.length === 0) {
                     return prev;
                 }
-                return { ...prev, [roomId]: '' };
+                return { ...prev, [roomId]: { plain: '', formatted: '', attachments: [] } };
             });
         } catch (error) {
             console.error('Failed to send message:', error);
@@ -1291,22 +1382,22 @@ if (isOffline) {
         }
     };
     
-    const handleOpenScheduleModal = (content: string) => {
+    const handleOpenScheduleModal = (content: DraftContent) => {
         setContentToSchedule(content);
         setIsScheduleModalOpen(true);
     };
-    
+
     const handleConfirmSchedule = async (sendAt: number) => {
-        if (selectedRoomId) {
+        if (selectedRoomId && contentToSchedule?.plain.trim()) {
             try {
-                await addScheduledMessage(client, selectedRoomId, contentToSchedule, sendAt);
+                await addScheduledMessage(client, selectedRoomId, contentToSchedule.plain, sendAt);
                 setAllScheduledMessages(await getScheduledMessages(client));
             } catch (error) {
                 console.error('Failed to schedule message', error);
             }
         }
         setIsScheduleModalOpen(false);
-        setContentToSchedule('');
+        setContentToSchedule(null);
     };
 
     const handleDeleteScheduled = async (id: string) => {
@@ -1606,9 +1697,10 @@ if (isOffline) {
                             replyingTo={replyingTo}
                             onCancelReply={() => setReplyingTo(null)}
                             roomMembers={roomMembers}
-                            draftContent={selectedRoomId ? drafts[selectedRoomId] ?? '' : ''}
+                            draftContent={selectedRoomId ? drafts[selectedRoomId] ?? null : null}
                             onDraftChange={handleActiveDraftChange}
                             isOffline={isOffline}
+                            sendKeyBehavior={sendKeyBehavior}
                         />
                     </>
                 ) : <WelcomeView client={client} />}
@@ -1622,6 +1714,7 @@ if (isOffline) {
                     client={client}
                     onSendMessage={handleSendMessage}
                     onImageClick={setViewingImageUrl}
+                    sendKeyBehavior={sendKeyBehavior}
                 />
             )}
 
@@ -1636,6 +1729,8 @@ if (isOffline) {
                     chatBackground={chatBackground}
                     onSetChatBackground={handleSetChatBackground}
                     onResetChatBackground={handleResetChatBackground}
+                    sendKeyBehavior={sendKeyBehavior}
+                    onSetSendKeyBehavior={handleSendKeyBehaviorChange}
                 />
             )}
 

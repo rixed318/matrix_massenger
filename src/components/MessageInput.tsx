@@ -1,32 +1,103 @@
-import React, { useState, KeyboardEvent, useEffect, useRef } from 'react';
+import React, { useState, KeyboardEvent, useEffect, useRef, useMemo, ChangeEvent } from 'react';
 import { MatrixClient, Message, MatrixUser, Sticker, Gif } from '@matrix-messenger/core';
 import { sendTypingIndicator, getRoomTTL, setRoomTTL, setNextMessageTTL } from '@matrix-messenger/core';
 import MentionSuggestions from './MentionSuggestions';
 import StickerGifPicker from './StickerGifPicker';
+import type { DraftAttachment, DraftContent, SendKeyBehavior } from '../types';
+
+const deserializeAttachment = async (attachment: DraftAttachment): Promise<File> => {
+    const response = await fetch(attachment.dataUrl);
+    const blob = await response.blob();
+    return new File([blob], attachment.name, { type: attachment.mimeType, lastModified: Date.now() });
+};
+
+const formatFileSize = (size: number) => {
+    if (size >= 1024 * 1024) {
+        return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+    }
+    if (size >= 1024) {
+        return `${(size / 1024).toFixed(1)} KB`;
+    }
+    return `${size} B`;
+};
+
+const createAttachmentId = () => `att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+const escapeHtml = (value: string) =>
+    value
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+
+const renderMarkdown = (value: string, roomMembers: MatrixUser[]): string => {
+    if (!value) {
+        return '';
+    }
+
+    const memberByName = new Map<string, MatrixUser>();
+    roomMembers.forEach(member => {
+        if (member.displayName) {
+            memberByName.set(member.displayName, member);
+        }
+        memberByName.set(member.userId, member);
+    });
+
+    let html = escapeHtml(value);
+
+    html = html.replace(/\[([^\]]+)\]\((https?:[^\s)]+)\)/g, (_match, text: string, url: string) => {
+        const safeText = text;
+        const safeUrl = escapeHtml(url);
+        return `<a href="${safeUrl}" target="_blank" rel="noopener noreferrer">${safeText}</a>`;
+    });
+
+    html = html.replace(/`([^`]+)`/g, (_match, content: string) => `<code>${content}</code>`);
+    html = html.replace(/\*\*([^*]+)\*\*/g, (_match, text: string) => `<strong>${text}</strong>`);
+    html = html.replace(/__([^_]+)__/g, (_match, text: string) => `<strong>${text}</strong>`);
+    html = html.replace(/~~([^~]+)~~/g, (_match, text: string) => `<s>${text}</s>`);
+    html = html.replace(/\*([^*]+)\*/g, (_match, text: string) => `<em>${text}</em>`);
+    html = html.replace(/_([^_]+)_/g, (_match, text: string) => `<em>${text}</em>`);
+
+    html = html.replace(/@([A-Za-z0-9._-]+)/g, (match: string, name: string) => {
+        const member = memberByName.get(name);
+        if (!member) {
+            return match;
+        }
+        const display = escapeHtml(member.displayName ?? member.userId);
+        return `<a href="https://matrix.to/#/${member.userId}" rel="noopener noreferrer">@${display}</a>`;
+    });
+
+    return html.replace(/\n/g, '<br/>');
+};
 
 interface MessageInputProps {
-    onSendMessage: (content: string) => void;
+    onSendMessage: (content: { body: string; formattedBody?: string }) => void | Promise<void>;
     onSendFile: (file: File) => void;
     onSendAudio: (file: Blob, duration: number) => void;
     onSendSticker: (sticker: Sticker) => void;
     onSendGif: (gif: Gif) => void;
     onOpenCreatePoll: () => void;
-    onSchedule: (content: string) => void;
+    onSchedule: (content: DraftContent) => void;
     isSending: boolean;
     client: MatrixClient;
     roomId: string | null;
     replyingTo: Message | null;
     onCancelReply: () => void;
     roomMembers: MatrixUser[];
-    draftContent: string;
-    onDraftChange: (content: string) => void;
+    draftContent: DraftContent | null;
+    onDraftChange: (content: DraftContent) => void;
+    sendKeyBehavior: SendKeyBehavior;
 }
 
 const MessageInput: React.FC<MessageInputProps> = ({
     onSendMessage, onSendFile, onSendAudio, onSendSticker, onSendGif, onOpenCreatePoll, onSchedule,
-    isSending, client, roomId, replyingTo, onCancelReply, roomMembers, draftContent, onDraftChange
+    isSending, client, roomId, replyingTo, onCancelReply, roomMembers, draftContent, onDraftChange,
+    sendKeyBehavior
 }) => {
-    const [content, setContent] = useState(draftContent || '');
+    const [content, setContent] = useState(draftContent?.plain ?? '');
+    const [attachments, setAttachments] = useState<DraftAttachment[]>(draftContent?.attachments ?? []);
+    const [showPreview, setShowPreview] = useState(false);
     const [isRecording, setIsRecording] = useState(false);
     const [recordingTime, setRecordingTime] = useState(0);
     const [showMentions, setShowMentions] = useState(false);
@@ -42,7 +113,7 @@ const MessageInput: React.FC<MessageInputProps> = ({
 
 
     const typingTimeoutRef = useRef<number | null>(null);
-    const inputRef = useRef<HTMLInputElement>(null);
+    const inputRef = useRef<HTMLTextAreaElement>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
     const mediaRecorderRef = useRef<MediaRecorder | null>(null);
     const audioChunksRef = useRef<Blob[]>([]);
@@ -56,17 +127,27 @@ const MessageInput: React.FC<MessageInputProps> = ({
     }, [replyingTo]);
 
     useEffect(() => {
-        setContent(draftContent || '');
+        setContent(draftContent?.plain ?? '');
+        setAttachments(draftContent?.attachments ?? []);
+        setShowPreview(false);
     }, [draftContent, roomId]);
 
-    useEffect(() => {
-        if (!roomId) return;
-        onDraftChange(content);
-    }, [content, roomId, onDraftChange]);
+    const formattedHtml = useMemo(() => renderMarkdown(content, roomMembers), [content, roomMembers]);
+
+    const currentDraft = useMemo<DraftContent>(() => ({
+        plain: content,
+        formatted: formattedHtml,
+        attachments,
+    }), [content, formattedHtml, attachments]);
 
     useEffect(() => {
         if (!roomId) return;
-        
+        onDraftChange(currentDraft);
+    }, [currentDraft, roomId, onDraftChange]);
+
+    useEffect(() => {
+        if (!roomId) return;
+
         const lastWord = content.split(' ').pop() || '';
         if (lastWord.startsWith('@') && lastWord.length > 1) {
             setShowMentions(true);
@@ -74,6 +155,8 @@ const MessageInput: React.FC<MessageInputProps> = ({
         } else {
             setShowMentions(false);
         }
+
+        adjustTextareaHeight();
 
         if (content) {
             sendTypingIndicator(client, roomId, true);
@@ -122,41 +205,196 @@ const MessageInput: React.FC<MessageInputProps> = ({
         return () => document.removeEventListener('mousedown', handleClickOutside);
     }, []);
 
-    const updateContent = (value: string) => {
-        setContent(value);
+    const adjustTextareaHeight = () => {
+        const textarea = inputRef.current;
+        if (!textarea) return;
+        textarea.style.height = 'auto';
+        const maxHeight = 240;
+        const nextHeight = Math.min(textarea.scrollHeight, maxHeight);
+        textarea.style.height = `${nextHeight}px`;
     };
 
-    const handleSend = () => {
-        if (content.trim() && roomId) {
-            if (typingTimeoutRef.current) window.clearTimeout(typingTimeoutRef.current);
-            sendTypingIndicator(client, roomId, false);
-            onSendMessage(content);
+    const handleTextareaChange = (event: ChangeEvent<HTMLTextAreaElement>) => {
+        setContent(event.target.value);
+        setMentionCursor(event.target.selectionStart ?? event.target.value.length);
+    };
+
+    const handleCaretChange = () => {
+        const textarea = inputRef.current;
+        if (!textarea) return;
+        setMentionCursor(textarea.selectionStart ?? textarea.value.length);
+    };
+
+    const applyMarkdown = (prefix: string, suffix: string, placeholder: string) => {
+        const textarea = inputRef.current;
+        if (!textarea) return;
+        const start = textarea.selectionStart ?? 0;
+        const end = textarea.selectionEnd ?? start;
+        const selected = content.slice(start, end) || placeholder;
+        const before = content.slice(0, start);
+        const after = content.slice(end);
+        const nextValue = `${before}${prefix}${selected}${suffix}${after}`;
+        setContent(nextValue);
+
+        const selectionStart = start + prefix.length;
+        const selectionEnd = selectionStart + selected.length;
+        requestAnimationFrame(() => {
+            textarea.focus();
+            textarea.selectionStart = selectionStart;
+            textarea.selectionEnd = selectionEnd;
+            setMentionCursor(selectionEnd);
+            adjustTextareaHeight();
+        });
+    };
+
+    const applyLink = () => {
+        const textarea = inputRef.current;
+        if (!textarea) return;
+        const start = textarea.selectionStart ?? 0;
+        const end = textarea.selectionEnd ?? start;
+        const selected = content.slice(start, end) || 'label';
+        const urlPlaceholder = 'https://example.com';
+        const before = content.slice(0, start);
+        const after = content.slice(end);
+        const linkMarkdown = `[${selected}](${urlPlaceholder})`;
+        const nextValue = `${before}${linkMarkdown}${after}`;
+        setContent(nextValue);
+
+        const selectionStart = before.length + selected.length + 3; // [ + ](
+        const selectionEnd = selectionStart + urlPlaceholder.length;
+        requestAnimationFrame(() => {
+            textarea.focus();
+            textarea.selectionStart = selectionStart;
+            textarea.selectionEnd = selectionEnd;
+            setMentionCursor(selectionEnd);
+            adjustTextareaHeight();
+        });
+    };
+
+    const removeAttachment = (id: string) => {
+        setAttachments(prev => prev.filter(att => att.id !== id));
+    };
+
+    const handleSend = async () => {
+        if (!roomId) return;
+        const trimmed = content.trim();
+        const hasAttachments = attachments.length > 0;
+        if (!trimmed && !hasAttachments) {
+            return;
+        }
+
+        if (typingTimeoutRef.current) window.clearTimeout(typingTimeoutRef.current);
+        sendTypingIndicator(client, roomId, false);
+
+        try {
+            if (trimmed) {
+                await onSendMessage({
+                    body: trimmed,
+                    formattedBody: formattedHtml || undefined,
+                });
+            }
+
+            if (hasAttachments) {
+                for (const attachment of attachments) {
+                    const file = await deserializeAttachment(attachment);
+                    onSendFile(file);
+                }
+            }
+
+            setAttachments([]);
+            setContent('');
+        } catch (error) {
+            console.error('Failed to send message content', error);
         }
     };
 
     const handleSelectMention = (user: MatrixUser) => {
-        const parts = content.split(' ');
-        parts.pop(); // remove the @-query part
-        const newContent = [...parts, `@${user.displayName}`].join(' ') + ' ';
-        updateContent(newContent);
+        const cursor = mentionCursor;
+        const textareaValue = content;
+        const lastAt = textareaValue.lastIndexOf('@', Math.max(cursor - 1, 0));
+        let newContent = textareaValue;
+        if (lastAt >= 0) {
+            const before = textareaValue.slice(0, lastAt);
+            const after = textareaValue.slice(cursor);
+            newContent = `${before}@${user.displayName} ${after}`;
+        } else {
+            newContent = `${textareaValue}@${user.displayName} `;
+        }
+
+        setContent(newContent);
         setShowMentions(false);
-        inputRef.current?.focus();
+        requestAnimationFrame(() => {
+            const textarea = inputRef.current;
+            if (textarea) {
+                const nextCursor = (lastAt >= 0 ? lastAt : textareaValue.length) + user.displayName.length + 2;
+                textarea.selectionStart = textarea.selectionEnd = nextCursor;
+                textarea.focus();
+                setMentionCursor(nextCursor);
+                adjustTextareaHeight();
+            }
+        });
     };
 
-    const handleKeyPress = (e: KeyboardEvent<HTMLInputElement>) => {
-        if (e.key === 'Enter' && !showMentions) {
-            handleSend();
-        } else if (e.key === 'Escape') {
+    const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
+        if (e.key === 'Enter') {
+            const isCtrlLike = e.ctrlKey || e.metaKey;
+            const shouldSend = (() => {
+                if (showMentions) return false;
+                if (sendKeyBehavior === 'enter') {
+                    if (e.shiftKey) return false;
+                    if (isCtrlLike || e.altKey) return false;
+                    e.preventDefault();
+                    return true;
+                }
+                if (sendKeyBehavior === 'ctrlEnter') {
+                    if (isCtrlLike && !e.shiftKey && !e.altKey) {
+                        e.preventDefault();
+                        return true;
+                    }
+                    return false;
+                }
+                if (sendKeyBehavior === 'altEnter') {
+                    if (e.altKey && !e.shiftKey && !isCtrlLike) {
+                        e.preventDefault();
+                        return true;
+                    }
+                    return false;
+                }
+                return false;
+            })();
+
+            if (shouldSend) {
+                void handleSend();
+                return;
+            }
+        }
+
+        if (e.key === 'Escape') {
             if (replyingTo) onCancelReply();
             if (showMentions) setShowMentions(false);
             if (isPickerOpen) setPickerOpen(false);
         }
     };
 
-    const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const handleFileChange = (event: ChangeEvent<HTMLInputElement>) => {
         const file = event.target.files?.[0];
         if (file) {
-            onSendFile(file);
+            const reader = new FileReader();
+            reader.onload = () => {
+                const dataUrl = reader.result as string;
+                setAttachments(prev => ([
+                    ...prev,
+                    {
+                        id: createAttachmentId(),
+                        name: file.name,
+                        size: file.size,
+                        mimeType: file.type,
+                        dataUrl,
+                        kind: 'file',
+                    },
+                ]));
+            };
+            reader.readAsDataURL(file);
         }
         if(event.target) {
             event.target.value = '';
@@ -259,7 +497,7 @@ const MessageInput: React.FC<MessageInputProps> = ({
     };
 
     const renderSendButton = () => {
-        const hasContent = content.trim().length > 0;
+        const hasContent = content.trim().length > 0 || attachments.length > 0;
         const buttonDisabled = isSending || !roomId;
 
         if (isRecording) {
@@ -274,7 +512,7 @@ const MessageInput: React.FC<MessageInputProps> = ({
         if (hasContent) {
             return (
                  <button
-                    onClick={handleSend}
+                    onClick={() => void handleSend()}
                     onContextMenu={handleSendRightClick}
                     disabled={buttonDisabled}
                     className="p-3 text-text-accent hover:opacity-80 disabled:text-text-secondary disabled:cursor-not-allowed"
@@ -322,7 +560,7 @@ const MessageInput: React.FC<MessageInputProps> = ({
                 >
                     <button
                         onClick={() => {
-                            onSchedule(content);
+                            onSchedule(currentDraft);
                             setContextMenuVisible(false);
                         }}
                         className="w-full text-left px-3 py-2 text-sm text-text-primary hover:bg-bg-tertiary rounded-md"
@@ -349,6 +587,27 @@ const MessageInput: React.FC<MessageInputProps> = ({
                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
                         </svg>
                     </button>
+                </div>
+            )}
+            {attachments.length > 0 && (
+                <div className="ml-1 mr-1 mb-2 flex flex-wrap gap-2">
+                    {attachments.map(attachment => (
+                        <div
+                            key={attachment.id}
+                            className="flex items-center gap-2 px-3 py-1 bg-bg-secondary border border-border-secondary rounded-md text-xs text-text-primary"
+                        >
+                            <span className="max-w-[160px] truncate" title={attachment.name}>{attachment.name}</span>
+                            <span className="text-text-secondary">{formatFileSize(attachment.size)}</span>
+                            <button
+                                type="button"
+                                onClick={() => removeAttachment(attachment.id)}
+                                className="text-text-secondary hover:text-text-primary"
+                                aria-label="Remove attachment"
+                            >
+                                ×
+                            </button>
+                        </div>
+                    ))}
                 </div>
             )}
             <div className={`flex items-center bg-bg-secondary ${replyingTo ? 'rounded-b-lg' : 'rounded-lg'}`}>
@@ -390,16 +649,79 @@ const MessageInput: React.FC<MessageInputProps> = ({
                          <button onClick={cancelRecording} className="text-text-secondary hover:text-text-primary">Cancel</button>
                      </div>
                 ) : (
-                    <input
-                        ref={inputRef}
-                        type="text"
-                        value={content}
-                        onChange={(e) => updateContent(e.target.value)}
-                        onKeyDown={handleKeyPress}
-                        placeholder="Type a message..."
-                        className="flex-1 bg-transparent p-3 text-text-primary placeholder-text-secondary focus:outline-none"
-                        disabled={isSending || !roomId}
-                    />
+                    <div className="flex-1 flex flex-col border-l border-border-secondary/60">
+                        <div className="flex items-center gap-2 px-3 pt-3 pb-1 border-b border-border-secondary/60">
+                            <button
+                                type="button"
+                                onClick={() => applyMarkdown('**', '**', 'bold text')}
+                                className="px-2 py-1 text-xs font-semibold rounded-md bg-transparent hover:bg-bg-tertiary"
+                                aria-label="Bold"
+                            >
+                                B
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => applyMarkdown('*', '*', 'italic text')}
+                                className="px-2 py-1 text-xs italic rounded-md bg-transparent hover:bg-bg-tertiary"
+                                aria-label="Italic"
+                            >
+                                I
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => applyMarkdown('~~', '~~', 'strikethrough')}
+                                className="px-2 py-1 text-xs rounded-md bg-transparent hover:bg-bg-tertiary"
+                                aria-label="Strikethrough"
+                            >
+                                S
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => applyMarkdown('`', '`', 'code')}
+                                className="px-2 py-1 text-xs font-mono rounded-md bg-transparent hover:bg-bg-tertiary"
+                                aria-label="Inline code"
+                            >
+                                {'</>'}
+                            </button>
+                            <button
+                                type="button"
+                                onClick={applyLink}
+                                className="px-2 py-1 text-xs rounded-md bg-transparent hover:bg-bg-tertiary"
+                                aria-label="Insert link"
+                            >
+                                🔗
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => setShowPreview(prev => !prev)}
+                                className={`ml-auto px-2 py-1 text-xs rounded-md ${showPreview ? 'bg-bg-tertiary text-text-primary' : 'bg-transparent text-text-secondary hover:text-text-primary hover:bg-bg-tertiary'}`}
+                                aria-pressed={showPreview}
+                            >
+                                {showPreview ? 'Editing' : 'Preview'}
+                            </button>
+                        </div>
+                        {showPreview ? (
+                            <div
+                                className="px-3 pb-3 text-sm text-text-primary whitespace-pre-wrap break-words max-h-40 overflow-y-auto"
+                                dangerouslySetInnerHTML={{ __html: formattedHtml || '<span class="text-text-secondary">Nothing to preview yet.</span>' }}
+                            />
+                        ) : (
+                            <textarea
+                                ref={inputRef}
+                                value={content}
+                                onChange={handleTextareaChange}
+                                onKeyDown={handleKeyDown}
+                                onKeyUp={handleCaretChange}
+                                onClick={handleCaretChange}
+                                onSelect={handleCaretChange}
+                                placeholder="Type a message..."
+                                className="flex-1 bg-transparent px-3 pb-3 text-text-primary placeholder-text-secondary focus:outline-none resize-none"
+                                disabled={isSending || !roomId}
+                                rows={1}
+                                style={{ minHeight: '48px', maxHeight: '240px' }}
+                            />
+                        )}
+                    </div>
                 )}
                 <div className="relative">
                     <button

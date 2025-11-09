@@ -3,6 +3,7 @@ import { MatrixClient } from '@matrix-messenger/core';
 import { mxcToHttp, getTranslationSettings, setTranslationSettings } from '@matrix-messenger/core';
 import Avatar from './Avatar';
 import SecuritySettings from './SecuritySettings';
+import type { SendKeyBehavior } from '../types';
 
 interface SettingsModalProps {
     isOpen: boolean;
@@ -14,6 +15,8 @@ interface SettingsModalProps {
     chatBackground: string;
     onSetChatBackground: (bgUrl: string) => void;
     onResetChatBackground: () => void;
+    sendKeyBehavior: SendKeyBehavior;
+    onSetSendKeyBehavior: (behavior: SendKeyBehavior) => void;
 }
 
 const ThemeSwatch: React.FC<{ name: string; colors: { primary: string; secondary: string; accent: string; }; isActive: boolean; onClick: () => void; }> = ({ name, colors, isActive, onClick }) => (
@@ -43,7 +46,7 @@ const BACKGROUNDS = [
 ];
 
 
-const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, onSave, client, notificationsEnabled, onSetNotificationsEnabled, chatBackground, onSetChatBackground, onResetChatBackground }) => {
+const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, onSave, client, notificationsEnabled, onSetNotificationsEnabled, chatBackground, onSetChatBackground, onResetChatBackground, sendKeyBehavior, onSetSendKeyBehavior }) => {
     const user = client.getUser(client.getUserId());
     const [displayName, setDisplayName] = useState(user?.displayName || '');
     const [avatarFile, setAvatarFile] = useState<File | null>(null);
@@ -212,6 +215,51 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, onSave, 
                             >
                                 Reset
                             </button>
+                        </div>
+                    </div>
+
+                    <div className="pt-6 border-t border-border-primary">
+                        <h3 className="text-lg font-semibold text-text-primary mb-3">Message Sending</h3>
+                        <div className="space-y-3">
+                            <label className="flex items-start gap-3 cursor-pointer">
+                                <input
+                                    type="radio"
+                                    name="sendKeyBehavior"
+                                    value="enter"
+                                    checked={sendKeyBehavior === 'enter'}
+                                    onChange={() => onSetSendKeyBehavior('enter')}
+                                    className="mt-1 h-4 w-4 text-accent focus:ring-ring-focus"
+                                />
+                                <span className="text-sm text-text-primary">
+                                    Enter sends message (Shift+Enter for new line)
+                                </span>
+                            </label>
+                            <label className="flex items-start gap-3 cursor-pointer">
+                                <input
+                                    type="radio"
+                                    name="sendKeyBehavior"
+                                    value="ctrlEnter"
+                                    checked={sendKeyBehavior === 'ctrlEnter'}
+                                    onChange={() => onSetSendKeyBehavior('ctrlEnter')}
+                                    className="mt-1 h-4 w-4 text-accent focus:ring-ring-focus"
+                                />
+                                <span className="text-sm text-text-primary">
+                                    Ctrl/⌘ + Enter sends message, Enter starts a new line
+                                </span>
+                            </label>
+                            <label className="flex items-start gap-3 cursor-pointer">
+                                <input
+                                    type="radio"
+                                    name="sendKeyBehavior"
+                                    value="altEnter"
+                                    checked={sendKeyBehavior === 'altEnter'}
+                                    onChange={() => onSetSendKeyBehavior('altEnter')}
+                                    className="mt-1 h-4 w-4 text-accent focus:ring-ring-focus"
+                                />
+                                <span className="text-sm text-text-primary">
+                                    Alt + Enter sends message, Enter starts a new line
+                                </span>
+                            </label>
                         </div>
                     </div>
 
