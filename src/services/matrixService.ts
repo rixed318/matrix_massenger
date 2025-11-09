@@ -632,6 +632,50 @@ const waitForFirstSync = (client: MatrixClient): Promise<void> =>
         client.on(ClientEvent.Sync as any, handler);
     });
 
+const delay = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
+
+const createAbortError = (): Error => {
+    const error = new Error('Aborted');
+    (error as any).name = 'AbortError';
+    return error;
+};
+
+const bootstrapAuthenticatedClient = async (client: MatrixClient, secureProfile?: SecureCloudProfile): Promise<void> => {
+    await initCryptoBackend(client);
+    const firstSync = waitForFirstSync(client);
+    await (client as any).startClient({ initialSyncLimit: 30, cryptoStore: _cryptoStore } as any);
+
+    try {
+        await (client as any).store?.startup?.();
+    } catch (e) {
+        console.warn('client.store.startup failed or not available', e);
+    }
+
+    try {
+        // Preload local history from the persistent store before network responses arrive
+        const rs = client.getRooms();
+        for (const r of rs) {
+            try {
+                r.getLiveTimeline();
+            } catch (_) {
+                // ignore
+            }
+        }
+    } catch (e) {
+        console.warn('Preload local history failed', e);
+    }
+
+    await firstSync;
+    try {
+        bindOutboxToClient(client);
+    } catch (e) {
+        console.warn('bindOutboxToClient failed', e);
+    }
+    if (secureProfile) {
+        setSecureCloudProfileForClient(client, secureProfile);
+    }
+};
+
 export const initClient = async (homeserverUrl: string, accessToken?: string, userId?: string): Promise<MatrixClient> => {
     const options: ICreateClientOpts = {
         baseUrl: homeserverUrl,
@@ -813,30 +857,8 @@ export const login = async (
         }
     }
 
-    await initCryptoBackend(client);
-    const firstSync = waitForFirstSync(client);
-    await (client as any).startClient({ initialSyncLimit: 30, cryptoStore: _cryptoStore } as any);
+    await bootstrapAuthenticatedClient(client, options.secureProfile);
 
-    try {
-        await (client as any).store?.startup?.();
-    } catch (e) {
-        console.warn('client.store.startup failed or not available', e);
-    }
-    try {
-        // Preload local history from the persistent store before network responses arrive
-        const rs = client.getRooms();
-        for (const r of rs) {
-            try { r.getLiveTimeline(); } catch (_) {}
-        }
-    } catch (e) {
-        console.warn('Preload local history failed', e);
-    }
-
-    await firstSync;
-    try { bindOutboxToClient(client); } catch (e) { console.warn('bindOutboxToClient failed', e); }
-    if (options.secureProfile) {
-        setSecureCloudProfileForClient(client, options.secureProfile);
-    }
     return client;
 };
 
@@ -916,6 +938,224 @@ export const register = async (homeserverUrl: string, username: string, password
 
     const userId = registerResponse?.user_id || username;
     return await login(homeserverUrl, userId, password);
+};
+
+export const loginWithToken = async (homeserverUrl: string, loginToken: string): Promise<MatrixClient> => {
+    if (!loginToken) {
+        throw new Error('Login token is required.');
+    }
+
+    const client = await initClient(homeserverUrl);
+    await client.login('m.login.token', { token: loginToken });
+    await bootstrapAuthenticatedClient(client);
+    return client;
+};
+
+export interface GenerateQrLoginOptions {
+    pollIntervalMs?: number;
+    signal?: AbortSignal;
+    fetchFn?: typeof fetch;
+}
+
+export interface QrLoginHandle {
+    matrixUri?: string | null;
+    expiresAt?: number | null;
+    fallbackUrl?: string | null;
+    pollLoginToken: (options?: { signal?: AbortSignal; pollIntervalMs?: number; timeoutMs?: number }) => Promise<string>;
+    cancel: () => Promise<void>;
+}
+
+const buildSsoFallbackUrl = (homeserverUrl: string): string => {
+    try {
+        const url = new URL('/_matrix/client/v3/login/sso/redirect', homeserverUrl);
+        url.searchParams.set('redirectUrl', 'https://matrix.to/#/');
+        return url.toString();
+    } catch (err) {
+        console.warn('Failed to build SSO fallback URL', err);
+        return homeserverUrl;
+    }
+};
+
+const readErrorMessage = async (response: Response): Promise<string> => {
+    try {
+        const text = await response.text();
+        if (!text) return '';
+        try {
+            const parsed = JSON.parse(text);
+            return parsed?.error || parsed?.message || text;
+        } catch {
+            return text;
+        }
+    } catch {
+        return '';
+    }
+};
+
+export const generateQrLogin = async (homeserverUrl: string, options: GenerateQrLoginOptions = {}): Promise<QrLoginHandle> => {
+    const fetchFn = options.fetchFn ?? (typeof fetch !== 'undefined' ? fetch.bind(globalThis) : undefined);
+    if (!fetchFn) {
+        throw new Error('QR login requires an environment with fetch support.');
+    }
+
+    const requestController = new AbortController();
+    const externalSignal = options.signal;
+    if (externalSignal) {
+        if (externalSignal.aborted) {
+            throw createAbortError();
+        }
+        const abortListener = () => requestController.abort();
+        externalSignal.addEventListener('abort', abortListener, { once: true });
+        requestController.signal.addEventListener(
+            'abort',
+            () => {
+                externalSignal.removeEventListener('abort', abortListener);
+            },
+            { once: true },
+        );
+    }
+
+    const codeUrl = new URL('/_matrix/client/v3/login/qr/code', homeserverUrl);
+    const response = await fetchFn(codeUrl.toString(), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: requestController.signal,
+    });
+
+    if (!response.ok) {
+        const errorMessage = await readErrorMessage(response);
+        const baseError = errorMessage || 'Сервер не поддерживает вход по QR-коду.';
+        throw new Error(baseError);
+    }
+
+    const payload: any = await response.json().catch(() => ({}));
+    const pollingToken: string | undefined =
+        payload?.polling?.token ?? payload?.polling_token ?? payload?.pollingToken ?? payload?.token;
+
+    if (!pollingToken) {
+        throw new Error('Сервер не вернул идентификатор QR-сессии.');
+    }
+
+    const matrixUri: string | null =
+        payload?.qr_code?.uri ?? payload?.qrUri ?? payload?.uri ?? payload?.qr_code_uri ?? payload?.qrCode?.uri ?? null;
+    const expiresAt: number | null =
+        typeof payload?.expires_at === 'number'
+            ? payload.expires_at
+            : typeof payload?.expires_in_ms === 'number'
+            ? Date.now() + payload.expires_in_ms
+            : null;
+
+    const pollUrl =
+        payload?.polling?.url ??
+        payload?.polling_url ??
+        (() => {
+            const url = new URL('/_matrix/client/v3/login/qr/attempt', homeserverUrl);
+            return url.toString();
+        })();
+
+    const cancelUrl: string | null =
+        payload?.polling?.cancel_url ??
+        payload?.cancel_url ??
+        (() => {
+            try {
+                const url = new URL('/_matrix/client/v3/login/qr/attempt', homeserverUrl);
+                return url.toString();
+            } catch (err) {
+                console.warn('Failed to build QR cancel URL', err);
+                return null;
+            }
+        })();
+
+    const defaultInterval =
+        typeof payload?.polling?.interval_ms === 'number'
+            ? Math.max(payload.polling.interval_ms, 1000)
+            : Math.max(options.pollIntervalMs ?? 5000, 1000);
+
+    const fallbackUrl: string | null = payload?.fallback_url ?? buildSsoFallbackUrl(homeserverUrl);
+
+    const pollLoginToken = async ({ signal, pollIntervalMs, timeoutMs }: { signal?: AbortSignal; pollIntervalMs?: number; timeoutMs?: number } = {}): Promise<string> => {
+        const interval = Math.max(pollIntervalMs ?? defaultInterval, 1000);
+        const startedAt = Date.now();
+        const loopController = new AbortController();
+
+        const abortHandler = () => {
+            loopController.abort();
+        };
+
+        const cleanup = () => {
+            if (signal) {
+                signal.removeEventListener('abort', abortHandler);
+            }
+        };
+
+        if (signal) {
+            if (signal.aborted) {
+                throw createAbortError();
+            }
+            signal.addEventListener('abort', abortHandler, { once: true });
+        }
+
+        try {
+            while (true) {
+                if (requestController.signal.aborted || loopController.signal.aborted) {
+                    throw createAbortError();
+                }
+
+                if (typeof timeoutMs === 'number' && timeoutMs > 0 && Date.now() - startedAt > timeoutMs) {
+                    throw new Error('Превышено время ожидания подтверждения QR-входа.');
+                }
+
+                if (expiresAt && Date.now() >= expiresAt) {
+                    throw new Error('QR-код истёк. Повторите попытку.');
+                }
+
+                const attemptResponse = await fetchFn(pollUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ token: pollingToken }),
+                    signal: requestController.signal,
+                });
+
+                if (attemptResponse.ok) {
+                    const result: any = await attemptResponse.json().catch(() => ({}));
+                    const loginToken: string | undefined =
+                        result?.login_token ?? result?.loginToken ?? result?.token ?? result?.access_token;
+                    if (loginToken) {
+                        cleanup();
+                        return loginToken;
+                    }
+                } else if (![401, 403, 404].includes(attemptResponse.status)) {
+                    const message = await readErrorMessage(attemptResponse);
+                    throw new Error(message || 'Не удалось проверить состояние QR-входа.');
+                }
+
+                await delay(interval);
+            }
+        } finally {
+            cleanup();
+        }
+    };
+
+    const cancel = async () => {
+        requestController.abort();
+        if (!cancelUrl) return;
+        try {
+            await fetchFn(cancelUrl, {
+                method: 'DELETE',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ token: pollingToken }),
+            });
+        } catch (err) {
+            console.warn('Failed to cancel QR login session', err);
+        }
+    };
+
+    return {
+        matrixUri,
+        expiresAt,
+        fallbackUrl,
+        pollLoginToken,
+        cancel,
+    } satisfies QrLoginHandle;
 };
 
 export const findOrCreateSavedMessagesRoom = async (client: MatrixClient): Promise<string> => {
