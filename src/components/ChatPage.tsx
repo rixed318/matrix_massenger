@@ -787,15 +787,41 @@ const handleSetChatBackground = (bgUrl: string) => {
             const roomData: UIRoom[] = sortedRooms.map(room => {
                 const lastEvent = room.timeline[room.timeline.length - 1];
                 const pinnedEvent = room.currentState.getStateEvents(EventType.RoomPinnedEvents, '');
+                const topicEvent = room.currentState.getStateEvents(EventType.RoomTopic, '');
+                const topicContent = topicEvent?.getContent?.();
+                const topic = typeof topicContent?.topic === 'string' ? topicContent.topic : undefined;
+                const canonicalAliasEvent = room.currentState.getStateEvents(EventType.RoomCanonicalAlias, '');
+                const canonicalAliasContent = canonicalAliasEvent?.getContent?.();
+                const canonicalAlias = typeof canonicalAliasContent?.alias === 'string'
+                    ? canonicalAliasContent.alias
+                    : (Array.isArray(canonicalAliasContent?.alt_aliases) && canonicalAliasContent.alt_aliases.length > 0
+                        ? canonicalAliasContent.alt_aliases[0]
+                        : undefined);
+                const roomType = room.getType() || null;
+                const isSpace = roomType === 'm.space';
+                const childEvents = room.currentState.getStateEvents(EventType.SpaceChild) as MatrixEvent[] | undefined;
+                const spaceChildIds = (Array.isArray(childEvents) ? childEvents : [])
+                    .map(ev => ev.getStateKey())
+                    .filter((id): id is string => !!id);
+                const parentEvents = room.currentState.getStateEvents(EventType.SpaceParent) as MatrixEvent[] | undefined;
+                const spaceParentIds = (Array.isArray(parentEvents) ? parentEvents : [])
+                    .map(ev => ev.getStateKey())
+                    .filter((id): id is string => !!id);
                 const uiRoom: UIRoom = {
                     roomId: room.roomId,
                     name: room.name,
+                    topic,
                     avatarUrl: mxcToHttp(client, room.getMxcAvatarUrl()),
                     lastMessage: lastEvent ? parseMatrixEvent(lastEvent) : null,
                     unreadCount: room.getUnreadNotificationCount(NotificationCountType.Total),
                     pinnedEvents: pinnedEvent?.getContent().pinned || [],
                     isEncrypted: client.isRoomEncrypted(room.roomId),
                     isDirectMessageRoom: room.getJoinedMemberCount() === 2,
+                    roomType,
+                    isSpace,
+                    spaceChildIds,
+                    spaceParentIds,
+                    canonicalAlias: canonicalAlias ?? null,
                 };
 
                 if (room.roomId === savedMessagesRoomId) {
