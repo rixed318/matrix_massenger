@@ -129,6 +129,19 @@ export function parseMatrixEvent(client: MatrixClient, event: MatrixEvent): Mess
     const isSticker = event.getType() === 'm.sticker';
     const isGif = content.msgtype === 'm.image' && content.info?.['xyz.amorgan.is_gif'];
 
+    const destructContent = content['com.matrix_messenger.self_destruct'];
+    let selfDestruct: Message['selfDestruct'] = null;
+    if (destructContent && typeof destructContent === 'object') {
+        const ttlMs = typeof destructContent.ttlMs === 'number' ? destructContent.ttlMs : undefined;
+        const expiresAtRaw = destructContent.expiresAt ?? (ttlMs ? event.getTs() + ttlMs : null);
+        if (typeof expiresAtRaw === 'number' && Number.isFinite(expiresAtRaw)) {
+            selfDestruct = {
+                expiresAt: expiresAtRaw,
+                ttlMs,
+            };
+        }
+    }
+
     return {
         id: event.getId()!,
         sender: {
@@ -155,5 +168,6 @@ export function parseMatrixEvent(client: MatrixClient, event: MatrixEvent): Mess
         linkPreview,
         isSticker,
         isGif,
+        selfDestruct,
     };
 }

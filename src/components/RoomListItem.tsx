@@ -25,6 +25,9 @@ const RoomListItem: React.FC<RoomListItemProps> = ({ room, isSelected, onSelect 
     );
 
     const renderMetaText = () => {
+        if (room.isHidden) {
+            return 'Скрытый чат';
+        }
         if (isSpace) {
             const parts: string[] = [];
             if (room.topic) {
@@ -75,6 +78,11 @@ const RoomListItem: React.FC<RoomListItemProps> = ({ room, isSelected, onSelect 
                 <div className="flex justify-between items-center">
                     <p className="font-semibold text-sm truncate flex items-center gap-2">
                         {room.name}
+                        {room.isHidden && (
+                            <span className="text-[10px] uppercase tracking-wide font-semibold px-1.5 py-0.5 rounded-full bg-purple-500/10 text-purple-200">
+                                Hidden
+                            </span>
+                        )}
                         {isSpace && (
                             <span className="text-[10px] uppercase tracking-wide font-semibold px-1.5 py-0.5 rounded-full bg-bg-tertiary text-text-secondary">
                                 Space
