@@ -1,12 +1,17 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { ClientEvent, EventType, NotificationCountType, RoomEvent } from 'matrix-js-sdk';
-import { MatrixClient, MatrixEvent, MatrixRoom, Room as UIRoom, RoomHistoryVisibility, RoomJoinRule, RoomNotificationMode } from '../types';
-import { mxcToHttp } from '../services/matrixService';
-import { parseMatrixEvent } from '../utils/parseMatrixEvent';
+import { ClientEvent, EventType, RoomEvent } from 'matrix-js-sdk';
+import { MatrixClient, MatrixEvent, RoomNotificationMode } from '../types';
 import { useAccountStore } from '../services/accountManager';
-
-export type ChatRoomType = 'all' | 'direct' | 'group' | 'saved';
-export type ChatRoomStatus = 'all' | 'joined' | 'invited' | 'left';
+import {
+    ChatRoomStatus,
+    ChatRoomType,
+    RoomSelection,
+    RoomSummary,
+    buildRoomSelection,
+    collectUnifiedRooms,
+    type UnifiedAccountDescriptor,
+    type UnifiedRoomSummary,
+} from '../utils/chatSelectors';
 
 interface UseChatsOptions {
     client: MatrixClient;
@@ -14,8 +19,8 @@ interface UseChatsOptions {
 }
 
 export interface UseChatsResult {
-    rooms: UIRoom[];
-    filteredRooms: UIRoom[];
+    rooms: RoomSummary[];
+    filteredRooms: RoomSummary[];
     isLoading: boolean;
     searchTerm: string;
     setSearchTerm: (value: string) => void;
@@ -26,23 +31,8 @@ export interface UseChatsResult {
     refresh: () => void;
 }
 
-const membershipToStatus = (membership?: string): ChatRoomStatus => {
-    if (membership === 'invite') return 'invited';
-    if (membership === 'leave') return 'left';
-    return 'joined';
-};
-
-const SLOW_MODE_EVENT_TYPE = 'org.matrix.msc3946.room.slow_mode';
-
-const getRoomType = (room: MatrixRoom, savedMessagesRoomId: string): Exclude<ChatRoomType, 'all'> => {
-    if (room.roomId === savedMessagesRoomId) {
-        return 'saved';
-    }
-    return room.getJoinedMemberCount() === 2 ? 'direct' : 'group';
-};
-
 export function useChats({ client, savedMessagesRoomId }: UseChatsOptions): UseChatsResult {
-    const [rooms, setRooms] = useState<UIRoom[]>([]);
+    const [roomSelections, setRoomSelections] = useState<RoomSelection[]>([]);
     const [isLoading, setIsLoading] = useState(true);
     const [searchTerm, setSearchTerm] = useState('');
     const [roomTypeFilter, setRoomTypeFilter] = useState<ChatRoomType>('all');
@@ -52,86 +42,42 @@ export function useChats({ client, savedMessagesRoomId }: UseChatsOptions): UseC
         return activeKey ? (state.accounts[activeKey]?.roomNotificationModes ?? {}) : {};
     });
 
-    const buildRoom = useCallback((room: MatrixRoom): UIRoom | null => {
-        if (!room) return null;
-        const membership = room.getMyMembership();
-        const status = membershipToStatus(membership);
-
-        const type = getRoomType(room, savedMessagesRoomId);
-
-        const timeline = room.getLiveTimeline().getEvents();
-        const lastEvent = timeline[timeline.length - 1];
-        const pinnedEvent = room.currentState.getStateEvents(EventType.RoomPinnedEvents, '');
-        const lastMessage = lastEvent ? parseMatrixEvent(client, lastEvent) : null;
-
-        const historyVisibilityEvent = room.currentState.getStateEvents(EventType.RoomHistoryVisibility, '');
-        const joinRuleEvent = room.currentState.getStateEvents(EventType.RoomJoinRules, '');
-        const createEvent = room.currentState.getStateEvents(EventType.RoomCreate, '');
-        const slowModeEvent = room.currentState.getStateEvents(SLOW_MODE_EVENT_TYPE as EventType, '');
-
-        const historyVisibility = (historyVisibilityEvent?.getContent()?.history_visibility ?? null) as RoomHistoryVisibility | null;
-        const joinRule = (joinRuleEvent?.getContent()?.join_rule ?? null) as RoomJoinRule | null;
-        const isFederationEnabled = createEvent?.getContent()?.['m.federate'] !== false;
-        const slowModeSeconds = typeof slowModeEvent?.getContent()?.seconds === 'number'
-            ? slowModeEvent.getContent().seconds as number
-            : null;
-
-        return {
-            roomId: room.roomId,
-            name: room.name || room.roomId,
-            avatarUrl: mxcToHttp(client, room.getMxcAvatarUrl()),
-            lastMessage,
-            unreadCount: room.getUnreadNotificationCount(NotificationCountType.Total),
-            pinnedEvents: pinnedEvent?.getContent().pinned || [],
-            isEncrypted: client.isRoomEncrypted(room.roomId),
-            isDirectMessageRoom: type === 'direct',
-            isSavedMessages: type === 'saved',
-            roomType: type,
-            status,
-            lastMessagePreview: lastMessage?.content.body ?? null,
-            lastMessageAt: lastMessage?.timestamp ?? lastEvent?.getTs() ?? null,
-            notificationMode: roomNotificationModes[room.roomId],
-            historyVisibility,
-            joinRule,
-            isFederationEnabled,
-            slowModeSeconds,
-        } as UIRoom & { roomType: Exclude<ChatRoomType, 'all'>; status: ChatRoomStatus; lastMessagePreview: string | null; lastMessageAt: number | null; };
-    }, [client, roomNotificationModes, savedMessagesRoomId]);
-
     const refresh = useCallback(() => {
-        const matrixRooms = client.getRooms();
-        const sortedRooms = matrixRooms
-            .slice()
-            .sort((a, b) => {
-                const aEvents = a.getLiveTimeline().getEvents();
-                const bEvents = b.getLiveTimeline().getEvents();
-                const lastA = aEvents[aEvents.length - 1];
-                const lastB = bEvents[bEvents.length - 1];
-                return (lastB?.getTs() || 0) - (lastA?.getTs() || 0);
+        const matrixRooms = client.getRooms().slice().sort((a, b) => {
+            const aEvents = a.getLiveTimeline().getEvents();
+            const bEvents = b.getLiveTimeline().getEvents();
+            const lastA = aEvents[aEvents.length - 1];
+            const lastB = bEvents[bEvents.length - 1];
+            return (lastB?.getTs() || 0) - (lastA?.getTs() || 0);
+        });
+
+        const nextSelections: RoomSelection[] = [];
+        let savedSelection: RoomSelection | null = null;
+
+        matrixRooms.forEach(room => {
+            const built = buildRoomSelection({
+                client,
+                matrixRoom: room,
+                savedMessagesRoomId,
+                roomNotificationModes,
             });
-
-        const nextRooms: UIRoom[] = [];
-        let savedRoom: UIRoom | null = null;
-
-        sortedRooms.forEach(room => {
-            const built = buildRoom(room);
             if (!built) {
                 return;
             }
             if (room.roomId === savedMessagesRoomId) {
-                savedRoom = { ...built, name: 'Saved Messages', isSavedMessages: true };
+                savedSelection = built;
             } else {
-                nextRooms.push(built);
+                nextSelections.push(built);
             }
         });
 
-        if (savedRoom) {
-            setRooms([savedRoom, ...nextRooms]);
+        if (savedSelection) {
+            setRoomSelections([savedSelection, ...nextSelections]);
         } else {
-            setRooms(nextRooms);
+            setRoomSelections(nextSelections);
         }
         setIsLoading(false);
-    }, [buildRoom, client, savedMessagesRoomId]);
+    }, [client, roomNotificationModes, savedMessagesRoomId]);
 
     useEffect(() => {
         refresh();
@@ -163,9 +109,12 @@ export function useChats({ client, savedMessagesRoomId }: UseChatsOptions): UseC
         };
     }, [client, refresh]);
 
+    const rooms = useMemo(() => roomSelections.map(selection => selection.room), [roomSelections]);
+
     const filteredRooms = useMemo(() => {
         const query = searchTerm.trim().toLowerCase();
-        return rooms.filter(room => {
+        return roomSelections.filter(selection => {
+            const room = selection.room;
             const matchesType = roomTypeFilter === 'all' || room.roomType === roomTypeFilter;
             const matchesStatus = statusFilter === 'all' || room.status === statusFilter;
             if (!matchesType || !matchesStatus) {
@@ -177,8 +126,8 @@ export function useChats({ client, savedMessagesRoomId }: UseChatsOptions): UseC
             const nameMatch = room.name.toLowerCase().includes(query);
             const previewMatch = room.lastMessagePreview?.toLowerCase().includes(query) ?? false;
             return nameMatch || previewMatch;
-        });
-    }, [rooms, roomTypeFilter, statusFilter, searchTerm]);
+        }).map(selection => selection.room);
+    }, [roomSelections, roomTypeFilter, statusFilter, searchTerm]);
 
     return {
         rooms,
@@ -193,3 +142,9 @@ export function useChats({ client, savedMessagesRoomId }: UseChatsOptions): UseC
         refresh,
     };
 }
+
+export const mapClientsToUnifiedRooms = (
+    descriptors: UnifiedAccountDescriptor[],
+): UnifiedRoomSummary[] => collectUnifiedRooms(descriptors);
+
+export type { ChatRoomType, ChatRoomStatus, RoomSummary, UnifiedAccountDescriptor, UnifiedRoomSummary };
