@@ -2,7 +2,7 @@ import React, { createContext, useContext, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { createStore, StoreApi } from 'zustand/vanilla';
 import { useStore } from 'zustand';
-import { MatrixClient } from '../types';
+import { MatrixClient, RoomNotificationMode } from '../types';
 import {
   AccountCredentials,
   MatrixSession,
@@ -26,6 +26,7 @@ export interface AccountRuntime {
   unread: number;
   avatarUrl?: string | null;
   displayName?: string | null;
+  roomNotificationModes: Record<string, RoomNotificationMode>;
 }
 
 export interface AccountStoreState {
@@ -42,6 +43,8 @@ export interface AccountStoreState {
   closeAddAccount: () => void;
   setError: (value: string | null) => void;
   updateAccountCredentials: (key: string, updater: (creds: StoredAccount) => StoredAccount) => Promise<void>;
+  setRoomNotificationMode: (roomId: string, mode: RoomNotificationMode, key?: string | null) => void;
+  setRoomNotificationModes: (modes: Record<string, RoomNotificationMode>, key?: string | null) => void;
 }
 
 export const createAccountKey = (creds: AccountCredentials) =>
@@ -107,6 +110,7 @@ export const createAccountStore = () => {
         unread: session.unread,
         avatarUrl: session.avatarUrl,
         displayName: session.displayName,
+        roomNotificationModes: {},
       };
     };
 
@@ -240,6 +244,35 @@ export const createAccountStore = () => {
 
     const setError: AccountStoreState['setError'] = (value) => set({ error: value });
 
+    const setRoomNotificationModes: AccountStoreState['setRoomNotificationModes'] = (modes, key = get().activeKey) => {
+      if (!key) {
+        return;
+      }
+      const current = get().accounts[key];
+      if (!current) {
+        return;
+      }
+      set(state => ({
+        accounts: {
+          ...state.accounts,
+          [key]: {
+            ...current,
+            roomNotificationModes: {
+              ...current.roomNotificationModes,
+              ...modes,
+            },
+          },
+        },
+      }));
+    };
+
+    const setRoomNotificationMode: AccountStoreState['setRoomNotificationMode'] = (roomId, mode, key = get().activeKey) => {
+      if (!roomId) {
+        return;
+      }
+      setRoomNotificationModes({ [roomId]: mode }, key);
+    };
+
     return {
       accounts: {},
       activeKey: null,
@@ -254,6 +287,8 @@ export const createAccountStore = () => {
       closeAddAccount,
       setError,
       updateAccountCredentials,
+      setRoomNotificationMode,
+      setRoomNotificationModes,
     };
   });
 

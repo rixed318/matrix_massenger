@@ -1,12 +1,14 @@
 import { isPermissionGranted, requestPermission, sendNotification as tauriSendNotification } from '@tauri-apps/plugin-notification';
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
 import { listen } from '@tauri-apps/api/event';
+import { RoomNotificationMode } from '../types';
 
 const isTauriEnvironment = () =>
     typeof window !== 'undefined' && typeof (window as any).__TAURI_INTERNALS__ !== 'undefined';
 
 let permissionGranted: boolean | null = null;
 let listenersInitialized = false;
+let roomNotificationPreferences: Record<string, RoomNotificationMode> = {};
 
 const base64ToUint8Array = (base64: string): Uint8Array => {
     const padding = '='.repeat((4 - (base64.length % 4)) % 4);
@@ -44,6 +46,67 @@ const resolveVapidKey = (explicit?: string): Uint8Array | undefined => {
     }
 };
 
+const postPreferencesToServiceWorker = async (preferences: Record<string, RoomNotificationMode>) => {
+    if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) {
+        return;
+    }
+    try {
+        const registration = await navigator.serviceWorker.ready;
+        registration.active?.postMessage({
+            type: 'ROOM_NOTIFICATION_PREFERENCES',
+            preferences,
+        });
+        navigator.serviceWorker.controller?.postMessage?.({
+            type: 'ROOM_NOTIFICATION_PREFERENCES',
+            preferences,
+        });
+    } catch (error) {
+        console.warn('Failed to sync notification preferences with service worker', error);
+    }
+};
+
+const shouldSuppressNotification = (options: SendNotificationOptions): boolean => {
+    if (!options.roomId) {
+        return false;
+    }
+    const preference = roomNotificationPreferences[options.roomId];
+    if (!preference || preference === 'all') {
+        return false;
+    }
+    if (preference === 'mute') {
+        return true;
+    }
+    return !options.isMention;
+};
+
+export interface SendNotificationOptions {
+    roomId?: string;
+    isMention?: boolean;
+}
+
+export const setRoomNotificationPreferences = (preferences: Record<string, RoomNotificationMode>): void => {
+    roomNotificationPreferences = { ...preferences };
+    void postPreferencesToServiceWorker(roomNotificationPreferences);
+};
+
+export const setRoomNotificationPreference = (roomId: string, mode: RoomNotificationMode): void => {
+    if (!roomId) {
+        return;
+    }
+    roomNotificationPreferences = {
+        ...roomNotificationPreferences,
+        [roomId]: mode,
+    };
+    void postPreferencesToServiceWorker(roomNotificationPreferences);
+};
+
+export const getRoomNotificationPreference = (roomId: string): RoomNotificationMode | undefined =>
+    roomNotificationPreferences[roomId];
+
+export const getRoomNotificationPreferences = (): Record<string, RoomNotificationMode> => ({
+    ...roomNotificationPreferences,
+});
+
 export const isWebPushSupported = (): boolean =>
     typeof window !== 'undefined'
     && 'serviceWorker' in navigator
@@ -74,8 +137,11 @@ export const checkPermission = async (): Promise<boolean> => {
     return result === 'granted';
 };
 
-export const sendNotification = async (title: string, body: string): Promise<void> => {
+export const sendNotification = async (title: string, body: string, options: SendNotificationOptions = {}): Promise<void> => {
     try {
+        if (shouldSuppressNotification(options)) {
+            return;
+        }
         const hasPermission = await checkPermission();
         if (!hasPermission) {
             return;

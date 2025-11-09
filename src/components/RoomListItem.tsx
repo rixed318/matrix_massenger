@@ -19,6 +19,11 @@ const RoomListItem: React.FC<RoomListItemProps> = ({ room, isSelected, onSelect 
         ? formatDistanceToNow(new Date(lastMessage.timestamp), { addSuffix: true })
         : '';
 
+    const hasRecentAttachment = !!lastMessage && (
+        lastMessage.isSticker
+        || ['m.image', 'm.video', 'm.audio', 'm.file', 'm.location'].includes(lastMessage.content.msgtype)
+    );
+
     const renderMetaText = () => {
         if (isSpace) {
             const parts: string[] = [];
@@ -75,6 +80,14 @@ const RoomListItem: React.FC<RoomListItemProps> = ({ room, isSelected, onSelect 
                                 Space
                             </span>
                         )}
+                        {room.notificationMode === 'mentions' && !isSpace && (
+                            <span className="text-[10px] uppercase tracking-wide font-semibold px-1.5 py-0.5 rounded-full bg-bg-tertiary text-text-secondary" title="Mentions only">
+                                @
+                            </span>
+                        )}
+                        {room.notificationMode === 'mute' && !isSpace && (
+                            <span className="text-text-secondary" title="Notifications muted">🔕</span>
+                        )}
                         {room.isEncrypted && !room.isSavedMessages && (
                              <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 text-text-secondary flex-shrink-0" viewBox="0 0 20 20" fill="currentColor">
                                 <path fillRule="evenodd" d="M5 9V7a5 5 0 0110 0v2a2 2 0 012 2v5a2 2 0 01-2 2H5a2 2 0 01-2-2v-5a2 2 0 012-2zm8-2v2H7V7a3 3 0 016 0z" clipRule="evenodd" />
@@ -84,7 +97,12 @@ const RoomListItem: React.FC<RoomListItemProps> = ({ room, isSelected, onSelect 
                     <p className="text-xs text-text-secondary flex-shrink-0">{timestamp}</p>
                 </div>
                 <div className="flex justify-between items-start">
-                    <p className="text-sm text-text-secondary truncate">{renderMetaText()}</p>
+                    <p className="text-sm text-text-secondary truncate flex items-center gap-2">
+                        <span className="truncate">{renderMetaText()}</span>
+                        {hasRecentAttachment && (
+                            <span className="px-1.5 py-0.5 rounded-full bg-accent/10 text-[10px] uppercase tracking-wide text-accent font-semibold">Shared</span>
+                        )}
+                    </p>
                     {room.unreadCount > 0 && (
                         <span className="bg-accent text-text-inverted text-xs font-bold rounded-full h-5 w-5 flex items-center justify-center flex-shrink-0 ml-2">
                             {room.unreadCount}

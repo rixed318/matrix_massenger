@@ -1,11 +1,11 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 // FIX: Import MatrixRoom to correctly type room objects from the SDK.
-import { Room as UIRoom, Message, MatrixEvent, Reaction, ReplyInfo, MatrixClient, MatrixRoom, ActiveThread, MatrixUser, Poll, PollResult, Folder, ScheduledMessage, MatrixCall, LinkPreviewData, Sticker, Gif } from '@matrix-messenger/core';
+import { Room as UIRoom, Message, MatrixEvent, Reaction, ReplyInfo, MatrixClient, MatrixRoom, ActiveThread, MatrixUser, Poll, PollResult, Folder, ScheduledMessage, MatrixCall, LinkPreviewData, Sticker, Gif, RoomNotificationMode } from '@matrix-messenger/core';
 import RoomList from './RoomList';
 import MessageView from './MessageView';
 import ChatHeader from './ChatHeader';
 import MessageInput from './MessageInput';
-import { mxcToHttp, sendReaction, sendTypingIndicator, editMessage, sendMessage, deleteMessage, sendImageMessage, sendReadReceipt, sendFileMessage, setDisplayName, setAvatar, createRoom, inviteUser, forwardMessage, paginateRoomHistory, sendAudioMessage, setPinnedMessages, sendPollStart, sendPollResponse, translateText, sendStickerMessage, sendGifMessage, getSecureCloudProfileForClient } from '@matrix-messenger/core';
+import { mxcToHttp, sendReaction, sendTypingIndicator, editMessage, sendMessage, deleteMessage, sendImageMessage, sendReadReceipt, sendFileMessage, setDisplayName, setAvatar, createRoom, inviteUser, forwardMessage, paginateRoomHistory, sendAudioMessage, setPinnedMessages, sendPollStart, sendPollResponse, translateText, sendStickerMessage, sendGifMessage, getSecureCloudProfileForClient, getRoomNotificationMode, setRoomNotificationMode as updateRoomPushRule } from '@matrix-messenger/core';
 import { startGroupCall, joinGroupCall, getDisplayMedia, enumerateDevices } from '@matrix-messenger/core';
 import {
     getScheduledMessages,
@@ -16,7 +16,7 @@ import {
     parseScheduledMessagesFromEvent,
     SCHEDULED_MESSAGES_EVENT_TYPE,
 } from '@matrix-messenger/core';
-import { checkPermission, sendNotification, setupNotificationListeners, subscribeToWebPush, isWebPushSupported, registerMatrixWebPush } from '@matrix-messenger/core';
+import { checkPermission, sendNotification, setupNotificationListeners, subscribeToWebPush, isWebPushSupported, registerMatrixWebPush, setRoomNotificationPreference, setRoomNotificationPreferences } from '@matrix-messenger/core';
 import WelcomeView from './WelcomeView';
 import SettingsModal from './SettingsModal';
 import CreateRoomModal from './CreateRoomModal';
@@ -35,13 +35,22 @@ import CallParticipantsPanel from './CallParticipantsPanel';
 import SearchModal from './SearchModal';
 import { SearchResultItem } from '@matrix-messenger/core';
 import type { DraftContent, SendKeyBehavior, DraftAttachment } from '../types';
+import SharedMediaPanel from './SharedMediaPanel';
+import type { RoomMediaSummary, SharedMediaCategory, RoomMediaItem } from '@matrix-messenger/core';
 // FIX: The `matrix-js-sdk` exports event names as enums. Import them to use with the event emitter.
 // FIX: Import event enums to use with the event emitter instead of string literals, which are not assignable.
 // FIX: `CallErrorCode` is not an exported member of `matrix-js-sdk`. It has been removed.
 import { NotificationCountType, EventType, MsgType, ClientEvent, RoomEvent, UserEvent, RelationType, CallEvent } from 'matrix-js-sdk';
-import { startSecureCloudSession, acknowledgeSuspiciousEvents } from '../services/secureCloudService';
-import type { SuspiciousEventNotice, SecureCloudSession } from '../services/secureCloudService';
-import { useAccountStore, useAccountListSnapshot } from '../services/accountManager';
+import { startSecureCloudSession, acknowledgeSuspiciousEvents, normaliseSecureCloudProfile } from '../services/secureCloudService';
+import type {
+    SuspiciousEventNotice,
+    SecureCloudSession,
+    SecureCloudProfile,
+    SecureCloudDetectorState,
+    SecureCloudDetectorStatus,
+} from '../services/secureCloudService';
+import { setSecureCloudProfileForClient } from '../services/matrixService';
+import { useAccountStore } from '../services/accountManager';
 
 interface ChatPageProps {
     client?: MatrixClient;
@@ -55,6 +64,8 @@ const DRAFT_ACCOUNT_DATA_EVENT = 'econix.message_drafts';
 const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, savedMessagesRoomId: savedRoomIdProp }) => {
     const activeRuntime = useAccountStore(state => (state.activeKey ? state.accounts[state.activeKey] : null));
     const removeAccount = useAccountStore(state => state.removeAccount);
+    const setAccountRoomNotificationMode = useAccountStore(state => state.setRoomNotificationMode);
+    const accountRoomNotificationModes = useAccountStore(state => (state.activeKey ? (state.accounts[state.activeKey]?.roomNotificationModes ?? {}) : {}));
     const client = (providedClient ?? activeRuntime?.client)!;
     const savedMessagesRoomId = savedRoomIdProp ?? activeRuntime?.savedMessagesRoomId ?? '';
     const logout = onLogout ?? (() => { void removeAccount(); });
@@ -113,6 +124,10 @@ const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, s
     const [secureCloudAlerts, setSecureCloudAlerts] = useState<Record<string, SuspiciousEventNotice[]>>({});
     const [secureCloudError, setSecureCloudError] = useState<string | null>(null);
     const [isSecureCloudActive, setIsSecureCloudActive] = useState(false);
+    const [isSharedMediaOpen, setIsSharedMediaOpen] = useState(false);
+    const [sharedMediaData, setSharedMediaData] = useState<RoomMediaSummary | null>(null);
+    const [isSharedMediaLoading, setIsSharedMediaLoading] = useState(false);
+    const [isSharedMediaPaginating, setIsSharedMediaPaginating] = useState(false);
     const normalizeAttachments = (attachments: unknown): DraftAttachment[] => {
         if (!Array.isArray(attachments)) return [];
         return attachments.flatMap(item => {
@@ -185,6 +200,74 @@ const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, s
     const oldScrollHeightRef = useRef<number>(0);
     const focusEventIdRef = useRef<string | null>(null);
     const secureSessionRef = useRef<SecureCloudSession | null>(null);
+    const sharedMediaEventIdsRef = useRef<Set<string>>(new Set());
+
+    useEffect(() => {
+        setRoomNotificationPreferences(accountRoomNotificationModes);
+    }, [accountRoomNotificationModes]);
+
+    const formatDetectorStatus = useCallback((state: SecureCloudDetectorState): string => {
+        if (!state.enabled && !state.detector.required) {
+            return 'Отключен пользователем';
+        }
+        const status = detectorStatuses[state.detector.id];
+        if (!status) {
+            return state.detector.required ? 'Активен' : 'Готов';
+        }
+        switch (status.state) {
+            case 'loading':
+                return status.detail ?? 'Загрузка…';
+            case 'error':
+                return `Ошибка: ${status.detail ?? 'подробности недоступны'}`;
+            case 'idle':
+                return status.detail ?? 'Ожидает активации';
+            case 'ready':
+            default:
+                return status.detail ?? 'Готов';
+        }
+    }, [detectorStatuses]);
+
+    const handleSecureCloudDetectorError = useCallback((error: Error) => {
+        setSecureCloudError(error.message);
+        const detectorMatch = error.message.match(/^Secure Cloud detector (.+?) failed: (.+)$/);
+        if (detectorMatch) {
+            const [, detectorId, detail] = detectorMatch;
+            setDetectorStatuses(prev => ({
+                ...prev,
+                [detectorId]: { state: 'error', detail },
+            }));
+        }
+    }, []);
+
+    const handleToggleDetector = useCallback((detectorId: string, enabled: boolean) => {
+        setSecureCloudProfile(prev => {
+            if (!prev) {
+                return prev;
+            }
+            const normalised = normaliseSecureCloudProfile(prev);
+            const detectors = (normalised.detectors ?? []).map(state => {
+                if (state.detector.id !== detectorId) {
+                    return state;
+                }
+                if (state.detector.required) {
+                    return { ...state, enabled: true };
+                }
+                return { ...state, enabled };
+            });
+            const nextProfile = normaliseSecureCloudProfile({ ...normalised, detectors });
+            setSecureCloudProfileForClient(client, nextProfile);
+            secureSessionRef.current?.updateProfile(nextProfile);
+            return nextProfile;
+        });
+
+        setDetectorStatuses(prev => {
+            if (enabled) {
+                const { [detectorId]: _, ...rest } = prev;
+                return rest;
+            }
+            return { ...prev, [detectorId]: { state: 'idle', detail: 'Отключен пользователем' } };
+        });
+    }, [client]);
 
     useEffect(() => {
         try {
@@ -207,20 +290,44 @@ const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, s
     }, [sendKeyBehavior]);
 
     useEffect(() => {
+        if (!client || !selectedRoomId) {
+            return;
+        }
+        let cancelled = false;
+        (async () => {
+            try {
+                const mode = await getRoomNotificationMode(client, selectedRoomId);
+                if (cancelled) {
+                    return;
+                }
+                setAccountRoomNotificationMode(selectedRoomId, mode, activeRuntime?.creds.key ?? null);
+                setRoomNotificationPreference(selectedRoomId, mode);
+            } catch (error) {
+                console.error('Failed to load room notification mode', error);
+            }
+        })();
+        return () => {
+            cancelled = true;
+        };
+    }, [client, selectedRoomId, activeRuntime?.creds.key, setAccountRoomNotificationMode]);
+
+    useEffect(() => {
         const profile = getSecureCloudProfileForClient(client);
         if (!profile || profile.mode === 'disabled') {
             setIsSecureCloudActive(false);
             setSecureCloudAlerts({});
+            setDetectorStatuses({});
             secureSessionRef.current?.stop();
             secureSessionRef.current = null;
             return;
         }
 
+        setSecureCloudProfileForClient(client, normalisedProfile);
         setIsSecureCloudActive(true);
         setSecureCloudError(null);
         setSecureCloudAlerts({});
 
-        const session = startSecureCloudSession(client, profile, {
+        const session = startSecureCloudSession(client, normalisedProfile, {
             onSuspiciousEvent: (notice) => {
                 setSecureCloudAlerts(prev => {
                     const roomAlerts = prev[notice.roomId] ?? [];
@@ -230,28 +337,62 @@ const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, s
                     return { ...prev, [notice.roomId]: [...roomAlerts, notice] };
                 });
             },
-            onError: (error) => {
-                setSecureCloudError(error.message);
-            },
+            onError: handleSecureCloudDetectorError,
         });
 
         secureSessionRef.current?.stop();
         secureSessionRef.current = session;
 
-        return (
-<>
-{isOffline && (
-    <div style={{background:'#2b2b2b', color:'#fff', padding:'6px 10px', fontSize:12, textAlign:'center'}}>
-        Offline. Messages will be queued.
-    </div>
-)}
-) => {
+        return () => {
             session.stop();
             if (secureSessionRef.current === session) {
                 secureSessionRef.current = null;
             }
         };
-    }, [client]);
+    }, [client, handleSecureCloudDetectorError]);
+
+    useEffect(() => {
+        if (!secureCloudProfile?.detectors || secureCloudProfile.detectors.length === 0) {
+            setDetectorStatuses({});
+            return;
+        }
+
+        let cancelled = false;
+
+        const refreshStatuses = async () => {
+            const next: Record<string, SecureCloudDetectorStatus> = {};
+            for (const state of secureCloudProfile.detectors ?? []) {
+                const detectorId = state.detector.id;
+                if (!state.enabled && !state.detector.required) {
+                    next[detectorId] = { state: 'idle', detail: 'Отключен пользователем' };
+                    continue;
+                }
+                try {
+                    const statusResult = state.detector.getStatus?.();
+                    const status = statusResult instanceof Promise ? await statusResult : statusResult;
+                    if (status) {
+                        next[detectorId] = status;
+                    } else {
+                        next[detectorId] = { state: 'ready' };
+                    }
+                } catch (error) {
+                    next[detectorId] = {
+                        state: 'error',
+                        detail: error instanceof Error ? error.message : 'Не удалось получить статус',
+                    };
+                }
+            }
+            if (!cancelled) {
+                setDetectorStatuses(next);
+            }
+        };
+
+        void refreshStatuses();
+
+        return () => {
+            cancelled = true;
+        };
+    }, [secureCloudProfile]);
 
     useEffect(() => {
         if (!client.getUserId()) {
@@ -816,9 +957,15 @@ const handleSetChatBackground = (bgUrl: string) => {
             if (notificationsEnabled && !document.hasFocus() && event.getSender() !== client.getUserId() && (event.getType() === EventType.RoomMessage || event.getType() === 'm.sticker') && !event.isRedacted()) {
                 const room = client.getRoom(roomId);
                 const senderName = event.sender?.name || 'Unknown User';
-                const messageBody = event.getContent().body;
+                const content = event.getContent();
+                const messageBody = content.body;
+                const currentUserId = client.getUserId?.();
+                const mentionList = Array.isArray(content?.['m.mentions']?.user_ids)
+                    ? content['m.mentions'].user_ids as string[]
+                    : [];
+                const isMention = currentUserId ? mentionList.includes(currentUserId) : false;
                 if (room && room.roomId !== savedMessagesRoomId) {
-                    sendNotification(room.name, `${senderName}: ${messageBody}`);
+                    sendNotification(room.name, `${senderName}: ${messageBody}`, { roomId, isMention });
                 }
             }
 
@@ -899,7 +1046,7 @@ const handleSetChatBackground = (bgUrl: string) => {
                 const peerMember = (call as any).getPeerMember();
                 const peerName = peerMember?.name || 'Unknown User';
                 const callType = call.type === 'video' ? 'Video' : 'Voice';
-                sendNotification(`Incoming ${callType} Call`, `From: ${peerName}`);
+                sendNotification(`Incoming ${callType} Call`, `From: ${peerName}`, { roomId: call.roomId ?? undefined, isMention: true });
             }
         };
 
@@ -1063,6 +1210,34 @@ const handleSetChatBackground = (bgUrl: string) => {
         };
     }, [client, selectedRoomId]);
 
+    useEffect(() => {
+        setIsSharedMediaOpen(false);
+        setSharedMediaData(null);
+        sharedMediaEventIdsRef.current = new Set();
+
+        if (!selectedRoomId) {
+            setIsSharedMediaLoading(false);
+            return;
+        }
+
+        const room = client.getRoom(selectedRoomId);
+        if (!room) {
+            setIsSharedMediaLoading(false);
+            return;
+        }
+
+        setIsSharedMediaLoading(true);
+        try {
+            const summary = getRoomMediaSummary(client, room);
+            setSharedMediaData(summary);
+            sharedMediaEventIdsRef.current = new Set(summary.eventIds);
+        } catch (error) {
+            console.error('Failed to load shared media summary', error);
+        } finally {
+            setIsSharedMediaLoading(false);
+        }
+    }, [client, selectedRoomId]);
+
     const handleDraftChange = useCallback((roomId: string, value: DraftContent) => {
         setDrafts(prev => {
             const currentValue = prev[roomId];
@@ -1081,6 +1256,85 @@ const handleSetChatBackground = (bgUrl: string) => {
         if (!selectedRoomId) return;
         handleDraftChange(selectedRoomId, value);
     }, [handleDraftChange, selectedRoomId]);
+
+    const handleOpenSharedMedia = useCallback(() => {
+        if (!selectedRoomId) {
+            return;
+        }
+        setIsSharedMediaOpen(true);
+    }, [selectedRoomId]);
+
+    const handleLoadMoreMedia = useCallback(async () => {
+        if (!selectedRoomId || isSharedMediaPaginating) {
+            return;
+        }
+        const room = client.getRoom(selectedRoomId);
+        if (!room) {
+            return;
+        }
+
+        setIsSharedMediaPaginating(true);
+        try {
+            const page = await paginateRoomMedia(client, room, {
+                knownEventIds: sharedMediaEventIdsRef.current,
+                limit: 40,
+            });
+
+            setSharedMediaData(prev => {
+                if (!prev) {
+                    if (page.newEventIds.length === 0 && !page.hasMore) {
+                        return prev;
+                    }
+                    sharedMediaEventIdsRef.current = new Set(page.newEventIds);
+                    return {
+                        itemsByCategory: page.itemsByCategory,
+                        countsByCategory: page.countsByCategory,
+                        hasMore: page.hasMore,
+                        eventIds: page.newEventIds,
+                    };
+                }
+
+                if (page.newEventIds.length === 0) {
+                    return { ...prev, hasMore: page.hasMore };
+                }
+
+                const mergedBuckets: Record<SharedMediaCategory, RoomMediaItem[]> = {
+                    media: [...prev.itemsByCategory.media],
+                    files: [...prev.itemsByCategory.files],
+                    links: [...prev.itemsByCategory.links],
+                    voice: [...prev.itemsByCategory.voice],
+                };
+
+                (Object.keys(page.itemsByCategory) as SharedMediaCategory[]).forEach(category => {
+                    if (page.itemsByCategory[category].length) {
+                        mergedBuckets[category] = [...mergedBuckets[category], ...page.itemsByCategory[category]]
+                            .sort((a, b) => b.timestamp - a.timestamp);
+                    }
+                });
+
+                const mergedCounts = {
+                    media: prev.countsByCategory.media + page.countsByCategory.media,
+                    files: prev.countsByCategory.files + page.countsByCategory.files,
+                    links: prev.countsByCategory.links + page.countsByCategory.links,
+                    voice: prev.countsByCategory.voice + page.countsByCategory.voice,
+                };
+
+                const mergedEventIds = [...prev.eventIds, ...page.newEventIds];
+                sharedMediaEventIdsRef.current = new Set(mergedEventIds);
+
+                return {
+                    itemsByCategory: mergedBuckets,
+                    countsByCategory: mergedCounts,
+                    hasMore: page.hasMore,
+                    eventIds: mergedEventIds,
+                };
+            });
+        } catch (error) {
+            console.error('Failed to paginate shared media', error);
+        } finally {
+            setIsSharedMediaPaginating(false);
+        }
+    }, [client, isSharedMediaPaginating, selectedRoomId]);
 
     const handleSendMessage = async (content: { body: string; formattedBody?: string }, threadRootId?: string) => {
         const trimmedBody = content.body.trim();
@@ -1348,6 +1602,23 @@ const handleSetChatBackground = (bgUrl: string) => {
         setIsInviteUserOpen(false);
     };
 
+    const handleSetNotificationLevel = useCallback(async (roomId: string, mode: RoomNotificationMode) => {
+        if (!roomId) {
+            return;
+        }
+        try {
+            await updateRoomPushRule(client, roomId, mode);
+            setAccountRoomNotificationMode(roomId, mode, activeRuntime?.creds.key ?? null);
+            setRoomNotificationPreference(roomId, mode);
+        } catch (error) {
+            console.error('Failed to update room notification mode', error);
+        }
+    }, [client, activeRuntime?.creds.key, setAccountRoomNotificationMode]);
+
+    const handleMuteRoom = useCallback((roomId: string) => {
+        void handleSetNotificationLevel(roomId, 'mute');
+    }, [handleSetNotificationLevel]);
+
     const handlePinToggle = async (messageId: string) => {
         if (!selectedRoomId || !canPin) return;
         const newPinnedIds = pinnedEventIds.includes(messageId)
@@ -1512,6 +1783,9 @@ const handleSetChatBackground = (bgUrl: string) => {
         ? allScheduledMessages.filter(m => m.roomId === selectedRoomId && m.status !== 'sent')
         : [];
     const activeRoomAlerts = selectedRoomId ? (secureCloudAlerts[selectedRoomId] ?? []) : [];
+    const sharedMediaCount = sharedMediaData
+        ? Object.values(sharedMediaData.countsByCategory).reduce((acc, value) => acc + value, 0)
+        : 0;
 
     return (
         <div className="flex h-screen">
@@ -1551,7 +1825,12 @@ const handleSetChatBackground = (bgUrl: string) => {
                             isDirectMessageRoom={selectedRoom.isDirectMessageRoom}
                             onPlaceCall={handlePlaceCall}
                             onOpenSearch={() => setIsSearchOpen(true)}
+                            onOpenSharedMedia={handleOpenSharedMedia}
+                            sharedMediaCount={sharedMediaCount}
                             connectionStatus={isOffline ? 'offline' : 'online'}
+                            notificationMode={selectedRoom.notificationMode ?? accountRoomNotificationModes[selectedRoom.roomId] ?? 'all'}
+                            onNotificationModeChange={(mode) => handleSetNotificationLevel(selectedRoom.roomId, mode)}
+                            onMuteRoom={() => handleMuteRoom(selectedRoom.roomId)}
                         />
                         {isSecureCloudActive && (
                             <div className="px-4 pt-3 space-y-3">
@@ -1565,6 +1844,41 @@ const handleSetChatBackground = (bgUrl: string) => {
                                         >
                                             Скрыть
                                         </button>
+                                    </div>
+                                )}
+                                {detectorStates.length > 0 && (
+                                    <div className="rounded-md border border-neutral-500/40 bg-neutral-900/40 px-3 py-2 text-xs text-neutral-100 space-y-2">
+                                        <div className="flex items-center justify-between">
+                                            <span className="font-semibold text-sm">Детекторы Secure Cloud</span>
+                                        </div>
+                                        <ul className="space-y-2">
+                                            {detectorStates.map(state => (
+                                                <li key={state.detector.id} className="flex items-start justify-between gap-3">
+                                                    <div className="flex-1 min-w-0">
+                                                        <div className="flex items-center gap-2">
+                                                            <span className="font-medium text-sm text-neutral-100">{state.detector.displayName}</span>
+                                                            {state.detector.required && (
+                                                                <span className="text-[10px] uppercase tracking-wide text-emerald-400/80">обязательный</span>
+                                                            )}
+                                                        </div>
+                                                        {state.detector.description && (
+                                                            <p className="text-[11px] text-neutral-400 mt-0.5">{state.detector.description}</p>
+                                                        )}
+                                                        <p className="text-[10px] text-neutral-500 mt-1">{formatDetectorStatus(state)}</p>
+                                                    </div>
+                                                    <label className="flex items-center gap-2 text-[11px] text-neutral-300">
+                                                        <input
+                                                            type="checkbox"
+                                                            className="h-4 w-4 rounded border-neutral-500 bg-transparent text-emerald-500 focus:ring-emerald-500"
+                                                            checked={state.detector.required || state.enabled}
+                                                            onChange={(event) => handleToggleDetector(state.detector.id, event.target.checked)}
+                                                            disabled={state.detector.required}
+                                                        />
+                                                        <span className="select-none">{state.detector.required ? 'Всегда' : state.enabled ? 'Вкл.' : 'Выкл.'}</span>
+                                                    </label>
+                                                </li>
+                                            ))}
+                                        </ul>
                                     </div>
                                 )}
                                 {activeRoomAlerts.length > 0 ? (
@@ -1820,6 +2134,14 @@ const handleSetChatBackground = (bgUrl: string) => {
                     onSelectResult={handleJumpToSearchResult}
                 />
             )}
+            <SharedMediaPanel
+                isOpen={isSharedMediaOpen}
+                onClose={() => setIsSharedMediaOpen(false)}
+                data={sharedMediaData}
+                isLoading={isSharedMediaLoading}
+                isPaginating={isSharedMediaPaginating}
+                onLoadMore={sharedMediaData?.hasMore ? handleLoadMoreMedia : undefined}
+            />
             {activeCall && <CallView call={activeCall} onHangup={() => handleHangupCall(false)} client={client} />}
             {incomingCall && <IncomingCallModal call={incomingCall} onAccept={handleAnswerCall} onDecline={() => handleHangupCall(true)} client={client} />}
         </div>
