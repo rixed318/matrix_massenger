@@ -21,6 +21,12 @@
     "paths": {
       "@/*": [
         "./*"
+      ],
+      "zustand": [
+        "./src/lib/zustand.ts"
+      ],
+      "zustand/vanilla": [
+        "./src/lib/zustand.ts"
       ]
     },
     "allowImportingTsExtensions": true,
