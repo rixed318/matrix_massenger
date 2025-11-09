@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Room, Message } from '@matrix-messenger/core';
+import { Room, Message, RoomNotificationMode } from '@matrix-messenger/core';
 import Avatar from './Avatar';
 import PinnedMessageBar from './PinnedMessageBar';
 
@@ -21,8 +21,9 @@ interface ChatHeaderProps {
     participantsCount?: number;
     isScreensharing?: boolean;
     connectionStatus?: 'online' | 'offline' | 'connecting';
-    onOpenSharedMedia?: () => void;
-    sharedMediaCount?: number;
+    notificationMode?: RoomNotificationMode;
+    onNotificationModeChange?: (mode: RoomNotificationMode) => void;
+    onMuteRoom?: () => void;
 }
 
 const statusLabels: Record<NonNullable<Room['status']>, string> = {
@@ -35,6 +36,12 @@ const roomTypeLabels: Record<NonNullable<Room['roomType']>, string> = {
     direct: 'Direct chat',
     group: 'Group chat',
     saved: 'Saved messages',
+};
+
+const notificationModeLabels: Record<RoomNotificationMode, string> = {
+    all: 'Enabled',
+    mentions: 'Mentions only',
+    mute: 'Muted',
 };
 
 const ChatHeader: React.FC<ChatHeaderProps> = ({
@@ -55,16 +62,22 @@ const ChatHeader: React.FC<ChatHeaderProps> = ({
     participantsCount,
     isScreensharing,
     connectionStatus = 'online',
-    onOpenSharedMedia,
-    sharedMediaCount = 0,
+    notificationMode = 'all',
+    onNotificationModeChange,
+    onMuteRoom,
 }) => {
     const [callMenuOpen, setCallMenuOpen] = useState(false);
     const callMenuRef = useRef<HTMLDivElement>(null);
+    const [notificationMenuOpen, setNotificationMenuOpen] = useState(false);
+    const notificationMenuRef = useRef<HTMLDivElement>(null);
 
     useEffect(() => {
         const onClick = (event: MouseEvent) => {
             if (callMenuRef.current && !callMenuRef.current.contains(event.target as Node)) {
                 setCallMenuOpen(false);
+            }
+            if (notificationMenuRef.current && !notificationMenuRef.current.contains(event.target as Node)) {
+                setNotificationMenuOpen(false);
             }
         };
         document.addEventListener('mousedown', onClick);
@@ -81,6 +94,16 @@ const ChatHeader: React.FC<ChatHeaderProps> = ({
 
     const statusBadge = room.status ? statusLabels[room.status] : undefined;
     const typeBadge = room.roomType ? roomTypeLabels[room.roomType] : undefined;
+    const notificationIcon = notificationMode === 'mute' ? '🔕' : '🔔';
+
+    const handleNotificationSelection = (mode: RoomNotificationMode) => {
+        if (mode === 'mute') {
+            onMuteRoom?.();
+        } else {
+            onNotificationModeChange?.(mode);
+        }
+        setNotificationMenuOpen(false);
+    };
 
     return (
         <header className="bg-bg-primary shadow-sm z-10 flex-shrink-0 border-b border-border-secondary">
@@ -107,6 +130,38 @@ const ChatHeader: React.FC<ChatHeaderProps> = ({
                     <p className="text-xs text-text-secondary min-h-[16px] transition-all">{typingText}</p>
                 </div>
                 <div className="flex items-center gap-2">
+                    <div className="relative" ref={notificationMenuRef}>
+                        <button
+                            onClick={() => setNotificationMenuOpen(prev => !prev)}
+                            className="px-3 py-2 rounded-full hover:bg-bg-tertiary flex items-center gap-2 text-sm"
+                            title="Notifications"
+                        >
+                            <span>{notificationIcon}</span>
+                            <span className="text-xs text-text-secondary">{notificationModeLabels[notificationMode]}</span>
+                        </button>
+                        {notificationMenuOpen && (
+                            <div className="absolute right-0 mt-2 w-48 bg-bg-secondary border border-border-primary rounded-md shadow-lg z-20 py-1">
+                                <button
+                                    onClick={() => handleNotificationSelection('all')}
+                                    className={`w-full text-left flex items-center gap-2 px-4 py-2 text-sm hover:bg-bg-tertiary ${notificationMode === 'all' ? 'text-text-primary font-semibold' : 'text-text-secondary'}`}
+                                >
+                                    🔔 Enabled
+                                </button>
+                                <button
+                                    onClick={() => handleNotificationSelection('mentions')}
+                                    className={`w-full text-left flex items-center gap-2 px-4 py-2 text-sm hover:bg-bg-tertiary ${notificationMode === 'mentions' ? 'text-text-primary font-semibold' : 'text-text-secondary'}`}
+                                >
+                                    @ Mentions only
+                                </button>
+                                <button
+                                    onClick={() => handleNotificationSelection('mute')}
+                                    className={`w-full text-left flex items-center gap-2 px-4 py-2 text-sm hover:bg-bg-tertiary ${notificationMode === 'mute' ? 'text-text-primary font-semibold' : 'text-text-secondary'}`}
+                                >
+                                    🔕 Muted
+                                </button>
+                            </div>
+                        )}
+                    </div>
                     {onStartGroupCall && (
                         <button
                             onClick={onStartGroupCall}

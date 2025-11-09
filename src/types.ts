@@ -34,6 +34,8 @@ export interface Poll {
 }
 
 
+export type RoomNotificationMode = 'all' | 'mentions' | 'mute';
+
 export interface Room {
   roomId: string;
   name: string;
@@ -50,6 +52,7 @@ export interface Room {
   spaceChildIds?: string[];
   spaceParentIds?: string[];
   canonicalAlias?: string | null;
+  notificationMode?: RoomNotificationMode;
 }
 
 export interface LinkPreviewData {
