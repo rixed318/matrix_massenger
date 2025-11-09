@@ -36,6 +36,23 @@ export interface Poll {
 
 export type RoomNotificationMode = 'all' | 'mentions' | 'mute';
 
+export type RoomHistoryVisibility = 'world_readable' | 'shared' | 'invited' | 'joined';
+export type RoomJoinRule = 'public' | 'invite' | 'knock' | 'restricted' | 'knock_restricted';
+
+export interface RoomCreationOptions {
+  name: string;
+  topic?: string;
+  roomAliasName?: string;
+  isPublic: boolean;
+  isEncrypted: boolean;
+  mode: 'chat' | 'channel';
+  historyVisibility: RoomHistoryVisibility;
+  slowModeSeconds?: number;
+  requireInvite: boolean;
+  disableFederation: boolean;
+  initialPost?: string;
+}
+
 export interface Room {
   roomId: string;
   name: string;
@@ -53,6 +70,10 @@ export interface Room {
   spaceParentIds?: string[];
   canonicalAlias?: string | null;
   notificationMode?: RoomNotificationMode;
+  historyVisibility?: RoomHistoryVisibility | null;
+  joinRule?: RoomJoinRule | null;
+  isFederationEnabled?: boolean;
+  slowModeSeconds?: number | null;
 }
 
 export interface LinkPreviewData {

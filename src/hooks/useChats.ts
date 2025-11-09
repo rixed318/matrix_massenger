@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { ClientEvent, EventType, NotificationCountType, RoomEvent } from 'matrix-js-sdk';
-import { MatrixClient, MatrixEvent, MatrixRoom, Room as UIRoom, RoomNotificationMode } from '../types';
+import { MatrixClient, MatrixEvent, MatrixRoom, Room as UIRoom, RoomHistoryVisibility, RoomJoinRule, RoomNotificationMode } from '../types';
 import { mxcToHttp } from '../services/matrixService';
 import { parseMatrixEvent } from '../utils/parseMatrixEvent';
 import { useAccountStore } from '../services/accountManager';
@@ -32,6 +32,8 @@ const membershipToStatus = (membership?: string): ChatRoomStatus => {
     return 'joined';
 };
 
+const SLOW_MODE_EVENT_TYPE = 'org.matrix.msc3946.room.slow_mode';
+
 const getRoomType = (room: MatrixRoom, savedMessagesRoomId: string): Exclude<ChatRoomType, 'all'> => {
     if (room.roomId === savedMessagesRoomId) {
         return 'saved';
@@ -62,6 +64,18 @@ export function useChats({ client, savedMessagesRoomId }: UseChatsOptions): UseC
         const pinnedEvent = room.currentState.getStateEvents(EventType.RoomPinnedEvents, '');
         const lastMessage = lastEvent ? parseMatrixEvent(client, lastEvent) : null;
 
+        const historyVisibilityEvent = room.currentState.getStateEvents(EventType.RoomHistoryVisibility, '');
+        const joinRuleEvent = room.currentState.getStateEvents(EventType.RoomJoinRules, '');
+        const createEvent = room.currentState.getStateEvents(EventType.RoomCreate, '');
+        const slowModeEvent = room.currentState.getStateEvents(SLOW_MODE_EVENT_TYPE as EventType, '');
+
+        const historyVisibility = (historyVisibilityEvent?.getContent()?.history_visibility ?? null) as RoomHistoryVisibility | null;
+        const joinRule = (joinRuleEvent?.getContent()?.join_rule ?? null) as RoomJoinRule | null;
+        const isFederationEnabled = createEvent?.getContent()?.['m.federate'] !== false;
+        const slowModeSeconds = typeof slowModeEvent?.getContent()?.seconds === 'number'
+            ? slowModeEvent.getContent().seconds as number
+            : null;
+
         return {
             roomId: room.roomId,
             name: room.name || room.roomId,
@@ -77,6 +91,10 @@ export function useChats({ client, savedMessagesRoomId }: UseChatsOptions): UseC
             lastMessagePreview: lastMessage?.content.body ?? null,
             lastMessageAt: lastMessage?.timestamp ?? lastEvent?.getTs() ?? null,
             notificationMode: roomNotificationModes[room.roomId],
+            historyVisibility,
+            joinRule,
+            isFederationEnabled,
+            slowModeSeconds,
         } as UIRoom & { roomType: Exclude<ChatRoomType, 'all'>; status: ChatRoomStatus; lastMessagePreview: string | null; lastMessageAt: number | null; };
     }, [client, roomNotificationModes, savedMessagesRoomId]);
 
