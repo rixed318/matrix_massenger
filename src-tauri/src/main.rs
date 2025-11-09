@@ -22,11 +22,26 @@ const PBKDF2_ITERATIONS: u32 = 120_000;
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 12;
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct StoredPushSubscription {
+  pub endpoint: String,
+  pub auth: String,
+  pub p256dh: String,
+  pub push_key: String,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub expiration_time: Option<f64>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub updated_at: Option<f64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Credentials {
   pub homeserver_url: String,
   pub user_id: String,
   pub access_token: String,
+  #[serde(default)]
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub push_subscription: Option<StoredPushSubscription>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +50,9 @@ pub struct StoredAccount {
   pub homeserver_url: String,
   pub user_id: String,
   pub access_token: String,
+  #[serde(default)]
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub push_subscription: Option<StoredPushSubscription>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -176,6 +194,7 @@ async fn load_credentials(app: AppHandle) -> Result<Vec<StoredAccount>, String> 
       homeserver_url: c.homeserver_url,
       user_id: c.user_id,
       access_token: c.access_token,
+      push_subscription: c.push_subscription,
     })
     .collect();
   out.sort_by(|a, b| a.key.cmp(&b.key));

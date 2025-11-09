@@ -3,6 +3,8 @@
 // src/offline/serviceWorker.ts
 const CACHE_NAME = 'econix-media-cache-v1';
 
+let latestPushSubscription: any = null;
+
 self.addEventListener('install', (event: any) => {
   event.waitUntil(self.skipWaiting());
 });
@@ -37,6 +39,27 @@ self.addEventListener('sync', (event: any) => {
   }
 });
 
+self.addEventListener('message', (event: any) => {
+  if (!event?.data || typeof event.data !== 'object') {
+    return;
+  }
+  if (event.data.type === 'PUSH_SUBSCRIPTION_UPDATED') {
+    latestPushSubscription = event.data.subscription ?? null;
+    const registerSync = async () => {
+      try {
+        await self.registration?.sync?.register?.('matrix-outbox-flush');
+      } catch (error) {
+        console.debug('Failed to register background sync after subscription update', error);
+      }
+    };
+    if (typeof event.waitUntil === 'function') {
+      event.waitUntil(registerSync());
+    } else {
+      void registerSync();
+    }
+  }
+});
+
 // Push notifications
 self.addEventListener('push', (event: any) => {
   let data: any = {};
@@ -48,6 +71,9 @@ self.addEventListener('push', (event: any) => {
     tag: data.tag || 'econix-msg',
     data: data.data || {}
   };
+  if (latestPushSubscription && typeof options.data === 'object' && options.data) {
+    options.data.subscription = options.data.subscription || latestPushSubscription;
+  }
   event.waitUntil(self.registration.showNotification(title, options));
 });
 

@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useEffect, useRef } from 'react';
+import React, { createContext, useContext, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { createStore, StoreApi } from 'zustand/vanilla';
 import { useStore } from 'zustand';
@@ -41,6 +41,7 @@ export interface AccountStoreState {
   openAddAccount: () => void;
   closeAddAccount: () => void;
   setError: (value: string | null) => void;
+  updateAccountCredentials: (key: string, updater: (creds: StoredAccount) => StoredAccount) => Promise<void>;
 }
 
 export const createAccountKey = (creds: AccountCredentials) =>
@@ -48,6 +49,18 @@ export const createAccountKey = (creds: AccountCredentials) =>
 
 export const createAccountStore = () => {
   const sessionCleanup = new Map<string, () => void>();
+
+  const persistAccount = async (account: StoredAccount) => {
+    if (!isTauriAvailable()) {
+      return;
+    }
+    try {
+      const { key: _key, ...payload } = account;
+      await invoke('save_credentials', { creds: payload });
+    } catch (error) {
+      console.warn('persist failed', error);
+    }
+  };
 
   const cleanupSession = (key: string) => {
     const disposer = sessionCleanup.get(key);
@@ -155,13 +168,7 @@ export const createAccountStore = () => {
         throw new Error('Недостаточно данных для сохранения аккаунта');
       }
 
-      if (isTauriAvailable()) {
-        try {
-          await invoke('save_credentials', { creds });
-        } catch (error) {
-          console.warn('persist failed', error);
-        }
-      }
+      await persistAccount(storedAccount);
 
       const runtime = await toRuntime(storedAccount, client);
       set(state => ({
@@ -216,6 +223,21 @@ export const createAccountStore = () => {
     const openAddAccount = () => set({ isAddAccountOpen: true, error: null });
     const closeAddAccount = () => set({ isAddAccountOpen: false, error: null });
 
+    const updateAccountCredentials: AccountStoreState['updateAccountCredentials'] = async (key, updater) => {
+      const current = get().accounts[key];
+      if (!current) {
+        return;
+      }
+      const updatedCreds = updater(current.creds);
+      set(state => ({
+        accounts: {
+          ...state.accounts,
+          [key]: { ...current, creds: updatedCreds },
+        },
+      }));
+      await persistAccount(updatedCreds);
+    };
+
     const setError: AccountStoreState['setError'] = (value) => set({ error: value });
 
     return {
@@ -231,25 +253,23 @@ export const createAccountStore = () => {
       openAddAccount,
       closeAddAccount,
       setError,
+      updateAccountCredentials,
     };
   });
 
   return store;
 };
 
-const AccountStoreContext = createContext<StoreApi<AccountStoreState> | null>(null);
+const accountStoreInstance = createAccountStore();
+
+const AccountStoreContext = createContext<StoreApi<AccountStoreState>>(accountStoreInstance);
+
+export const getAccountStore = () => accountStoreInstance;
 
 export const AccountProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const storeRef = useRef<StoreApi<AccountStoreState>>();
-  if (!storeRef.current) {
-    storeRef.current = createAccountStore();
-  }
-
   useEffect(() => {
     return () => {
-      const store = storeRef.current;
-      if (!store) return;
-      const state = store.getState();
+      const state = accountStoreInstance.getState();
       Object.keys(state.accounts).forEach(key => {
         try {
           state.accounts[key]?.client.stopClient?.();
@@ -261,7 +281,7 @@ export const AccountProvider: React.FC<{ children: React.ReactNode }> = ({ child
   }, []);
 
   return (
-    <AccountStoreContext.Provider value={storeRef.current}>
+    <AccountStoreContext.Provider value={accountStoreInstance}>
       {children}
     </AccountStoreContext.Provider>
   );
@@ -269,8 +289,5 @@ export const AccountProvider: React.FC<{ children: React.ReactNode }> = ({ child
 
 export const useAccountStore = <T,>(selector: (state: AccountStoreState) => T): T => {
   const store = useContext(AccountStoreContext);
-  if (!store) {
-    throw new Error('AccountStoreContext is not available');
-  }
   return useStore(store, selector);
 };
