@@ -16,7 +16,7 @@ import {
     parseScheduledMessagesFromEvent,
     SCHEDULED_MESSAGES_EVENT_TYPE,
 } from '@matrix-messenger/core';
-import { checkPermission, sendNotification, setupNotificationListeners } from '@matrix-messenger/core';
+import { checkPermission, sendNotification, setupNotificationListeners, subscribeToWebPush, isWebPushSupported, registerMatrixWebPush } from '@matrix-messenger/core';
 import WelcomeView from './WelcomeView';
 import SettingsModal from './SettingsModal';
 import CreateRoomModal from './CreateRoomModal';
@@ -283,10 +283,30 @@ const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, s
     // Handle notification settings
     useEffect(() => {
         localStorage.setItem('matrix-notifications-enabled', String(notificationsEnabled));
-        if (notificationsEnabled) {
-            checkPermission();
+        if (!notificationsEnabled) {
+            return;
         }
-    }, [notificationsEnabled]);
+        const enableNotifications = async () => {
+            try {
+                const hasPermission = await checkPermission();
+                if (!hasPermission) {
+                    setNotificationsEnabled(false);
+                    return;
+                }
+                if (isWebPushSupported()) {
+                    const result = await subscribeToWebPush();
+                    if (result) {
+                        await registerMatrixWebPush(client, result.registration, result.subscription, {
+                            accountKey: activeRuntime?.creds.key ?? null,
+                        });
+                    }
+                }
+            } catch (error) {
+                console.error('Failed to enable notifications', error);
+            }
+        };
+        void enableNotifications();
+    }, [notificationsEnabled, client, activeRuntime?.creds.key]);
 
     // Setup notification listeners on mount
     useEffect(() => {

@@ -5,6 +5,14 @@ export interface AccountCredentials {
   homeserver_url: string;
   user_id: string;
   access_token: string;
+  push_subscription?: {
+    endpoint: string;
+    auth: string;
+    p256dh: string;
+    push_key: string;
+    expiration_time?: number | null;
+    updated_at?: number;
+  } | null;
 }
 
 export interface MatrixSession {
