@@ -9,6 +9,10 @@ vi.mock('../../src/services/matrixService', () => ({
     mxcToHttp: () => null,
 }));
 
+vi.mock('../../src/services/mediaIndexService', () => ({
+    getSmartCollections: vi.fn().mockResolvedValue([]),
+}));
+
 const createClient = (): MatrixClient => ({
     getUserId: () => '@test:server',
     getUser: () => ({ displayName: 'Tester', avatarUrl: null }) as any,

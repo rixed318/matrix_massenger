@@ -81,6 +81,33 @@ const ChatList: React.FC<ChatListProps> = ({
     statusFilter,
     onStatusFilterChange,
 }) => {
+    const [smartCollections, setSmartCollections] = useState<SmartCollection[]>([]);
+
+    useEffect(() => {
+        let cancelled = false;
+        const userId = client.getUserId?.();
+        if (!userId) {
+            setSmartCollections([]);
+            return () => {
+                cancelled = true;
+            };
+        }
+        getSmartCollections(userId)
+            .then(collections => {
+                if (!cancelled) {
+                    setSmartCollections(collections);
+                }
+            })
+            .catch(() => {
+                if (!cancelled) {
+                    setSmartCollections([]);
+                }
+            });
+        return () => {
+            cancelled = true;
+        };
+    }, [client, rooms]);
+
     const user = client.getUser(client.getUserId());
     const userAvatarUrl = mxcToHttp(client, user?.avatarUrl);
 
