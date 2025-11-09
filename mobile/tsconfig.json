@@ -8,8 +8,11 @@
   },
   "include": [
     "App.tsx",
+    "src/**/*.ts",
+    "src/**/*.tsx",
     "app/**/*.ts",
     "app/**/*.tsx",
-    "expo-env.d.ts"
+    "expo-env.d.ts",
+    "e2e/**/*.ts"
   ]
 }

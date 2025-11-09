@@ -1,123 +1,76 @@
-import { StatusBar } from 'expo-status-bar'
-import Constants from 'expo-constants'
-import React, { useState } from 'react'
-import { SafeAreaView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native'
-import { resolveHomeserverBaseUrl, HomeserverDiscoveryError } from '@matrix-messenger/core'
+import 'react-native-gesture-handler';
+import React from 'react';
+import { NavigationContainer } from '@react-navigation/native';
+import { createNativeStackNavigator } from '@react-navigation/native-stack';
+import { StatusBar } from 'expo-status-bar';
+import { MatrixSessionProvider, useMatrixSession } from './src/context/MatrixSessionContext';
+import { LoginScreen } from './src/screens/LoginScreen';
+import { ChatListScreen } from './src/screens/ChatListScreen';
+import { ChatScreen } from './src/screens/ChatScreen';
+import { CallScreen } from './src/screens/CallScreen';
+import { RootStackParamList } from './src/types/navigation';
+import { usePushNotifications } from './src/hooks/usePushNotifications';
 
-const defaultHomeserver =
-  Constants.expoConfig?.extra?.homeserverUrl ?? 'https://matrix-client.matrix.org'
+const Stack = createNativeStackNavigator<RootStackParamList>();
 
-export default function App() {
-  const [homeserver, setHomeserver] = useState(defaultHomeserver)
-  const [status, setStatus] = useState<string>('Введите адрес homeserver и нажмите Проверить')
-  const [busy, setBusy] = useState(false)
+const AuthenticatedNavigator = () => {
+  const { session, logout } = useMatrixSession();
+  usePushNotifications(session);
 
-  const handleDiscover = async () => {
-    if (busy) return
-    setBusy(true)
-    setStatus('Выполняется discovery…')
-    try {
-      const baseUrl = await resolveHomeserverBaseUrl(homeserver)
-      setStatus(`Homeserver найден: ${baseUrl}`)
-    } catch (error) {
-      if (error instanceof HomeserverDiscoveryError) {
-        setStatus(error.message)
-      } else {
-        setStatus('Неожиданная ошибка во время discovery.')
-      }
-    } finally {
-      setBusy(false)
-    }
+  if (!session) {
+    return null;
   }
 
   return (
-    <SafeAreaView style={styles.container}>
-      <StatusBar style="light" />
-      <View style={styles.header}>
-        <Text style={styles.title}>Matrix Messenger Mobile</Text>
-        <Text style={styles.subtitle}>Прототип, разделяющий бизнес-логику с веб/Tauri приложением</Text>
-      </View>
-      <View style={styles.card}>
-        <Text style={styles.label}>Homeserver</Text>
-        <TextInput
-          accessibilityLabel="Matrix homeserver"
-          autoCapitalize="none"
-          autoCorrect={false}
-          keyboardType="url"
-          placeholder="matrix.example.com"
-          style={styles.input}
-          value={homeserver}
-          onChangeText={setHomeserver}
-        />
-        <TouchableOpacity accessibilityRole="button" style={styles.button} onPress={handleDiscover} disabled={busy}>
-          <Text style={styles.buttonText}>{busy ? 'Проверяем…' : 'Проверить'}</Text>
-        </TouchableOpacity>
-        <Text style={styles.status}>{status}</Text>
-      </View>
-    </SafeAreaView>
-  )
-}
+    <Stack.Navigator
+      initialRouteName="Chats"
+      screenOptions={{
+        headerShown: false,
+        contentStyle: { backgroundColor: '#0B1526' },
+      }}
+    >
+      <Stack.Screen name="Chats">
+        {props => <ChatListScreen {...props} session={session} onLogout={logout} />}
+      </Stack.Screen>
+      <Stack.Screen name="Chat">
+        {props => <ChatScreen {...props} session={session} />}
+      </Stack.Screen>
+      <Stack.Screen name="Call">
+        {props => <CallScreen {...props} session={session} />}
+      </Stack.Screen>
+    </Stack.Navigator>
+  );
+};
 
-const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: '#0B1526',
-    alignItems: 'center',
-    justifyContent: 'flex-start',
-    paddingHorizontal: 24,
-    paddingVertical: 32,
-  },
-  header: {
-    width: '100%',
-    marginBottom: 24,
-  },
-  title: {
-    fontSize: 28,
-    fontWeight: '600',
-    color: '#FFFFFF',
-  },
-  subtitle: {
-    marginTop: 8,
-    fontSize: 16,
-    lineHeight: 22,
-    color: '#B4C2DF',
-  },
-  card: {
-    backgroundColor: '#12213B',
-    borderRadius: 16,
-    padding: 20,
-    width: '100%',
-    gap: 12,
-  },
-  label: {
-    color: '#B4C2DF',
-    fontSize: 14,
-  },
-  input: {
-    backgroundColor: '#0B1526',
-    borderRadius: 12,
-    paddingHorizontal: 16,
-    paddingVertical: 14,
-    color: '#FFFFFF',
-    borderWidth: 1,
-    borderColor: '#203456',
-  },
-  button: {
-    marginTop: 8,
-    backgroundColor: '#3A7EFB',
-    borderRadius: 12,
-    paddingVertical: 14,
-    alignItems: 'center',
-  },
-  buttonText: {
-    color: '#FFFFFF',
-    fontWeight: '600',
-    fontSize: 16,
-  },
-  status: {
-    marginTop: 12,
-    color: '#FFFFFF',
-    fontSize: 14,
-    lineHeight: 20,
-  },
-})
+const RootNavigator = () => {
+  const { session, loginWithPassword, isLoading, error } = useMatrixSession();
+
+  if (!session) {
+    return (
+      <Stack.Navigator screenOptions={{ headerShown: false }}>
+        <Stack.Screen name="Login">
+          {() => <LoginScreen onSubmit={loginWithPassword} loading={isLoading} error={error} />}
+        </Stack.Screen>
+      </Stack.Navigator>
+    );
+  }
+
+  return <AuthenticatedNavigator />;
+};
+
+const Providers: React.FC<{ children: React.ReactNode }> = ({ children }) => (
+  <MatrixSessionProvider>
+    {children}
+  </MatrixSessionProvider>
+);
+
+export default function App() {
+  return (
+    <Providers>
+      <StatusBar style="light" />
+      <NavigationContainer>
+        <RootNavigator />
+      </NavigationContainer>
+    </Providers>
+  );
+}
