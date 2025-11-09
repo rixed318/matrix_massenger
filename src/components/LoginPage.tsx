@@ -1,6 +1,6 @@
 import React, { useState, FormEvent, useEffect } from 'react';
-import { MatrixClient } from '../types';
-import { login, resolveHomeserverBaseUrl, HomeserverDiscoveryError, register as registerAccount } from '../services/matrixService';
+import { MatrixClient } from '@matrix-messenger/core';
+import { login, resolveHomeserverBaseUrl, HomeserverDiscoveryError, register as registerAccount } from '@matrix-messenger/core';
 import ServerDeploymentWizard from './ServerDeploymentWizard';
 import { useAccountStore } from '../services/accountManager';
 

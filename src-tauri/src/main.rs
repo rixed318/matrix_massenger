@@ -6,6 +6,7 @@ use deployment::{deploy_synapse_server, DeploymentConfig, DeploymentStatus};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tauri::AppHandle;
+use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_store::StoreBuilder;
 
 const STORE_FILE: &str = "secure_credentials.store";
@@ -140,6 +141,22 @@ async fn test_ssh_connection(
 fn main() {
   tauri::Builder::default()
     .plugin(tauri_plugin_store::Builder::default().build())
+    .plugin(tauri_plugin_notification::init())
+    .setup(|app| {
+      #[cfg(not(debug_assertions))]
+      {
+        let handle = app.handle();
+        tauri::async_runtime::spawn(async move {
+          let _ = handle
+            .notification()
+            .builder()
+            .title("Matrix Messenger ready")
+            .body("Background services initialized successfully.")
+            .show();
+        });
+      }
+      Ok(())
+    })
     .invoke_handler(tauri::generate_handler![
       save_credentials,
       load_credentials,

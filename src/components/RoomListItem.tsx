@@ -2,7 +2,7 @@
 
 
 import React from 'react';
-import { Room } from '../types';
+import { Room } from '@matrix-messenger/core';
 import Avatar from './Avatar';
 import { formatDistanceToNow } from 'date-fns';
 

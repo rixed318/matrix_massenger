@@ -1,5 +1,5 @@
 import React from 'react';
-import { Message, Reaction, MatrixClient } from '../types';
+import { Message, Reaction, MatrixClient } from '@matrix-messenger/core';
 import ChatMessage from './ChatMessage';
 
 interface MessageViewProps {

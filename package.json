@@ -6,6 +6,12 @@
     "packages/*"
   ],
   "type": "module",
+  "workspaces": {
+    "packages": [
+      "packages/*",
+      "mobile"
+    ]
+  },
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
@@ -18,6 +24,7 @@
   "dependencies": {
     "@tauri-apps/api": "^2.9.0",
     "@tauri-apps/plugin-notification": "^2.3.3",
+    "@matrix-messenger/core": "file:packages/core",
     "@tauri-apps/plugin-opener": "^2.5.2",
     "date-fns": "^3.6.0",
     "matrix-js-sdk": "^30.1.0",

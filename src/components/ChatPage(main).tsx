@@ -1,14 +1,14 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 // FIX: Import MatrixRoom to correctly type room objects from the SDK.
-import { Room as UIRoom, Message, MatrixEvent, Reaction, ReplyInfo, MatrixClient, MatrixRoom, ActiveThread, MatrixUser, Poll, PollResult, Folder, ScheduledMessage, MatrixCall, LinkPreviewData, Sticker, Gif } from '../types';
+import { Room as UIRoom, Message, MatrixEvent, Reaction, ReplyInfo, MatrixClient, MatrixRoom, ActiveThread, MatrixUser, Poll, PollResult, Folder, ScheduledMessage, MatrixCall, LinkPreviewData, Sticker, Gif } from '@matrix-messenger/core';
 import RoomList from './RoomList';
 import MessageView from './MessageView';
 import ChatHeader from './ChatHeader';
 import MessageInput from './MessageInput';
-import { mxcToHttp, sendReaction, sendTypingIndicator, editMessage, sendMessage, deleteMessage, sendImageMessage, sendReadReceipt, sendFileMessage, setDisplayName, setAvatar, createRoom, inviteUser, forwardMessage, paginateRoomHistory, sendAudioMessage, setPinnedMessages, sendPollStart, sendPollResponse, translateText, sendStickerMessage, sendGifMessage, getSecureCloudProfileForClient } from '../services/matrixService';
-import { onOutboxEvent, getOutboxPending, flushOutbox } from '../services/matrixService';
-import { startGroupCall, joinGroupCall, getDisplayMedia, enumerateDevices } from '../services/matrixService';
-import { onOutboxEvent, getOutboxPending, flushOutbox } from '../services/matrixService';
+import { mxcToHttp, sendReaction, sendTypingIndicator, editMessage, sendMessage, deleteMessage, sendImageMessage, sendReadReceipt, sendFileMessage, setDisplayName, setAvatar, createRoom, inviteUser, forwardMessage, paginateRoomHistory, sendAudioMessage, setPinnedMessages, sendPollStart, sendPollResponse, translateText, sendStickerMessage, sendGifMessage, getSecureCloudProfileForClient } from '@matrix-messenger/core';
+import { onOutboxEvent, getOutboxPending, flushOutbox } from '@matrix-messenger/core';
+import { startGroupCall, joinGroupCall, getDisplayMedia, enumerateDevices } from '@matrix-messenger/core';
+import { onOutboxEvent, getOutboxPending, flushOutbox } from '@matrix-messenger/core';
 import {
     getScheduledMessages,
     addScheduledMessage,
@@ -17,8 +17,8 @@ import {
     recordScheduledMessageError,
     parseScheduledMessagesFromEvent,
     SCHEDULED_MESSAGES_EVENT_TYPE,
-} from '../services/schedulerService';
-import { checkPermission, sendNotification, setupNotificationListeners } from '../services/notificationService';
+} from '@matrix-messenger/core';
+import { checkPermission, sendNotification, setupNotificationListeners } from '@matrix-messenger/core';
 import WelcomeView from './WelcomeView';
 import SettingsModal from './SettingsModal';
 import CreateRoomModal from './CreateRoomModal';
@@ -35,13 +35,13 @@ import CallView from './CallView';
 import GroupCallView from './GroupCallView';
 import CallParticipantsPanel from './CallParticipantsPanel';
 import SearchModal from './SearchModal';
-import { SearchResultItem } from '../services/searchService';
+import { SearchResultItem } from '@matrix-messenger/core';
 // FIX: The `matrix-js-sdk` exports event names as enums. Import them to use with the event emitter.
 // FIX: Import event enums to use with the event emitter instead of string literals, which are not assignable.
 // FIX: `CallErrorCode` is not an exported member of `matrix-js-sdk`. It has been removed.
 import { NotificationCountType, EventType, MsgType, ClientEvent, RoomEvent, UserEvent, RelationType, CallEvent } from 'matrix-js-sdk';
-import { startSecureCloudSession, acknowledgeSuspiciousEvents } from '../services/secureCloudService';
-import type { SuspiciousEventNotice, SecureCloudSession } from '../services/secureCloudService';
+import { startSecureCloudSession, acknowledgeSuspiciousEvents } from '@matrix-messenger/core';
+import type { SuspiciousEventNotice, SecureCloudSession } from '@matrix-messenger/core';
 
 interface ChatPageProps {
     client: MatrixClient;

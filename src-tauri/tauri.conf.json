@@ -15,15 +15,41 @@
         "width": 1280,
         "height": 720,
         "resizable": true,
-        "fullscreen": false
+        "fullscreen": false,
+        "center": true,
+        "visible": true,
+        "theme": "System"
       }
     ],
     "security": {
       "csp": null
+    },
+    "updater": {
+      "active": true,
+      "dialog": true,
+      "endpoints": [
+        "https://updates.matrix-messenger.dev/desktop/{{target}}/{{arch}}/{{current_version}}/latest.json"
+      ],
+      "pubkey": "YOUR_PUBLIC_KEY_HERE"
     }
   },
   "bundle": {
     "active": true,
-    "targets": "all"
+    "targets": "all",
+    "icon": [
+      "icons/icon.icns",
+      "icons/icon.ico",
+      "icons/icon.png"
+    ],
+    "windows": {
+      "iconPath": "icons/icon.ico"
+    },
+    "macOS": {
+      "icon": "icons/icon.icns"
+    },
+    "linux": {
+      "iconPath": "icons/icon.png",
+      "category": "Chat"
+    }
   }
 }

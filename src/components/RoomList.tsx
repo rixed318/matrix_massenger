@@ -1,8 +1,8 @@
 import React, { useEffect, useState } from 'react';
-import { Room, MatrixClient, Folder } from '../types';
+import { Room, MatrixClient, Folder } from '@matrix-messenger/core';
 import RoomListItem from './RoomListItem';
 import Avatar from './Avatar';
-import { mxcToHttp } from '../services/matrixService';
+import { mxcToHttp } from '@matrix-messenger/core';
 
 interface RoomListProps {
   rooms: Room[];
