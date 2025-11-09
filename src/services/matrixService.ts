@@ -1213,15 +1213,19 @@ export const getSpaceHierarchy = async (
 const URL_REGEX = /(https?:\/\/[^\s]+)/;
 
 
+type SendMessageInput = string | { body: string; formattedBody?: string; format?: string };
+
 export function sendMessage(
     client: MatrixClient,
     roomId: string,
-    body: string,
+    input: SendMessageInput,
     replyToEvent?: MatrixEvent,
     threadRootId?: string,
     roomMembers: MatrixUser[] = []
 ): Promise<{ event_id: string }> {
     return (async () => {
+        const payload = typeof input === 'string' ? { body: input } : input;
+        const body = payload.body;
         const mentionedUserIds = new Set<string>();
         const formattedBodyParts: string[] = [];
         const parts = body.split(/(@[a-zA-Z0-9\._-]*)/g);
@@ -1243,9 +1247,16 @@ export function sendMessage(
             body: body,
         };
 
+        if (payload.formattedBody) {
+            content.format = payload.format ?? 'org.matrix.custom.html';
+            content.formatted_body = payload.formattedBody;
+        }
+
         if (mentionedUserIds.size > 0) {
-            content.format = 'org.matrix.custom.html';
-            content.formatted_body = formattedBodyParts.join('');
+            content.format = content.format ?? 'org.matrix.custom.html';
+            if (!content.formatted_body) {
+                content.formatted_body = formattedBodyParts.join('');
+            }
             content['m.mentions'] = {
                 user_ids: Array.from(mentionedUserIds),
             };

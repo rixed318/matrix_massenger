@@ -152,3 +152,20 @@ export interface Gif {
     title: string;
     dims: [number, number];
 }
+
+export type SendKeyBehavior = 'enter' | 'ctrlEnter' | 'altEnter';
+
+export interface DraftAttachment {
+    id: string;
+    name: string;
+    size: number;
+    mimeType: string;
+    dataUrl: string;
+    kind: 'file';
+}
+
+export interface DraftContent {
+    plain: string;
+    formatted?: string;
+    attachments: DraftAttachment[];
+}
