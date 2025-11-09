@@ -1,11 +1,11 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 // FIX: Import MatrixRoom to correctly type room objects from the SDK.
-import { Room as UIRoom, Message, MatrixEvent, Reaction, ReplyInfo, MatrixClient, MatrixRoom, ActiveThread, MatrixUser, Poll, PollResult, Folder, ScheduledMessage, MatrixCall, LinkPreviewData, Sticker, Gif } from '@matrix-messenger/core';
+import { Room as UIRoom, Message, MatrixEvent, Reaction, ReplyInfo, MatrixClient, MatrixRoom, ActiveThread, MatrixUser, Poll, PollResult, Folder, ScheduledMessage, MatrixCall, LinkPreviewData, Sticker, Gif, RoomNotificationMode } from '@matrix-messenger/core';
 import RoomList from './RoomList';
 import MessageView from './MessageView';
 import ChatHeader from './ChatHeader';
 import MessageInput from './MessageInput';
-import { mxcToHttp, sendReaction, sendTypingIndicator, editMessage, sendMessage, deleteMessage, sendImageMessage, sendReadReceipt, sendFileMessage, setDisplayName, setAvatar, createRoom, inviteUser, forwardMessage, paginateRoomHistory, sendAudioMessage, setPinnedMessages, sendPollStart, sendPollResponse, translateText, sendStickerMessage, sendGifMessage, getSecureCloudProfileForClient } from '@matrix-messenger/core';
+import { mxcToHttp, sendReaction, sendTypingIndicator, editMessage, sendMessage, deleteMessage, sendImageMessage, sendReadReceipt, sendFileMessage, setDisplayName, setAvatar, createRoom, inviteUser, forwardMessage, paginateRoomHistory, sendAudioMessage, setPinnedMessages, sendPollStart, sendPollResponse, translateText, sendStickerMessage, sendGifMessage, getSecureCloudProfileForClient, getRoomNotificationMode, setRoomNotificationMode as updateRoomPushRule } from '@matrix-messenger/core';
 import { startGroupCall, joinGroupCall, getDisplayMedia, enumerateDevices } from '@matrix-messenger/core';
 import {
     getScheduledMessages,
@@ -16,7 +16,7 @@ import {
     parseScheduledMessagesFromEvent,
     SCHEDULED_MESSAGES_EVENT_TYPE,
 } from '@matrix-messenger/core';
-import { checkPermission, sendNotification, setupNotificationListeners, subscribeToWebPush, isWebPushSupported, registerMatrixWebPush } from '@matrix-messenger/core';
+import { checkPermission, sendNotification, setupNotificationListeners, subscribeToWebPush, isWebPushSupported, registerMatrixWebPush, setRoomNotificationPreference, setRoomNotificationPreferences } from '@matrix-messenger/core';
 import WelcomeView from './WelcomeView';
 import SettingsModal from './SettingsModal';
 import CreateRoomModal from './CreateRoomModal';
@@ -55,6 +55,8 @@ const DRAFT_ACCOUNT_DATA_EVENT = 'econix.message_drafts';
 const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, savedMessagesRoomId: savedRoomIdProp }) => {
     const activeRuntime = useAccountStore(state => (state.activeKey ? state.accounts[state.activeKey] : null));
     const removeAccount = useAccountStore(state => state.removeAccount);
+    const setAccountRoomNotificationMode = useAccountStore(state => state.setRoomNotificationMode);
+    const accountRoomNotificationModes = useAccountStore(state => (state.activeKey ? (state.accounts[state.activeKey]?.roomNotificationModes ?? {}) : {}));
     const client = (providedClient ?? activeRuntime?.client)!;
     const savedMessagesRoomId = savedRoomIdProp ?? activeRuntime?.savedMessagesRoomId ?? '';
     const logout = onLogout ?? (() => { void removeAccount(); });
@@ -198,6 +200,10 @@ const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, s
     const secureSessionRef = useRef<SecureCloudSession | null>(null);
 
     useEffect(() => {
+        setRoomNotificationPreferences(accountRoomNotificationModes);
+    }, [accountRoomNotificationModes]);
+
+    useEffect(() => {
         try {
             const serialized = Object.entries(drafts).reduce<Record<string, DraftContent>>((acc, [roomId, draft]) => {
                 acc[roomId] = draft;
@@ -216,6 +222,28 @@ const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, s
             console.error('Failed to persist send key behavior', error);
         }
     }, [sendKeyBehavior]);
+
+    useEffect(() => {
+        if (!client || !selectedRoomId) {
+            return;
+        }
+        let cancelled = false;
+        (async () => {
+            try {
+                const mode = await getRoomNotificationMode(client, selectedRoomId);
+                if (cancelled) {
+                    return;
+                }
+                setAccountRoomNotificationMode(selectedRoomId, mode, activeRuntime?.creds.key ?? null);
+                setRoomNotificationPreference(selectedRoomId, mode);
+            } catch (error) {
+                console.error('Failed to load room notification mode', error);
+            }
+        })();
+        return () => {
+            cancelled = true;
+        };
+    }, [client, selectedRoomId, activeRuntime?.creds.key, setAccountRoomNotificationMode]);
 
     useEffect(() => {
         const profile = getSecureCloudProfileForClient(client);
@@ -826,9 +854,15 @@ const handleSetChatBackground = (bgUrl: string) => {
             if (notificationsEnabled && !document.hasFocus() && event.getSender() !== client.getUserId() && (event.getType() === EventType.RoomMessage || event.getType() === 'm.sticker') && !event.isRedacted()) {
                 const room = client.getRoom(roomId);
                 const senderName = event.sender?.name || 'Unknown User';
-                const messageBody = event.getContent().body;
+                const content = event.getContent();
+                const messageBody = content.body;
+                const currentUserId = client.getUserId?.();
+                const mentionList = Array.isArray(content?.['m.mentions']?.user_ids)
+                    ? content['m.mentions'].user_ids as string[]
+                    : [];
+                const isMention = currentUserId ? mentionList.includes(currentUserId) : false;
                 if (room && room.roomId !== savedMessagesRoomId) {
-                    sendNotification(room.name, `${senderName}: ${messageBody}`);
+                    sendNotification(room.name, `${senderName}: ${messageBody}`, { roomId, isMention });
                 }
             }
 
@@ -909,7 +943,7 @@ const handleSetChatBackground = (bgUrl: string) => {
                 const peerMember = (call as any).getPeerMember();
                 const peerName = peerMember?.name || 'Unknown User';
                 const callType = call.type === 'video' ? 'Video' : 'Voice';
-                sendNotification(`Incoming ${callType} Call`, `From: ${peerName}`);
+                sendNotification(`Incoming ${callType} Call`, `From: ${peerName}`, { roomId: call.roomId ?? undefined, isMention: true });
             }
         };
 
@@ -1358,6 +1392,23 @@ const handleSetChatBackground = (bgUrl: string) => {
         setIsInviteUserOpen(false);
     };
 
+    const handleSetNotificationLevel = useCallback(async (roomId: string, mode: RoomNotificationMode) => {
+        if (!roomId) {
+            return;
+        }
+        try {
+            await updateRoomPushRule(client, roomId, mode);
+            setAccountRoomNotificationMode(roomId, mode, activeRuntime?.creds.key ?? null);
+            setRoomNotificationPreference(roomId, mode);
+        } catch (error) {
+            console.error('Failed to update room notification mode', error);
+        }
+    }, [client, activeRuntime?.creds.key, setAccountRoomNotificationMode]);
+
+    const handleMuteRoom = useCallback((roomId: string) => {
+        void handleSetNotificationLevel(roomId, 'mute');
+    }, [handleSetNotificationLevel]);
+
     const handlePinToggle = async (messageId: string) => {
         if (!selectedRoomId || !canPin) return;
         const newPinnedIds = pinnedEventIds.includes(messageId)
@@ -1565,6 +1616,9 @@ const handleSetChatBackground = (bgUrl: string) => {
                             onPlaceCall={handlePlaceCall}
                             onOpenSearch={() => setIsSearchOpen(true)}
                             connectionStatus={isOffline ? 'offline' : 'online'}
+                            notificationMode={selectedRoom.notificationMode ?? accountRoomNotificationModes[selectedRoom.roomId] ?? 'all'}
+                            onNotificationModeChange={(mode) => handleSetNotificationLevel(selectedRoom.roomId, mode)}
+                            onMuteRoom={() => handleMuteRoom(selectedRoom.roomId)}
                         />
                         {isSecureCloudActive && (
                             <div className="px-4 pt-3 space-y-3">

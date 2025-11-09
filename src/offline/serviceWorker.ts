@@ -4,6 +4,7 @@
 const CACHE_NAME = 'econix-media-cache-v1';
 
 let latestPushSubscription: any = null;
+let roomNotificationPreferences: Record<string, 'all' | 'mentions' | 'mute'> = {};
 
 self.addEventListener('install', (event: any) => {
   event.waitUntil(self.skipWaiting());
@@ -57,6 +58,10 @@ self.addEventListener('message', (event: any) => {
     } else {
       void registerSync();
     }
+    return;
+  }
+  if (event.data.type === 'ROOM_NOTIFICATION_PREFERENCES') {
+    roomNotificationPreferences = { ...(event.data.preferences || {}) };
   }
 });
 
@@ -71,6 +76,17 @@ self.addEventListener('push', (event: any) => {
     tag: data.tag || 'econix-msg',
     data: data.data || {}
   };
+  const roomId = options.data?.roomId || data.roomId;
+  const isMention = Boolean(options.data?.isMention ?? data.isMention ?? data.highlight);
+  if (roomId) {
+    const preference = roomNotificationPreferences[roomId];
+    if (preference === 'mute') {
+      return;
+    }
+    if (preference === 'mentions' && !isMention) {
+      return;
+    }
+  }
   if (latestPushSubscription && typeof options.data === 'object' && options.data) {
     options.data.subscription = options.data.subscription || latestPushSubscription;
   }
