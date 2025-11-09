@@ -1,4 +1,6 @@
 import { MatrixClient, MatrixEvent, MatrixRoom, MatrixUser, Sticker, Gif } from '../types';
+import type { SecureCloudProfile } from './secureCloudService';
+import { normaliseSecureCloudProfile } from './secureCloudService';
 // FIX: `RoomCreateOptions` is not an exported member of `matrix-js-sdk`. Replaced with the correct type `ICreateRoomOpts`.
 // FIX: Import Visibility enum to correctly type room creation options.
 import {
@@ -233,7 +235,7 @@ export const setSecureCloudProfileForClient = (client: MatrixClient, profile: Se
         secureCloudProfiles.delete(client);
         return;
     }
-    secureCloudProfiles.set(client, profile);
+    secureCloudProfiles.set(client, normaliseSecureCloudProfile(profile));
 };
 
 export const getSecureCloudProfileForClient = (client: MatrixClient): SecureCloudProfile | null => {

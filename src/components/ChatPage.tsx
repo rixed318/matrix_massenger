@@ -41,8 +41,15 @@ import type { RoomMediaSummary, SharedMediaCategory, RoomMediaItem } from '@matr
 // FIX: Import event enums to use with the event emitter instead of string literals, which are not assignable.
 // FIX: `CallErrorCode` is not an exported member of `matrix-js-sdk`. It has been removed.
 import { NotificationCountType, EventType, MsgType, ClientEvent, RoomEvent, UserEvent, RelationType, CallEvent } from 'matrix-js-sdk';
-import { startSecureCloudSession, acknowledgeSuspiciousEvents } from '../services/secureCloudService';
-import type { SuspiciousEventNotice, SecureCloudSession } from '../services/secureCloudService';
+import { startSecureCloudSession, acknowledgeSuspiciousEvents, normaliseSecureCloudProfile } from '../services/secureCloudService';
+import type {
+    SuspiciousEventNotice,
+    SecureCloudSession,
+    SecureCloudProfile,
+    SecureCloudDetectorState,
+    SecureCloudDetectorStatus,
+} from '../services/secureCloudService';
+import { setSecureCloudProfileForClient } from '../services/matrixService';
 import { useAccountStore } from '../services/accountManager';
 
 interface ChatPageProps {
@@ -210,6 +217,69 @@ const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, s
         setRoomNotificationPreferences(accountRoomNotificationModes);
     }, [accountRoomNotificationModes]);
 
+    const formatDetectorStatus = useCallback((state: SecureCloudDetectorState): string => {
+        if (!state.enabled && !state.detector.required) {
+            return 'Отключен пользователем';
+        }
+        const status = detectorStatuses[state.detector.id];
+        if (!status) {
+            return state.detector.required ? 'Активен' : 'Готов';
+        }
+        switch (status.state) {
+            case 'loading':
+                return status.detail ?? 'Загрузка…';
+            case 'error':
+                return `Ошибка: ${status.detail ?? 'подробности недоступны'}`;
+            case 'idle':
+                return status.detail ?? 'Ожидает активации';
+            case 'ready':
+            default:
+                return status.detail ?? 'Готов';
+        }
+    }, [detectorStatuses]);
+
+    const handleSecureCloudDetectorError = useCallback((error: Error) => {
+        setSecureCloudError(error.message);
+        const detectorMatch = error.message.match(/^Secure Cloud detector (.+?) failed: (.+)$/);
+        if (detectorMatch) {
+            const [, detectorId, detail] = detectorMatch;
+            setDetectorStatuses(prev => ({
+                ...prev,
+                [detectorId]: { state: 'error', detail },
+            }));
+        }
+    }, []);
+
+    const handleToggleDetector = useCallback((detectorId: string, enabled: boolean) => {
+        setSecureCloudProfile(prev => {
+            if (!prev) {
+                return prev;
+            }
+            const normalised = normaliseSecureCloudProfile(prev);
+            const detectors = (normalised.detectors ?? []).map(state => {
+                if (state.detector.id !== detectorId) {
+                    return state;
+                }
+                if (state.detector.required) {
+                    return { ...state, enabled: true };
+                }
+                return { ...state, enabled };
+            });
+            const nextProfile = normaliseSecureCloudProfile({ ...normalised, detectors });
+            setSecureCloudProfileForClient(client, nextProfile);
+            secureSessionRef.current?.updateProfile(nextProfile);
+            return nextProfile;
+        });
+
+        setDetectorStatuses(prev => {
+            if (enabled) {
+                const { [detectorId]: _, ...rest } = prev;
+                return rest;
+            }
+            return { ...prev, [detectorId]: { state: 'idle', detail: 'Отключен пользователем' } };
+        });
+    }, [client]);
+
     useEffect(() => {
         try {
             const serialized = Object.entries(drafts).reduce<Record<string, DraftContent>>((acc, [roomId, draft]) => {
@@ -257,16 +327,18 @@ const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, s
         if (!profile || profile.mode === 'disabled') {
             setIsSecureCloudActive(false);
             setSecureCloudAlerts({});
+            setDetectorStatuses({});
             secureSessionRef.current?.stop();
             secureSessionRef.current = null;
             return;
         }
 
+        setSecureCloudProfileForClient(client, normalisedProfile);
         setIsSecureCloudActive(true);
         setSecureCloudError(null);
         setSecureCloudAlerts({});
 
-        const session = startSecureCloudSession(client, profile, {
+        const session = startSecureCloudSession(client, normalisedProfile, {
             onSuspiciousEvent: (notice) => {
                 setSecureCloudAlerts(prev => {
                     const roomAlerts = prev[notice.roomId] ?? [];
@@ -276,28 +348,62 @@ const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, s
                     return { ...prev, [notice.roomId]: [...roomAlerts, notice] };
                 });
             },
-            onError: (error) => {
-                setSecureCloudError(error.message);
-            },
+            onError: handleSecureCloudDetectorError,
         });
 
         secureSessionRef.current?.stop();
         secureSessionRef.current = session;
 
-        return (
-<>
-{isOffline && (
-    <div style={{background:'#2b2b2b', color:'#fff', padding:'6px 10px', fontSize:12, textAlign:'center'}}>
-        Offline. Messages will be queued.
-    </div>
-)}
-) => {
+        return () => {
             session.stop();
             if (secureSessionRef.current === session) {
                 secureSessionRef.current = null;
             }
         };
-    }, [client]);
+    }, [client, handleSecureCloudDetectorError]);
+
+    useEffect(() => {
+        if (!secureCloudProfile?.detectors || secureCloudProfile.detectors.length === 0) {
+            setDetectorStatuses({});
+            return;
+        }
+
+        let cancelled = false;
+
+        const refreshStatuses = async () => {
+            const next: Record<string, SecureCloudDetectorStatus> = {};
+            for (const state of secureCloudProfile.detectors ?? []) {
+                const detectorId = state.detector.id;
+                if (!state.enabled && !state.detector.required) {
+                    next[detectorId] = { state: 'idle', detail: 'Отключен пользователем' };
+                    continue;
+                }
+                try {
+                    const statusResult = state.detector.getStatus?.();
+                    const status = statusResult instanceof Promise ? await statusResult : statusResult;
+                    if (status) {
+                        next[detectorId] = status;
+                    } else {
+                        next[detectorId] = { state: 'ready' };
+                    }
+                } catch (error) {
+                    next[detectorId] = {
+                        state: 'error',
+                        detail: error instanceof Error ? error.message : 'Не удалось получить статус',
+                    };
+                }
+            }
+            if (!cancelled) {
+                setDetectorStatuses(next);
+            }
+        };
+
+        void refreshStatuses();
+
+        return () => {
+            cancelled = true;
+        };
+    }, [secureCloudProfile]);
 
     useEffect(() => {
         if (!client.getUserId()) {
@@ -1751,6 +1857,41 @@ const handleSetChatBackground = (bgUrl: string) => {
                                         >
                                             Скрыть
                                         </button>
+                                    </div>
+                                )}
+                                {detectorStates.length > 0 && (
+                                    <div className="rounded-md border border-neutral-500/40 bg-neutral-900/40 px-3 py-2 text-xs text-neutral-100 space-y-2">
+                                        <div className="flex items-center justify-between">
+                                            <span className="font-semibold text-sm">Детекторы Secure Cloud</span>
+                                        </div>
+                                        <ul className="space-y-2">
+                                            {detectorStates.map(state => (
+                                                <li key={state.detector.id} className="flex items-start justify-between gap-3">
+                                                    <div className="flex-1 min-w-0">
+                                                        <div className="flex items-center gap-2">
+                                                            <span className="font-medium text-sm text-neutral-100">{state.detector.displayName}</span>
+                                                            {state.detector.required && (
+                                                                <span className="text-[10px] uppercase tracking-wide text-emerald-400/80">обязательный</span>
+                                                            )}
+                                                        </div>
+                                                        {state.detector.description && (
+                                                            <p className="text-[11px] text-neutral-400 mt-0.5">{state.detector.description}</p>
+                                                        )}
+                                                        <p className="text-[10px] text-neutral-500 mt-1">{formatDetectorStatus(state)}</p>
+                                                    </div>
+                                                    <label className="flex items-center gap-2 text-[11px] text-neutral-300">
+                                                        <input
+                                                            type="checkbox"
+                                                            className="h-4 w-4 rounded border-neutral-500 bg-transparent text-emerald-500 focus:ring-emerald-500"
+                                                            checked={state.detector.required || state.enabled}
+                                                            onChange={(event) => handleToggleDetector(state.detector.id, event.target.checked)}
+                                                            disabled={state.detector.required}
+                                                        />
+                                                        <span className="select-none">{state.detector.required ? 'Всегда' : state.enabled ? 'Вкл.' : 'Выкл.'}</span>
+                                                    </label>
+                                                </li>
+                                            ))}
+                                        </ul>
                                     </div>
                                 )}
                                 {activeRoomAlerts.length > 0 ? (
