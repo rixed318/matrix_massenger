@@ -9,6 +9,15 @@ export interface SearchMessagesOptions {
     beforeLimit?: number;
     afterLimit?: number;
     keys?: SearchKey[];
+    senders?: string[];
+    messageTypes?: string[];
+    dateRange?: SearchDateRange;
+    hasMedia?: boolean;
+}
+
+export interface SearchDateRange {
+    from?: string | number | Date;
+    to?: string | number | Date;
 }
 
 export interface SearchResultContext {
@@ -41,6 +50,15 @@ interface RawSearchResult {
     highlight?: string[];
 }
 
+const normalizeDateToTimestamp = (value?: string | number | Date): number | undefined => {
+    if (value === undefined || value === null) return undefined;
+    if (typeof value === 'number') return value;
+    if (value instanceof Date) return Number.isNaN(value.getTime()) ? undefined : value.getTime();
+
+    const timestamp = Date.parse(value);
+    return Number.isNaN(timestamp) ? undefined : timestamp;
+};
+
 const mapEvents = (mapper: ReturnType<MatrixClient['getEventMapper']>, events?: any[]): MatrixEvent[] => {
     if (!events) return [];
     return events.map(event => mapper(event)).filter((event): event is MatrixEvent => Boolean(event));
@@ -56,8 +74,51 @@ export const searchMessages = async (
         beforeLimit = 1,
         afterLimit = 1,
         keys = ['content.body'] as SearchKey[],
+        senders,
+        messageTypes,
+        dateRange,
+        hasMedia,
     }: SearchMessagesOptions,
 ): Promise<SearchMessagesResponse> => {
+    const effectiveKeys = keys.length > 0 ? keys : (['content.body'] as SearchKey[]);
+    const filter: Record<string, unknown> = {
+        limit,
+    };
+
+    if (roomId) {
+        filter.rooms = [roomId];
+    }
+
+    if (Array.isArray(senders) && senders.length > 0) {
+        filter.senders = senders;
+    }
+
+    if (Array.isArray(messageTypes) && messageTypes.length > 0) {
+        filter.types = messageTypes;
+    }
+
+    if (hasMedia) {
+        filter.contains_url = true;
+    }
+
+    if (dateRange) {
+        const range: Record<string, number> = {};
+        const fromTs = normalizeDateToTimestamp(dateRange.from);
+        const toTs = normalizeDateToTimestamp(dateRange.to);
+
+        if (typeof fromTs === 'number') {
+            range.from = fromTs;
+        }
+
+        if (typeof toTs === 'number') {
+            range.to = toTs;
+        }
+
+        if (Object.keys(range).length > 0) {
+            filter.range = range;
+        }
+    }
+
     const body = {
         search_categories: {
             room_events: {
@@ -69,11 +130,8 @@ export const searchMessages = async (
                     include_profile: true,
                 },
                 include_state: false,
-                keys,
-                filter: {
-                    limit,
-                    rooms: roomId ? [roomId] : undefined,
-                },
+                keys: effectiveKeys,
+                filter,
             },
         },
     };

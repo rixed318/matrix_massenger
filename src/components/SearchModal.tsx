@@ -1,6 +1,7 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { MatrixClient, Room } from '@matrix-messenger/core';
-import { searchMessages, SearchMessagesResponse, SearchResultItem } from '@matrix-messenger/core';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { searchMessages } from '@matrix-messenger/core';
+import type { MatrixClient, Room, SearchMessagesResponse, SearchResultItem } from '@matrix-messenger/core';
+import type { SearchKey } from 'matrix-js-sdk';
 
 interface SearchModalProps {
     isOpen: boolean;
@@ -12,6 +13,61 @@ interface SearchModalProps {
 
 const escapeRegExp = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
+const DEFAULT_KEYS = ['content.body'] as SearchKey[];
+
+const MESSAGE_TYPE_OPTIONS = [
+    { value: 'm.room.message', label: 'Сообщения' },
+    { value: 'm.sticker', label: 'Стикеры' },
+    { value: 'm.room.encrypted', label: 'Зашифрованные события' },
+];
+
+const KEY_OPTIONS: { value: SearchKey; label: string }[] = [
+    { value: 'content.body' as SearchKey, label: 'Текст сообщения' },
+    { value: 'content.msgtype' as SearchKey, label: 'Тип контента' },
+    { value: 'sender' as SearchKey, label: 'Отправитель' },
+];
+
+interface AppliedFilters {
+    roomId?: string;
+    senders: string[];
+    messageTypes: string[];
+    hasMedia: boolean;
+    dateFrom?: string;
+    dateTo?: string;
+    keys: SearchKey[];
+}
+
+const createInitialAppliedFilters = (): AppliedFilters => ({
+    roomId: undefined,
+    senders: [],
+    messageTypes: [],
+    hasMedia: false,
+    dateFrom: undefined,
+    dateTo: undefined,
+    keys: [...DEFAULT_KEYS],
+});
+
+const normalizeDateInputValue = (value?: string | number | Date): string | undefined => {
+    if (value === undefined || value === null) return undefined;
+    if (value instanceof Date) {
+        return Number.isNaN(value.getTime()) ? undefined : value.toISOString().slice(0, 10);
+    }
+    if (typeof value === 'number') {
+        const date = new Date(value);
+        return Number.isNaN(date.getTime()) ? undefined : date.toISOString().slice(0, 10);
+    }
+    return value;
+};
+
+type SearchOverride = Partial<{
+    roomId?: string;
+    keys?: SearchKey[];
+    senders?: string[];
+    messageTypes?: string[];
+    dateRange?: { from?: string | number | Date; to?: string | number | Date };
+    hasMedia?: boolean | undefined;
+}>;
+
 const SearchModal: React.FC<SearchModalProps> = ({ isOpen, onClose, client, rooms, onSelectResult }) => {
     const [query, setQuery] = useState('');
     const [results, setResults] = useState<SearchResultItem[]>([]);
@@ -21,7 +77,27 @@ const SearchModal: React.FC<SearchModalProps> = ({ isOpen, onClose, client, room
     const [error, setError] = useState<string | null>(null);
     const [selectedIndex, setSelectedIndex] = useState(0);
     const [activeResultId, setActiveResultId] = useState<string | null>(null);
+    const [selectedRoomId, setSelectedRoomId] = useState('');
+    const [selectedSenders, setSelectedSenders] = useState<string[]>([]);
+    const [senderInput, setSenderInput] = useState('');
+    const [selectedMessageTypes, setSelectedMessageTypes] = useState<string[]>([]);
+    const [hasMediaOnly, setHasMediaOnly] = useState(false);
+    const [dateFrom, setDateFrom] = useState('');
+    const [dateTo, setDateTo] = useState('');
+    const [selectedKeys, setSelectedKeys] = useState<SearchKey[]>(() => [...DEFAULT_KEYS]);
+    const [appliedFilters, setAppliedFilters] = useState<AppliedFilters>(() => createInitialAppliedFilters());
     const inputRef = useRef<HTMLInputElement>(null);
+
+    const resetFilterSelections = useCallback(() => {
+        setSelectedRoomId('');
+        setSelectedSenders([]);
+        setSenderInput('');
+        setSelectedMessageTypes([]);
+        setHasMediaOnly(false);
+        setDateFrom('');
+        setDateTo('');
+        setSelectedKeys([...DEFAULT_KEYS]);
+    }, []);
 
     useEffect(() => {
         if (!isOpen) {
@@ -32,12 +108,14 @@ const SearchModal: React.FC<SearchModalProps> = ({ isOpen, onClose, client, room
             setSelectedIndex(0);
             setError(null);
             setActiveResultId(null);
+            resetFilterSelections();
+            setAppliedFilters(createInitialAppliedFilters());
             return;
         }
 
         const timer = setTimeout(() => inputRef.current?.focus(), 50);
         return () => clearTimeout(timer);
-    }, [isOpen]);
+    }, [isOpen, resetFilterSelections]);
 
     useEffect(() => {
         if (!isOpen) return;
@@ -51,15 +129,28 @@ const SearchModal: React.FC<SearchModalProps> = ({ isOpen, onClose, client, room
         return () => window.removeEventListener('keydown', handleKeydown);
     }, [isOpen, onClose]);
 
-    const handleSearch = async (batch?: string, append = false) => {
+    const handleSearch = async (batch?: string, append = false, overrides: SearchOverride = {}) => {
         const trimmed = query.trim();
         if (!trimmed) {
             setResults([]);
             setHighlights([]);
             setNextBatch(undefined);
             setError(null);
+            setAppliedFilters(createInitialAppliedFilters());
             return;
         }
+
+        const roomIdCandidate = 'roomId' in overrides ? overrides.roomId : (selectedRoomId || undefined);
+        const keysCandidate = 'keys' in overrides ? overrides.keys : selectedKeys;
+        const sendersCandidate = 'senders' in overrides ? overrides.senders : selectedSenders;
+        const messageTypesCandidate = 'messageTypes' in overrides ? overrides.messageTypes : selectedMessageTypes;
+        const dateRangeCandidate = 'dateRange' in overrides
+            ? overrides.dateRange
+            : (dateFrom || dateTo ? { from: dateFrom, to: dateTo } : undefined);
+        const hasMediaCandidate = 'hasMedia' in overrides ? overrides.hasMedia : (hasMediaOnly ? true : undefined);
+        const effectiveKeys = keysCandidate && keysCandidate.length > 0 ? keysCandidate : DEFAULT_KEYS;
+        const sendersFilter = Array.isArray(sendersCandidate) && sendersCandidate.length > 0 ? sendersCandidate : undefined;
+        const messageTypesFilter = Array.isArray(messageTypesCandidate) && messageTypesCandidate.length > 0 ? messageTypesCandidate : undefined;
 
         setIsSearching(true);
         setError(null);
@@ -67,11 +158,26 @@ const SearchModal: React.FC<SearchModalProps> = ({ isOpen, onClose, client, room
             const response: SearchMessagesResponse = await searchMessages(client, {
                 searchTerm: trimmed,
                 nextBatch: batch,
+                roomId: roomIdCandidate || undefined,
+                keys: effectiveKeys,
+                senders: sendersFilter,
+                messageTypes: messageTypesFilter,
+                dateRange: dateRangeCandidate,
+                hasMedia: hasMediaCandidate,
             });
             setHighlights(response.highlights);
             setNextBatch(response.nextBatch);
             setResults(prev => append ? [...prev, ...response.results] : response.results);
             setSelectedIndex(0);
+            setAppliedFilters({
+                roomId: roomIdCandidate || undefined,
+                senders: sendersFilter ? [...sendersFilter] : [],
+                messageTypes: messageTypesFilter ? [...messageTypesFilter] : [],
+                hasMedia: Boolean(hasMediaCandidate),
+                dateFrom: normalizeDateInputValue(dateRangeCandidate?.from),
+                dateTo: normalizeDateInputValue(dateRangeCandidate?.to),
+                keys: [...effectiveKeys],
+            });
         } catch (err) {
             console.error('Failed to search messages:', err);
             setError('Не удалось выполнить поиск. Попробуйте ещё раз.');
@@ -91,6 +197,77 @@ const SearchModal: React.FC<SearchModalProps> = ({ isOpen, onClose, client, room
         }
     };
 
+    const handleRoomChange = (event: React.ChangeEvent<HTMLSelectElement>) => {
+        setSelectedRoomId(event.target.value);
+    };
+
+    const commitSenderInput = () => {
+        const trimmed = senderInput.trim();
+        if (!trimmed) return;
+        setSelectedSenders(prev => prev.includes(trimmed) ? prev : [...prev, trimmed]);
+        setSenderInput('');
+    };
+
+    const handleSenderKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
+        if (event.key === 'Enter') {
+            event.preventDefault();
+            commitSenderInput();
+        }
+    };
+
+    const handleSenderBlur = () => {
+        commitSenderInput();
+    };
+
+    const handleSenderRemove = (sender: string) => {
+        setSelectedSenders(prev => prev.filter(value => value !== sender));
+    };
+
+    const handleMessageTypesChange = (event: React.ChangeEvent<HTMLSelectElement>) => {
+        const values = Array.from(event.target.selectedOptions).map(option => option.value);
+        setSelectedMessageTypes(values);
+    };
+
+    const handleKeysChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+        const { value, checked } = event.target;
+        setSelectedKeys(prev => {
+            if (checked) {
+                if (prev.includes(value as SearchKey)) return prev;
+                return [...prev, value as SearchKey];
+            }
+            const filtered = prev.filter(key => key !== value);
+            return filtered.length > 0 ? filtered : [...DEFAULT_KEYS];
+        });
+    };
+
+    const handleDateFromChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+        setDateFrom(event.target.value);
+    };
+
+    const handleDateToChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+        setDateTo(event.target.value);
+    };
+
+    const handleHasMediaChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+        setHasMediaOnly(event.target.checked);
+    };
+
+    const handleResetFilters = () => {
+        resetFilterSelections();
+        const initial = createInitialAppliedFilters();
+        setAppliedFilters(initial);
+        if (query.trim()) {
+            void handleSearch(undefined, false, {
+                roomId: undefined,
+                keys: initial.keys,
+                senders: [],
+                messageTypes: [],
+                dateRange: undefined,
+                hasMedia: false,
+            });
+        }
+    };
+
     const roomMap = useMemo(() => {
         return rooms.reduce<Record<string, Room>>((acc, room) => {
             acc[room.roomId] = room;
@@ -99,6 +276,58 @@ const SearchModal: React.FC<SearchModalProps> = ({ isOpen, onClose, client, room
     }, [rooms]);
 
     const highlightWords = useMemo(() => highlights.map(h => h.toLowerCase()), [highlights]);
+
+    const activeFilterChips = useMemo(() => {
+        const chips: { key: string; label: string; value: string }[] = [];
+        if (appliedFilters.roomId) {
+            const room = roomMap[appliedFilters.roomId];
+            chips.push({
+                key: 'room',
+                label: 'Комната',
+                value: room?.name || appliedFilters.roomId,
+            });
+        }
+        if (appliedFilters.senders.length > 0) {
+            chips.push({
+                key: 'senders',
+                label: 'Отправители',
+                value: appliedFilters.senders.join(', '),
+            });
+        }
+        if (appliedFilters.messageTypes.length > 0) {
+            chips.push({
+                key: 'types',
+                label: 'Типы',
+                value: appliedFilters.messageTypes.join(', '),
+            });
+        }
+        if (appliedFilters.hasMedia) {
+            chips.push({
+                key: 'media',
+                label: 'Медиа',
+                value: 'Только сообщения с медиа',
+            });
+        }
+        if (appliedFilters.dateFrom || appliedFilters.dateTo) {
+            const parts = [
+                appliedFilters.dateFrom ? `с ${appliedFilters.dateFrom}` : null,
+                appliedFilters.dateTo ? `по ${appliedFilters.dateTo}` : null,
+            ].filter(Boolean);
+            chips.push({
+                key: 'dateRange',
+                label: 'Период',
+                value: parts.join(' '),
+            });
+        }
+        if (appliedFilters.keys.length > 0) {
+            chips.push({
+                key: 'keys',
+                label: 'Поля поиска',
+                value: appliedFilters.keys.join(', '),
+            });
+        }
+        return chips;
+    }, [appliedFilters, roomMap]);
 
     const renderHighlighted = (text: string) => {
         if (!text) return <span className="text-text-primary">Без текста</span>;
@@ -183,8 +412,147 @@ const SearchModal: React.FC<SearchModalProps> = ({ isOpen, onClose, client, room
                         </button>
                     </label>
                     <p className="mt-2 text-xs text-text-secondary">Совет: используйте Ctrl/Cmd + K для быстрого доступа.</p>
+                    <div className="mt-4 grid gap-4 sm:grid-cols-2">
+                        <div className="flex flex-col gap-2">
+                            <label className="text-xs uppercase tracking-wide text-text-secondary">Комната</label>
+                            <select
+                                value={selectedRoomId}
+                                onChange={handleRoomChange}
+                                aria-label="Комната"
+                                className="w-full bg-bg-primary border border-border-secondary rounded-md px-3 py-2 text-sm text-text-primary focus:outline-none focus:ring-1 focus:ring-accent"
+                            >
+                                <option value="">Все комнаты</option>
+                                {rooms.map(room => (
+                                    <option key={room.roomId} value={room.roomId}>
+                                        {room.name || room.roomId}
+                                    </option>
+                                ))}
+                            </select>
+                        </div>
+                        <div className="flex flex-col gap-2">
+                            <label className="text-xs uppercase tracking-wide text-text-secondary">Типы событий</label>
+                            <select
+                                multiple
+                                value={selectedMessageTypes}
+                                onChange={handleMessageTypesChange}
+                                aria-label="Типы событий"
+                                className="w-full bg-bg-primary border border-border-secondary rounded-md px-3 py-2 text-sm text-text-primary focus:outline-none focus:ring-1 focus:ring-accent h-24"
+                            >
+                                {MESSAGE_TYPE_OPTIONS.map(option => (
+                                    <option key={option.value} value={option.value}>
+                                        {option.label}
+                                    </option>
+                                ))}
+                            </select>
+                        </div>
+                        <div className="flex flex-col gap-2 sm:col-span-2">
+                            <label className="text-xs uppercase tracking-wide text-text-secondary">Отправители</label>
+                            <div className="flex flex-wrap gap-2">
+                                {selectedSenders.map(sender => (
+                                    <span
+                                        key={sender}
+                                        className="flex items-center gap-1 bg-bg-tertiary border border-border-secondary rounded-full px-3 py-1 text-xs text-text-primary"
+                                    >
+                                        {sender}
+                                        <button
+                                            type="button"
+                                            onClick={() => handleSenderRemove(sender)}
+                                            className="text-text-secondary hover:text-text-primary"
+                                            aria-label={`Удалить фильтр по отправителю ${sender}`}
+                                        >
+                                            ×
+                                        </button>
+                                    </span>
+                                ))}
+                                <input
+                                    type="text"
+                                    value={senderInput}
+                                    onChange={event => setSenderInput(event.target.value)}
+                                    onKeyDown={handleSenderKeyDown}
+                                    onBlur={handleSenderBlur}
+                                    placeholder="Добавьте отправителя и нажмите Enter"
+                                    aria-label="Добавить отправителя"
+                                    className="flex-1 min-w-[12rem] bg-bg-primary border border-border-secondary rounded-md px-3 py-2 text-sm text-text-primary focus:outline-none focus:ring-1 focus:ring-accent"
+                                />
+                            </div>
+                        </div>
+                        <div className="flex flex-col gap-2">
+                            <label className="text-xs uppercase tracking-wide text-text-secondary">Период</label>
+                            <div className="flex gap-2">
+                                <input
+                                    type="date"
+                                    value={dateFrom}
+                                    onChange={handleDateFromChange}
+                                    aria-label="Дата начала"
+                                    className="flex-1 bg-bg-primary border border-border-secondary rounded-md px-3 py-2 text-sm text-text-primary focus:outline-none focus:ring-1 focus:ring-accent"
+                                />
+                                <input
+                                    type="date"
+                                    value={dateTo}
+                                    onChange={handleDateToChange}
+                                    aria-label="Дата окончания"
+                                    className="flex-1 bg-bg-primary border border-border-secondary rounded-md px-3 py-2 text-sm text-text-primary focus:outline-none focus:ring-1 focus:ring-accent"
+                                />
+                            </div>
+                        </div>
+                        <div className="flex flex-col gap-2">
+                            <span className="text-xs uppercase tracking-wide text-text-secondary">Поля поиска</span>
+                            <div className="flex flex-wrap gap-3">
+                                {KEY_OPTIONS.map(option => (
+                                    <label key={option.value} className="flex items-center gap-2 text-xs text-text-secondary">
+                                        <input
+                                            type="checkbox"
+                                            value={option.value}
+                                            checked={selectedKeys.includes(option.value)}
+                                            onChange={handleKeysChange}
+                                            className="h-4 w-4 rounded border-border-secondary bg-bg-primary"
+                                        />
+                                        <span>{option.label}</span>
+                                    </label>
+                                ))}
+                            </div>
+                            <label className="mt-2 flex items-center gap-2 text-xs text-text-secondary">
+                                <input
+                                    type="checkbox"
+                                    checked={hasMediaOnly}
+                                    onChange={handleHasMediaChange}
+                                    className="h-4 w-4 rounded border-border-secondary bg-bg-primary"
+                                />
+                                <span>Только сообщения с медиа</span>
+                            </label>
+                        </div>
+                        <div className="flex items-end sm:col-span-2">
+                            <button
+                                type="button"
+                                onClick={handleResetFilters}
+                                className="ml-auto inline-flex items-center gap-2 px-3 py-2 text-xs font-semibold text-text-secondary bg-bg-tertiary border border-border-secondary rounded-md hover:text-text-primary hover:border-accent transition"
+                            >
+                                Сбросить фильтры
+                            </button>
+                        </div>
+                    </div>
                 </form>
                 <div className="flex-1 overflow-y-auto">
+                    {activeFilterChips.length > 0 && (
+                        <div className="px-5 py-3 border-b border-border-secondary bg-bg-secondary/40 flex flex-wrap items-center gap-2">
+                            <span className="text-xs font-semibold uppercase tracking-wide text-text-secondary">Фильтры:</span>
+                            {activeFilterChips.map(chip => (
+                                <span
+                                    key={chip.key}
+                                    className="text-xs bg-bg-tertiary border border-border-secondary text-text-primary px-3 py-1 rounded-full"
+                                >
+                                    <span className="font-semibold">{chip.label}:</span> {chip.value}
+                                </span>
+                            ))}
+                            <button
+                                type="button"
+                                onClick={handleResetFilters}
+                                className="ml-auto text-xs font-semibold text-accent hover:text-accent-hover"
+                            >
+                                Очистить
+                            </button>
+                        </div>
+                    )}
                     {error && (
                         <div className="p-4 text-sm text-red-400 bg-red-900/20">{error}</div>
                     )}
