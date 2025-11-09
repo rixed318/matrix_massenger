@@ -20,6 +20,8 @@ interface ChatHeaderProps {
     onOpenParticipants?: () => void;
     participantsCount?: number;
     isScreensharing?: boolean;
+    canStartGroupCall?: boolean;
+    groupCallDisabledReason?: string | null;
     connectionStatus?: 'online' | 'offline' | 'connecting';
     notificationMode?: RoomNotificationMode;
     onNotificationModeChange?: (mode: RoomNotificationMode) => void;
@@ -242,9 +244,10 @@ const ChatHeader: React.FC<ChatHeaderProps> = ({
                     </div>
                     {onStartGroupCall && (
                         <button
-                            onClick={onStartGroupCall}
-                            className="p-2 rounded-full hover:bg-bg-tertiary"
-                            title="Start group call"
+                            onClick={canStartGroupCall === false ? undefined : onStartGroupCall}
+                            className={`p-2 rounded-full ${canStartGroupCall === false ? 'opacity-50 cursor-not-allowed bg-bg-secondary text-text-tertiary' : 'hover:bg-bg-tertiary'}`}
+                            title={canStartGroupCall === false ? groupCallDisabledReason || 'Недостаточно прав' : 'Начать групповой звонок'}
+                            disabled={canStartGroupCall === false}
                         >
                             📞
                         </button>

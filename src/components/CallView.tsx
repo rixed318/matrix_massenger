@@ -1,14 +1,55 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { MatrixCall, MatrixClient } from '@matrix-messenger/core';
 import Avatar from './Avatar';
 import { mxcToHttp } from '@matrix-messenger/core';
-// FIX: Use CallEvent enum for event listeners. CallState is not exported in this SDK version, so string literals will be used for state values.
 import { CallEvent } from 'matrix-js-sdk';
+import CallParticipantsPanel, { Participant as CallParticipant } from './CallParticipantsPanel';
+
+export type CallLayout = 'spotlight' | 'grid';
+
+interface ExtendedParticipant extends CallParticipant {
+    stream?: MediaStream | null;
+    screenshareStream?: MediaStream | null;
+    dominant?: boolean;
+}
 
 interface CallViewProps {
-    call: MatrixCall;
+    call?: MatrixCall | null;
     onHangup: () => void;
     client: MatrixClient;
+    participants?: ExtendedParticipant[];
+    layout?: CallLayout;
+    onLayoutChange?: (layout: CallLayout) => void;
+    showParticipantsPanel?: boolean;
+    onToggleParticipantsPanel?: () => void;
+    onToggleScreenshare?: () => void;
+    onToggleLocalMute?: () => void;
+    onToggleLocalVideo?: () => void;
+    isScreensharing?: boolean;
+    isMuted?: boolean;
+    isVideoMuted?: boolean;
+    onToggleCoWatch?: () => void;
+    coWatchActive?: boolean;
+    headerTitle?: string;
+    onMuteParticipant?: (participantId: string) => void;
+    onVideoParticipantToggle?: (participantId: string) => void;
+    onRemoveParticipant?: (participantId: string) => void;
+    onPromotePresenter?: (participantId: string) => void;
+    onSpotlightParticipant?: (participantId: string) => void;
+    localUserId?: string;
+    canModerateParticipants?: boolean;
+}
+
+interface VideoTileInfo {
+    id: string;
+    baseId: string;
+    name: string;
+    mediaStream: MediaStream | null | undefined;
+    isLocal?: boolean;
+    isMuted?: boolean;
+    isVideoMuted?: boolean;
+    isScreenShare?: boolean;
+    avatarUrl?: string | null;
 }
 
 const formatDuration = (seconds: number) => {
@@ -17,98 +58,333 @@ const formatDuration = (seconds: number) => {
     return `${mins}:${secs}`;
 };
 
-const CallView: React.FC<CallViewProps> = ({ call, onHangup, client }) => {
-    const [layout, setLayout] = useState<'spotlight'|'grid'>('spotlight');
-    // FIX: Explicitly type callState as string because the 'state' event provides string literals.
-    const [callState, setCallState] = useState<string>(call.state);
+const VideoTile: React.FC<{ tile: VideoTileInfo; localMuted: boolean; compact?: boolean }> = ({ tile, localMuted, compact }) => {
+    const videoRef = useRef<HTMLVideoElement>(null);
+
+    useEffect(() => {
+        const element = videoRef.current;
+        if (!element) return;
+        if (tile.mediaStream) {
+            try {
+                (element as HTMLVideoElement).srcObject = tile.mediaStream;
+            } catch (error) {
+                (element as HTMLVideoElement).srcObject = null;
+                element.src = '';
+            }
+            void element.play().catch(() => undefined);
+        } else {
+            (element as HTMLVideoElement).srcObject = null;
+        }
+    }, [tile.mediaStream]);
+
+    const placeholder = tile.name.slice(0, 2).toUpperCase();
+
+    return (
+        <div className={`relative rounded-xl overflow-hidden bg-black ${compact ? 'aspect-video min-h-[160px]' : 'aspect-video min-h-[200px]'}`}>
+            {tile.mediaStream ? (
+                <video
+                    ref={videoRef}
+                    autoPlay
+                    playsInline
+                    muted={tile.isLocal || tile.isScreenShare || localMuted}
+                    className="h-full w-full object-cover"
+                />
+            ) : (
+                <div className="flex h-full w-full items-center justify-center bg-bg-tertiary text-3xl font-semibold text-text-secondary">
+                    {placeholder}
+                </div>
+            )}
+            <div className="absolute bottom-0 left-0 right-0 bg-black/45 backdrop-blur-sm px-3 py-2 text-xs text-white flex items-center justify-between">
+                <span className="truncate max-w-[70%]">{tile.name}</span>
+                <span className="flex items-center gap-2">
+                    {tile.isMuted ? '🔇' : '🎙️'}
+                    {tile.isScreenShare ? '🖥️' : tile.isVideoMuted ? '📷 off' : '📷 on'}
+                </span>
+            </div>
+        </div>
+    );
+};
+
+const CallView: React.FC<CallViewProps> = ({
+    call,
+    onHangup,
+    client,
+    participants,
+    layout = 'grid',
+    onLayoutChange,
+    showParticipantsPanel,
+    onToggleParticipantsPanel,
+    onToggleScreenshare,
+    onToggleLocalMute,
+    onToggleLocalVideo,
+    isScreensharing = false,
+    isMuted: mutedProp,
+    isVideoMuted: videoMutedProp,
+    onToggleCoWatch,
+    coWatchActive = false,
+    headerTitle,
+    onMuteParticipant,
+    onVideoParticipantToggle,
+    onRemoveParticipant,
+    onPromotePresenter,
+    onSpotlightParticipant,
+    localUserId,
+    canModerateParticipants = false,
+}) => {
+    const [callState, setCallState] = useState<string>(call?.state ?? '');
     const [duration, setDuration] = useState(0);
-    const [isMuted, setIsMuted] = useState(call.isMicrophoneMuted());
-    const [isVidMuted, setIsVidMuted] = useState(call.isLocalVideoMuted());
+    const [internalMuted, setInternalMuted] = useState(call?.isMicrophoneMuted() ?? false);
+    const [internalVideoMuted, setInternalVideoMuted] = useState(call?.isLocalVideoMuted() ?? false);
     const durationIntervalRef = useRef<number | null>(null);
     const localVideoRef = useRef<HTMLVideoElement>(null);
     const remoteVideoRef = useRef<HTMLVideoElement>(null);
 
-    // FIX: The 'getPeerMember' method may not be in the MatrixCall type definition. Cast to 'any' to bypass the check.
-    const peerMember = (call as any).getPeerMember();
-    const peerName = peerMember?.name || 'Unknown User';
-    const peerAvatar = mxcToHttp(client, peerMember?.getMxcAvatarUrl(), 128);
-    const isVideoCall = call.type === 'video';
+    const isGroupCall = Boolean(participants && participants.length > 0);
 
     useEffect(() => {
-        if (isVideoCall) {
-            if (localVideoRef.current) {
-                // FIX: `setLocalVideoElement` is not in the MatrixCall type definition. Cast to `any`.
-                (call as any).setLocalVideoElement(localVideoRef.current);
-            }
-            if (remoteVideoRef.current) {
-                // FIX: `setRemoteVideoElement` is not in the MatrixCall type definition. Cast to `any`.
-                (call as any).setRemoteVideoElement(remoteVideoRef.current);
-            }
+        if (!call || isGroupCall) return;
+        if (localVideoRef.current) {
+            (call as any).setLocalVideoElement(localVideoRef.current);
         }
-    }, [call, isVideoCall]);
-
+        if (remoteVideoRef.current) {
+            (call as any).setRemoteVideoElement(remoteVideoRef.current);
+        }
+    }, [call, isGroupCall]);
 
     useEffect(() => {
-        // FIX: The type of newState from the 'state' event is a string literal (e.g., 'connected'), not the CallState enum.
+        if (!call || isGroupCall) return;
         const onStateChanged = (newState: string) => {
             setCallState(newState);
-            // FIX: Use string literal 'connected' instead of CallState.Connected.
             if (newState === 'connected') {
                 if (durationIntervalRef.current) {
-                    clearInterval(durationIntervalRef.current);
+                    window.clearInterval(durationIntervalRef.current);
                 }
                 durationIntervalRef.current = window.setInterval(() => {
                     setDuration(prev => prev + 1);
                 }, 1000);
-            } else {
-                if (durationIntervalRef.current) {
-                    clearInterval(durationIntervalRef.current);
-                    durationIntervalRef.current = null;
-                }
+            } else if (durationIntervalRef.current) {
+                window.clearInterval(durationIntervalRef.current);
+                durationIntervalRef.current = null;
             }
         };
 
-        // FIX: Use CallEvent.State enum member for the 'state' event. Cast listener as a workaround for potential type mismatch since CallState cannot be imported.
         call.on(CallEvent.State, onStateChanged as any);
-        
-        // Initial state check
-        // FIX: Use string literal 'connected' instead of CallState.Connected.
         if (call.state === 'connected') {
             onStateChanged('connected');
         }
 
         return () => {
-            // FIX: Use CallEvent.State enum member for the 'state' event.
             call.removeListener(CallEvent.State, onStateChanged as any);
             if (durationIntervalRef.current) {
-                clearInterval(durationIntervalRef.current);
+                window.clearInterval(durationIntervalRef.current);
+                durationIntervalRef.current = null;
             }
         };
-    }, [call]);
+    }, [call, isGroupCall]);
+
+    useEffect(() => {
+        if (typeof mutedProp === 'boolean') {
+            setInternalMuted(mutedProp);
+        }
+    }, [mutedProp]);
+
+    useEffect(() => {
+        if (typeof videoMutedProp === 'boolean') {
+            setInternalVideoMuted(videoMutedProp);
+        }
+    }, [videoMutedProp]);
+
+    const computedMuted = typeof mutedProp === 'boolean' ? mutedProp : internalMuted;
+    const computedVideoMuted = typeof videoMutedProp === 'boolean' ? videoMutedProp : internalVideoMuted;
 
     const toggleMute = () => {
-        const newMutedState = !isMuted;
-        call.setMicrophoneMuted(newMutedState);
-        setIsMuted(newMutedState);
+        if (onToggleLocalMute) {
+            onToggleLocalMute();
+        } else if (call) {
+            const newState = !computedMuted;
+            call.setMicrophoneMuted(newState);
+            setInternalMuted(newState);
+        }
     };
 
     const toggleVideoMute = () => {
-        const newVidMutedState = !isVidMuted;
-        // FIX: `setVideoMuted` is not in the MatrixCall type definition. Cast to `any`.
-        (call as any).setVideoMuted(newVidMutedState);
-        setIsVidMuted(newVidMutedState);
+        if (onToggleLocalVideo) {
+            onToggleLocalVideo();
+        } else if (call) {
+            const newState = !computedVideoMuted;
+            (call as any).setVideoMuted(newState);
+            setInternalVideoMuted(newState);
+        }
     };
 
     const getStateText = () => {
+        if (isGroupCall) {
+            return 'Групповой звонок';
+        }
         switch (callState) {
-            // FIX: Use string literals instead of CallState enum.
-            case 'connecting': return 'Connecting...';
-            case 'ringing': return 'Ringing...';
-            case 'connected': return formatDuration(duration);
-            default: return callState.charAt(0).toUpperCase() + callState.slice(1);
+            case 'connecting':
+                return 'Connecting...';
+            case 'ringing':
+                return 'Ringing...';
+            case 'connected':
+                return formatDuration(duration);
+            default:
+                return callState ? callState.charAt(0).toUpperCase() + callState.slice(1) : 'Звонок';
         }
     };
-    
+
+    const participantTiles = useMemo<VideoTileInfo[]>(() => {
+        if (!participants || participants.length === 0) return [];
+        return participants.flatMap(participant => {
+            const tiles: VideoTileInfo[] = [
+                {
+                    id: participant.id,
+                    baseId: participant.id,
+                    name: participant.name,
+                    mediaStream: participant.stream ?? null,
+                    isLocal: participant.isLocal,
+                    isMuted: participant.isMuted,
+                    isVideoMuted: participant.isVideoMuted,
+                    avatarUrl: participant.avatarUrl ?? null,
+                },
+            ];
+            if (participant.screenshareStream) {
+                tiles.push({
+                    id: `${participant.id}-screen`,
+                    baseId: participant.id,
+                    name: `${participant.name} — экран`,
+                    mediaStream: participant.screenshareStream,
+                    isLocal: participant.isLocal,
+                    isMuted: true,
+                    isVideoMuted: false,
+                    isScreenShare: true,
+                    avatarUrl: participant.avatarUrl ?? null,
+                });
+            }
+            return tiles;
+        });
+    }, [participants]);
+
+    const dominantId = useMemo(() => participants?.find(p => p.dominant)?.id, [participants]);
+    const spotlightTile = layout === 'spotlight'
+        ? participantTiles.find(tile => tile.baseId === dominantId) ?? participantTiles[0] ?? null
+        : null;
+    const secondaryTiles = layout === 'spotlight' && spotlightTile
+        ? participantTiles.filter(tile => tile.id !== spotlightTile.id)
+        : participantTiles;
+
+    if (isGroupCall) {
+        return (
+            <div className="fixed inset-0 bg-gray-900/95 z-40 flex flex-col">
+                <div className="absolute top-6 left-6 flex items-center gap-3">
+                    <button
+                        className={`px-3 py-1 rounded-full text-sm ${layout === 'grid' ? 'bg-indigo-600 text-white' : 'bg-bg-secondary hover:bg-bg-tertiary text-text-secondary'}`}
+                        onClick={() => onLayoutChange?.('grid')}
+                        type="button"
+                    >
+                        Сетка
+                    </button>
+                    <button
+                        className={`px-3 py-1 rounded-full text-sm ${layout === 'spotlight' ? 'bg-indigo-600 text-white' : 'bg-bg-secondary hover:bg-bg-tertiary text-text-secondary'}`}
+                        onClick={() => onLayoutChange?.('spotlight')}
+                        type="button"
+                    >
+                        Фокус
+                    </button>
+                    {onToggleScreenshare && (
+                        <button
+                            className={`px-3 py-1 rounded-full text-sm ${isScreensharing ? 'bg-emerald-600 text-white' : 'bg-bg-secondary hover:bg-bg-tertiary text-text-secondary'}`}
+                            onClick={onToggleScreenshare}
+                            type="button"
+                        >
+                            {isScreensharing ? 'Остановить экран' : 'Поделиться экраном'}
+                        </button>
+                    )}
+                    {onToggleCoWatch && (
+                        <button
+                            className={`px-3 py-1 rounded-full text-sm ${coWatchActive ? 'bg-purple-600 text-white' : 'bg-bg-secondary hover:bg-bg-tertiary text-text-secondary'}`}
+                            onClick={onToggleCoWatch}
+                            type="button"
+                        >
+                            {coWatchActive ? 'Завершить просмотр' : 'Совместный просмотр'}
+                        </button>
+                    )}
+                </div>
+
+                <div className="absolute top-6 right-6 flex items-center gap-3">
+                    <div className="text-sm text-text-secondary">{headerTitle || 'Групповой звонок'}</div>
+                    <button
+                        className="px-3 py-1 rounded-full text-sm bg-bg-secondary hover:bg-bg-tertiary"
+                        onClick={onToggleParticipantsPanel}
+                        type="button"
+                    >
+                        👥 {participants?.length ?? 0}
+                    </button>
+                </div>
+
+                <div className="flex-1 overflow-y-auto pt-20 pb-36">
+                    {layout === 'spotlight' && spotlightTile && (
+                        <div className="max-w-5xl mx-auto px-6">
+                            <VideoTile tile={spotlightTile} localMuted={computedMuted} />
+                        </div>
+                    )}
+                    <div className={`mt-6 px-6 ${layout === 'grid' ? 'grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4' : 'grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4'}`}>
+                        {secondaryTiles.map(tile => (
+                            <VideoTile key={tile.id} tile={tile} localMuted={computedMuted} compact={layout === 'spotlight'} />
+                        ))}
+                    </div>
+                </div>
+
+                <div className="absolute bottom-12 inset-x-0 flex items-center justify-center gap-6">
+                    <button
+                        onClick={toggleMute}
+                        className={`h-14 w-14 rounded-full flex items-center justify-center transition-colors ${computedMuted ? 'bg-indigo-600 text-white' : 'bg-gray-700 hover:bg-gray-600 text-white'}`}
+                        title={computedMuted ? 'Включить микрофон' : 'Выключить микрофон'}
+                        type="button"
+                    >
+                        {computedMuted ? '🔇' : '🎙️'}
+                    </button>
+                    <button
+                        onClick={toggleVideoMute}
+                        className={`h-14 w-14 rounded-full flex items-center justify-center transition-colors ${computedVideoMuted ? 'bg-indigo-600 text-white' : 'bg-gray-700 hover:bg-gray-600 text-white'}`}
+                        title={computedVideoMuted ? 'Включить камеру' : 'Выключить камеру'}
+                        type="button"
+                    >
+                        {computedVideoMuted ? '📷🚫' : '📷'}
+                    </button>
+                    <button
+                        onClick={onHangup}
+                        className="h-16 w-16 rounded-full bg-red-600 hover:bg-red-700 flex items-center justify-center text-white text-xl"
+                        title="Завершить звонок"
+                        type="button"
+                    >
+                        ☎️
+                    </button>
+                </div>
+
+                {showParticipantsPanel && (
+                    <CallParticipantsPanel
+                        participants={participants ?? []}
+                        onClose={onToggleParticipantsPanel}
+                        onMuteToggle={onMuteParticipant}
+                        onVideoToggle={onVideoParticipantToggle}
+                        onRemoveParticipant={onRemoveParticipant}
+                        onPromotePresenter={onPromotePresenter}
+                        onSpotlight={onSpotlightParticipant}
+                        localUserId={localUserId}
+                        canModerate={canModerateParticipants}
+                    />
+                )}
+            </div>
+        );
+    }
+
+    // Fallback to classic one-to-one call UI
+    const peerMember = call ? (call as any).getPeerMember() : null;
+    const peerName = peerMember?.name || 'Unknown User';
+    const peerAvatar = mxcToHttp(client, peerMember?.getMxcAvatarUrl?.(), 128);
+    const isVideoCall = call?.type === 'video';
+
     return (
         <div className="fixed inset-0 bg-gray-900/95 z-40 flex flex-col items-center justify-center animate-fade-in-fast">
             {isVideoCall && (
@@ -132,62 +408,44 @@ const CallView: React.FC<CallViewProps> = ({ call, onHangup, client }) => {
                     autoPlay
                     playsInline
                     muted
-                    className={`absolute bottom-40 right-8 w-48 h-auto rounded-lg shadow-lg border-2 border-gray-700 transition-opacity ${isVidMuted ? 'opacity-0' : 'opacity-100'}`}
+                    className={`absolute bottom-40 right-8 w-48 h-auto rounded-lg shadow-lg border-2 border-gray-700 transition-opacity ${computedVideoMuted ? 'opacity-0' : 'opacity-100'}`}
                 />
             )}
-            
+
             <div className="absolute bottom-16 flex items-center gap-8 z-10">
                 <button
-                    onClick={() => window.postMessage({ type: 'toggle-screen-share' }, '*')}
+                    onClick={onToggleScreenshare}
                     className="h-16 w-16 rounded-full flex items-center justify-center bg-gray-700 hover:bg-gray-600"
                     title="Экран"
+                    type="button"
                 >
-                    <svg xmlns="http://www.w3.org/2000/svg" className="h-8 w-8" viewBox="0 0 20 20" fill="currentColor">
-                        <path d="M2 3a1 1 0 011-1h14a1 1 0 011 1v9a1 1 0 01-1 1H3a1 1 0 01-1-1V3z" />
-                        <path d="M7 16a1 1 0 100 2h6a1 1 0 100-2H7z"/>
-                    </svg>
+                    🖥️
                 </button>
-                <button 
-                    onClick={toggleMute} 
-                    className={`h-16 w-16 rounded-full flex items-center justify-center transition-colors ${isMuted ? 'bg-indigo-500' : 'bg-gray-700 hover:bg-gray-600'}`}
-                    title={isMuted ? 'Unmute' : 'Mute'}
+                <button
+                    onClick={toggleMute}
+                    className={`h-16 w-16 rounded-full flex items-center justify-center transition-colors ${computedMuted ? 'bg-indigo-500 text-white' : 'bg-gray-700 hover:bg-gray-600 text-white'}`}
+                    title={computedMuted ? 'Включить микрофон' : 'Выключить микрофон'}
+                    type="button"
                 >
-                    {isMuted ? (
-                        <svg xmlns="http://www.w3.org/2000/svg" className="h-8 w-8" viewBox="0 0 20 20" fill="currentColor">
-                           <path fillRule="evenodd" d="M9.383 3.076A1 1 0 0110 4v12a1 1 0 01-1.707.707L4.586 13H2a1 1 0 01-1-1V8a1 1 0 011-1h2.586l3.707-3.707a1 1 0 011.09-.217zM12.293 7.293a1 1 0 011.414 0L15 8.586l1.293-1.293a1 1 0 111.414 1.414L16.414 10l1.293 1.293a1 1 0 01-1.414 1.414L15 11.414l-1.293 1.293a1 1 0 01-1.414-1.414L13.586 10l-1.293-1.293a1 1 0 010-1.414z" clipRule="evenodd" />
-                        </svg>
-                    ) : (
-                        <svg xmlns="http://www.w3.org/2000/svg" className="h-8 w-8" viewBox="0 0 20 20" fill="currentColor">
-                            <path fillRule="evenodd" d="M7 4a3 3 0 016 0v4a3 3 0 11-6 0V4zm4 10.93A7.001 7.001 0 0017 8a1 1 0 10-2 0a5 5 0 01-5 5V8a3 3 0 014.52-2.83A1 1 0 0015 4.93a3 3 0 01-6 0A1 1 0 008.48 5.17 3 3 0 0113 8v6.93zM5 8a1 1 0 00-2 0 7.001 7.001 0 006 6.93V17H7a1 1 0 100 2h6a1 1 0 100-2h-2v-2.07A7.001 7.001 0 005 8z" clipRule="evenodd" />
-                        </svg>
-                    )}
+                    {computedMuted ? '🔇' : '🎙️'}
                 </button>
-                 {isVideoCall && (
-                    <button 
-                        onClick={toggleVideoMute} 
-                        className={`h-16 w-16 rounded-full flex items-center justify-center transition-colors ${isVidMuted ? 'bg-indigo-500' : 'bg-gray-700 hover:bg-gray-600'}`}
-                        title={isVidMuted ? 'Turn camera on' : 'Turn camera off'}
+                {isVideoCall && (
+                    <button
+                        onClick={toggleVideoMute}
+                        className={`h-16 w-16 rounded-full flex items-center justify-center transition-colors ${computedVideoMuted ? 'bg-indigo-500 text-white' : 'bg-gray-700 hover:bg-gray-600 text-white'}`}
+                        title={computedVideoMuted ? 'Включить камеру' : 'Выключить камеру'}
+                        type="button"
                     >
-                         {isVidMuted ? (
-                             <svg xmlns="http://www.w3.org/2000/svg" className="h-8 w-8" viewBox="0 0 20 20" fill="currentColor">
-                                <path d="M10 12.5a2.5 2.5 0 100-5 2.5 2.5 0 000 5z" />
-                                <path fillRule="evenodd" d="M.458 10C1.732 5.943 5.522 3 10 3s8.268 2.943 9.542 7c-1.274 4.057-5.022 7-9.542 7S1.732 14.057.458 10zM14 10a4 4 0 11-8 0 4 4 0 018 0z" clipRule="evenodd" />
-                            </svg>
-                         ) : (
-                            <svg xmlns="http://www.w3.org/2000/svg" className="h-8 w-8" viewBox="0 0 20 20" fill="currentColor">
-                                <path d="M2 6a2 2 0 012-2h6a2 2 0 012 2v8a2 2 0 01-2 2H4a2 2 0 01-2-2V6zM14.553 7.106A1 1 0 0014 8v4a1 1 0 001.553.832l3-2a1 1 0 000-1.664l-3-2z" />
-                            </svg>
-                         )}
+                        {computedVideoMuted ? '📷🚫' : '📷'}
                     </button>
-                 )}
-                <button 
-                    onClick={onHangup} 
+                )}
+                <button
+                    onClick={onHangup}
                     className="h-20 w-20 rounded-full bg-red-600 hover:bg-red-700 flex items-center justify-center"
                     title="End call"
+                    type="button"
                 >
-                    <svg xmlns="http://www.w3.org/2000/svg" className="h-10 w-10 transform -rotate-135" viewBox="0 0 20 20" fill="currentColor">
-                        <path d="M2 3a1 1 0 011-1h2.153a1 1 0 01.986.836l.74 4.435a1 1 0 01-.54 1.06l-1.548.773a11.037 11.037 0 006.105 6.105l.774-1.548a1 1 0 011.059-.54l4.435.74a1 1 0 01.836.986V17a1 1 0 01-1 1h-2C7.82 18 2 12.18 2 5V3z" />
-                    </svg>
+                    ☎️
                 </button>
             </div>
         </div>
