@@ -2,9 +2,14 @@ import React from 'react';
 import { render, screen, fireEvent } from '@testing-library/react';
 import ChatList from '../../src/components/ChatList';
 import { Folder, MatrixClient, Room } from '../../src/types';
+import { getSmartCollections } from '../../src/services/mediaIndexService';
 
 vi.mock('../../src/services/matrixService', () => ({
     mxcToHttp: () => null,
+}));
+
+vi.mock('../../src/services/mediaIndexService', () => ({
+    getSmartCollections: vi.fn().mockResolvedValue([]),
 }));
 
 const createClient = (): MatrixClient => ({
@@ -101,5 +106,22 @@ describe('ChatList', () => {
 
         fireEvent.click(screen.getByText('Invites'));
         expect(onStatusFilterChange).toHaveBeenCalledWith('invited');
+    });
+
+    it('shows smart collections when available', async () => {
+        vi.mocked(getSmartCollections).mockResolvedValueOnce([
+            {
+                id: 'important',
+                label: 'Важно',
+                description: 'critical messages',
+                count: 3,
+                token: 'smart:important',
+            },
+        ]);
+
+        renderChatList();
+
+        expect(await screen.findByText('Интеллектуальные подборки')).toBeTruthy();
+        expect(await screen.findByText('Важно')).toBeTruthy();
     });
 });

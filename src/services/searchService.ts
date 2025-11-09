@@ -1,5 +1,10 @@
 import { MatrixClient, MatrixEvent } from '../types';
 import { SearchOrderBy, SearchKey } from 'matrix-js-sdk';
+import {
+    searchLocalMessages as searchLocalIndex,
+    type LocalSearchQuery,
+    type IndexedMessageMetadata,
+} from './mediaIndexService';
 
 export interface SearchMessagesOptions {
     searchTerm: string;
@@ -80,6 +85,21 @@ export const searchMessages = async (
         hasMedia,
     }: SearchMessagesOptions,
 ): Promise<SearchMessagesResponse> => {
+    const offline = typeof navigator !== 'undefined' && navigator.onLine === false;
+    const shouldUseLocalOnly = searchTerm?.startsWith('smart:');
+    const localQuery = buildLocalQuery({
+        searchTerm,
+        roomId,
+        limit,
+        senders,
+        dateRange,
+        hasMedia,
+        messageTypes,
+    });
+    if (offline || shouldUseLocalOnly) {
+        return runLocalFallback(client, localQuery, searchTerm);
+    }
+
     const effectiveKeys = keys.length > 0 ? keys : (['content.body'] as SearchKey[]);
     const filter: Record<string, unknown> = {
         limit,
@@ -136,7 +156,8 @@ export const searchMessages = async (
         },
     };
 
-    const response = await client.search({ body, next_batch: nextBatch });
+    try {
+        const response = await client.search({ body, next_batch: nextBatch });
     const roomEvents = response.search_categories.room_events;
     const eventMapper = client.getEventMapper();
 
@@ -169,4 +190,96 @@ export const searchMessages = async (
         nextBatch: roomEvents.next_batch,
         results,
     };
+    } catch (error) {
+        console.warn('Falling back to local search index', error);
+        return runLocalFallback(client, localQuery, searchTerm);
+    }
+};
+
+interface BuildLocalQueryOptions extends Pick<SearchMessagesOptions, 'searchTerm' | 'roomId' | 'limit' | 'senders' | 'dateRange' | 'hasMedia' | 'messageTypes'> {}
+
+const mediaTypeMap: Record<string, string> = {
+    'm.image': 'image',
+    'm.video': 'video',
+    'm.file': 'file',
+    'm.audio': 'file',
+    'm.text': 'link',
+};
+
+const buildLocalQuery = ({ searchTerm, roomId, limit, senders, dateRange, hasMedia, messageTypes }: BuildLocalQueryOptions): LocalSearchQuery => {
+    const query: LocalSearchQuery = {
+        term: searchTerm,
+        roomId,
+        limit,
+        senders,
+        hasMedia,
+    };
+    if (dateRange) {
+        const fromTs = normalizeDateToTimestamp(dateRange.from);
+        const toTs = normalizeDateToTimestamp(dateRange.to);
+        query.fromTs = fromTs;
+        query.toTs = toTs;
+    }
+    if (Array.isArray(messageTypes) && messageTypes.length) {
+        const mapped = messageTypes
+            .map(type => mediaTypeMap[type])
+            .filter((type): type is string => Boolean(type));
+        if (mapped.length) {
+            query.mediaTypes = Array.from(new Set(mapped));
+            query.hasMedia = true;
+        }
+    }
+    return query;
+};
+
+const runLocalFallback = async (
+    client: MatrixClient,
+    query: LocalSearchQuery,
+    searchTerm: string,
+): Promise<SearchMessagesResponse> => {
+    const hits = await searchLocalIndex(query, client.getUserId?.());
+    const results = hits
+        .map(hit => mapLocalHit(client, hit, searchTerm))
+        .filter((result): result is SearchResultItem => Boolean(result));
+    const highlightSet = new Set<string>();
+    results.forEach(result => result.highlights.forEach(item => highlightSet.add(item)));
+    return {
+        count: results.length,
+        highlights: Array.from(highlightSet),
+        results,
+    };
+};
+
+const mapLocalHit = (
+    client: MatrixClient,
+    hit: IndexedMessageMetadata,
+    term: string,
+): SearchResultItem | null => {
+    const room = client.getRoom?.(hit.roomId);
+    const event = room?.findEventById?.(hit.eventId);
+    if (!event) return null;
+    const highlights = buildHighlights(hit, term);
+    return {
+        event,
+        roomId: hit.roomId,
+        rank: hit.timestamp,
+        context: { before: [], after: [] },
+        highlights,
+    };
+};
+
+const buildHighlights = (hit: IndexedMessageMetadata, term: string): string[] => {
+    const tokens = new Set<string>();
+    if (term?.startsWith('smart:')) {
+        if (term === 'smart:important') {
+            hit.tags.forEach(tag => tokens.add(tag));
+            hit.reactions.forEach(reaction => tokens.add(reaction));
+        }
+        if (term === 'smart:mentions') {
+            hit.tokens.filter(token => token.startsWith('@')).forEach(token => tokens.add(token));
+        }
+    } else if (term && term.trim()) {
+        tokens.add(term.trim());
+    }
+    return Array.from(tokens);
 };

@@ -1,9 +1,10 @@
-import React, { useMemo } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { Folder, MatrixClient, Room } from '../types';
 import Avatar from './Avatar';
 import RoomListItem from './RoomListItem';
 import { mxcToHttp } from '../services/matrixService';
 import { ChatRoomStatus, ChatRoomType } from '../hooks/useChats';
+import { getSmartCollections, SmartCollection } from '../services/mediaIndexService';
 
 interface ChatListProps {
     rooms: Room[];
@@ -62,6 +63,33 @@ const ChatList: React.FC<ChatListProps> = ({
     statusFilter,
     onStatusFilterChange,
 }) => {
+    const [smartCollections, setSmartCollections] = useState<SmartCollection[]>([]);
+
+    useEffect(() => {
+        let cancelled = false;
+        const userId = client.getUserId?.();
+        if (!userId) {
+            setSmartCollections([]);
+            return () => {
+                cancelled = true;
+            };
+        }
+        getSmartCollections(userId)
+            .then(collections => {
+                if (!cancelled) {
+                    setSmartCollections(collections);
+                }
+            })
+            .catch(() => {
+                if (!cancelled) {
+                    setSmartCollections([]);
+                }
+            });
+        return () => {
+            cancelled = true;
+        };
+    }, [client, rooms]);
+
     const user = client.getUser(client.getUserId());
     const userAvatarUrl = mxcToHttp(client, user?.avatarUrl);
 
@@ -166,6 +194,32 @@ const ChatList: React.FC<ChatListProps> = ({
                     ))}
                 </div>
             </div>
+
+            {smartCollections.length > 0 && (
+                <div className="border-b border-border-secondary px-4 py-3 space-y-2">
+                    <div className="flex items-center justify-between">
+                        <p className="text-xs font-semibold uppercase tracking-wide text-text-secondary">Интеллектуальные подборки</p>
+                        <span className="text-xs text-text-secondary">
+                            {smartCollections.reduce((acc, item) => acc + item.count, 0)}
+                        </span>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                        {smartCollections.map(collection => (
+                            <button
+                                key={collection.id}
+                                onClick={() => onSearchTermChange(collection.token)}
+                                className="px-3 py-1.5 text-xs font-medium rounded-full bg-bg-tertiary text-text-secondary hover:bg-chip-selected hover:text-text-inverted transition-colors flex items-center gap-2"
+                                title={collection.description}
+                            >
+                                <span>{collection.label}</span>
+                                <span className="inline-flex items-center justify-center rounded-full bg-accent text-text-inverted px-2 text-[10px]">
+                                    {collection.count}
+                                </span>
+                            </button>
+                        ))}
+                    </div>
+                </div>
+            )}
 
             <div className="flex-shrink-0 border-b border-border-secondary px-3">
                 <div className="flex items-center gap-2 overflow-x-auto py-2">
