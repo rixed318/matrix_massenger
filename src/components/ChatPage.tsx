@@ -41,7 +41,7 @@ import type { DraftContent, SendKeyBehavior, DraftAttachment } from '../types';
 import { NotificationCountType, EventType, MsgType, ClientEvent, RoomEvent, UserEvent, RelationType, CallEvent } from 'matrix-js-sdk';
 import { startSecureCloudSession, acknowledgeSuspiciousEvents } from '../services/secureCloudService';
 import type { SuspiciousEventNotice, SecureCloudSession } from '../services/secureCloudService';
-import { useAccountStore } from '../services/accountManager';
+import { useAccountStore, useAccountListSnapshot } from '../services/accountManager';
 
 interface ChatPageProps {
     client?: MatrixClient;
@@ -58,7 +58,9 @@ const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, s
     const client = (providedClient ?? activeRuntime?.client)!;
     const savedMessagesRoomId = savedRoomIdProp ?? activeRuntime?.savedMessagesRoomId ?? '';
     const logout = onLogout ?? (() => { void removeAccount(); });
+    const { accounts: accountList, activeKey: activeAccountKey, setActiveKey: switchAccount, openAddAccount } = useAccountListSnapshot();
     const [rooms, setRooms] = useState<UIRoom[]>([]);
+    const [isRoomsLoading, setIsRoomsLoading] = useState(true);
     const [selectedRoomId, setSelectedRoomId] = useState<string | null>(null);
     const [messages, setMessages] = useState<Message[]>([]);
     const [isSending, setIsSending] = useState(false);
@@ -178,19 +180,6 @@ const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, s
         }
         return {};
     });
-
-    const {
-        rooms: allRooms,
-        filteredRooms,
-        isLoading: isRoomsLoading,
-        searchTerm,
-        setSearchTerm,
-        roomTypeFilter,
-        setRoomTypeFilter,
-        statusFilter,
-        setStatusFilter,
-        refresh: refreshRooms,
-    } = useChats({ client, savedMessagesRoomId });
 
     const scrollContainerRef = useRef<HTMLDivElement>(null);
     const oldScrollHeightRef = useRef<number>(0);
@@ -722,80 +711,81 @@ const handleSetChatBackground = (bgUrl: string) => {
         }
     }, [client, parseMatrixEvent]);
 
-    useEffect(() => {
-        const loadRooms = () => {
-            const matrixRooms = client.getRooms();
-            const sortedRooms = matrixRooms
-                .filter(room => room.getJoinedMemberCount() > 0) // Show all rooms including self-chats
-                .sort((a, b) => {
-                    const lastEventA = a.timeline[a.timeline.length - 1];
-                    const lastEventB = b.timeline[b.timeline.length - 1];
-                    return (lastEventB?.getTs() || 0) - (lastEventA?.getTs() || 0);
-                });
+    const loadRooms = useCallback(() => {
+        const matrixRooms = client.getRooms();
+        const sortedRooms = matrixRooms
+            .filter(room => room.getJoinedMemberCount() > 0) // Show all rooms including self-chats
+            .sort((a, b) => {
+                const lastEventA = a.timeline[a.timeline.length - 1];
+                const lastEventB = b.timeline[b.timeline.length - 1];
+                return (lastEventB?.getTs() || 0) - (lastEventA?.getTs() || 0);
+            });
 
-            let savedMessagesRoom: UIRoom | null = null;
-            
-            const roomData: UIRoom[] = sortedRooms.map(room => {
-                const lastEvent = room.timeline[room.timeline.length - 1];
-                const pinnedEvent = room.currentState.getStateEvents(EventType.RoomPinnedEvents, '');
-                const topicEvent = room.currentState.getStateEvents(EventType.RoomTopic, '');
-                const topicContent = topicEvent?.getContent?.();
-                const topic = typeof topicContent?.topic === 'string' ? topicContent.topic : undefined;
-                const canonicalAliasEvent = room.currentState.getStateEvents(EventType.RoomCanonicalAlias, '');
-                const canonicalAliasContent = canonicalAliasEvent?.getContent?.();
-                const canonicalAlias = typeof canonicalAliasContent?.alias === 'string'
-                    ? canonicalAliasContent.alias
-                    : (Array.isArray(canonicalAliasContent?.alt_aliases) && canonicalAliasContent.alt_aliases.length > 0
-                        ? canonicalAliasContent.alt_aliases[0]
-                        : undefined);
-                const roomType = room.getType() || null;
-                const isSpace = roomType === 'm.space';
-                const childEvents = room.currentState.getStateEvents(EventType.SpaceChild) as MatrixEvent[] | undefined;
-                const spaceChildIds = (Array.isArray(childEvents) ? childEvents : [])
-                    .map(ev => ev.getStateKey())
-                    .filter((id): id is string => !!id);
-                const parentEvents = room.currentState.getStateEvents(EventType.SpaceParent) as MatrixEvent[] | undefined;
-                const spaceParentIds = (Array.isArray(parentEvents) ? parentEvents : [])
-                    .map(ev => ev.getStateKey())
-                    .filter((id): id is string => !!id);
-                const uiRoom: UIRoom = {
-                    roomId: room.roomId,
-                    name: room.name,
-                    topic,
-                    avatarUrl: mxcToHttp(client, room.getMxcAvatarUrl()),
-                    lastMessage: lastEvent ? parseMatrixEvent(lastEvent) : null,
-                    unreadCount: room.getUnreadNotificationCount(NotificationCountType.Total),
-                    pinnedEvents: pinnedEvent?.getContent().pinned || [],
-                    isEncrypted: client.isRoomEncrypted(room.roomId),
-                    isDirectMessageRoom: room.getJoinedMemberCount() === 2,
-                    roomType,
-                    isSpace,
-                    spaceChildIds,
-                    spaceParentIds,
-                    canonicalAlias: canonicalAlias ?? null,
+        let savedMessagesRoom: UIRoom | null = null;
+
+        const roomData: UIRoom[] = sortedRooms.map(room => {
+            const lastEvent = room.timeline[room.timeline.length - 1];
+            const pinnedEvent = room.currentState.getStateEvents(EventType.RoomPinnedEvents, '');
+            const topicEvent = room.currentState.getStateEvents(EventType.RoomTopic, '');
+            const topicContent = topicEvent?.getContent?.();
+            const topic = typeof topicContent?.topic === 'string' ? topicContent.topic : undefined;
+            const canonicalAliasEvent = room.currentState.getStateEvents(EventType.RoomCanonicalAlias, '');
+            const canonicalAliasContent = canonicalAliasEvent?.getContent?.();
+            const canonicalAlias = typeof canonicalAliasContent?.alias === 'string'
+                ? canonicalAliasContent.alias
+                : (Array.isArray(canonicalAliasContent?.alt_aliases) && canonicalAliasContent.alt_aliases.length > 0
+                    ? canonicalAliasContent.alt_aliases[0]
+                    : undefined);
+            const roomType = room.getType() || null;
+            const isSpace = roomType === 'm.space';
+            const childEvents = room.currentState.getStateEvents(EventType.SpaceChild) as MatrixEvent[] | undefined;
+            const spaceChildIds = (Array.isArray(childEvents) ? childEvents : [])
+                .map(ev => ev.getStateKey())
+                .filter((id): id is string => !!id);
+            const parentEvents = room.currentState.getStateEvents(EventType.SpaceParent) as MatrixEvent[] | undefined;
+            const spaceParentIds = (Array.isArray(parentEvents) ? parentEvents : [])
+                .map(ev => ev.getStateKey())
+                .filter((id): id is string => !!id);
+            const uiRoom: UIRoom = {
+                roomId: room.roomId,
+                name: room.name,
+                topic,
+                avatarUrl: mxcToHttp(client, room.getMxcAvatarUrl()),
+                lastMessage: lastEvent ? parseMatrixEvent(lastEvent) : null,
+                unreadCount: room.getUnreadNotificationCount(NotificationCountType.Total),
+                pinnedEvents: pinnedEvent?.getContent().pinned || [],
+                isEncrypted: client.isRoomEncrypted(room.roomId),
+                isDirectMessageRoom: room.getJoinedMemberCount() === 2,
+                roomType,
+                isSpace,
+                spaceChildIds,
+                spaceParentIds,
+                canonicalAlias: canonicalAlias ?? null,
+            };
+
+            if (room.roomId === savedMessagesRoomId) {
+                savedMessagesRoom = {
+                    ...uiRoom,
+                    name: 'Saved Messages',
+                    isSavedMessages: true,
                 };
-
-                if (room.roomId === savedMessagesRoomId) {
-                    savedMessagesRoom = {
-                        ...uiRoom,
-                        name: 'Saved Messages',
-                        isSavedMessages: true,
-                    };
-                }
-                
-                return uiRoom;
-
-            }).filter(r => r.roomId !== savedMessagesRoomId);
-
-            if (savedMessagesRoom) {
-                setRooms([savedMessagesRoom, ...roomData]);
-            } else {
-                setRooms(roomData);
             }
-        };
 
+            return uiRoom;
+
+        }).filter(r => r.roomId !== savedMessagesRoomId);
+
+        if (savedMessagesRoom) {
+            setRooms([savedMessagesRoom, ...roomData]);
+        } else {
+            setRooms(roomData);
+        }
+
+        setIsRoomsLoading(false);
+    }, [client, savedMessagesRoomId, parseMatrixEvent]);
+
+    useEffect(() => {
         loadRooms();
-        setIsLoading(false);
 
         const onSync = (state: string) => {
             if (state === 'ERROR' || state === 'STOPPED') {
@@ -805,7 +795,7 @@ const handleSetChatBackground = (bgUrl: string) => {
             }
 
             if (state === 'PREPARED') {
-                refreshRooms();
+                loadRooms();
                 if (selectedRoomId) {
                     loadRoomMessages(selectedRoomId);
                     loadPinnedMessage(selectedRoomId);
@@ -832,7 +822,7 @@ const handleSetChatBackground = (bgUrl: string) => {
                 }
             }
 
-            refreshRooms();
+            loadRooms();
 
             if (roomId === selectedRoomId) {
                 if ((event.getType() === EventType.RoomMessage || event.getType() === 'm.sticker') && event.getSender() === client.getUserId()) {
@@ -892,7 +882,7 @@ const handleSetChatBackground = (bgUrl: string) => {
             client.removeListener(UserEvent.DisplayName, onUserProfileChange);
             client.removeListener(UserEvent.AvatarUrl, onUserProfileChange);
         };
-    }, [client, selectedRoomId, parseMatrixEvent, loadRoomMessages, activeThread, loadPinnedMessage, notificationsEnabled, savedMessagesRoomId, refreshRooms]);
+    }, [client, selectedRoomId, parseMatrixEvent, loadRoomMessages, activeThread, loadPinnedMessage, notificationsEnabled, savedMessagesRoomId, loadRooms]);
 
     useEffect(() => {
         const onCallIncoming = (call: MatrixCall) => {
@@ -1514,8 +1504,8 @@ const handleSetChatBackground = (bgUrl: string) => {
     };
 
 
-    const selectedRoom = allRooms.find(r => r.roomId === selectedRoomId);
-    const savedMessagesRoom = allRooms.find(r => r.roomId === savedMessagesRoomId);
+    const selectedRoom = rooms.find(r => r.roomId === selectedRoomId);
+    const savedMessagesRoom = rooms.find(r => r.roomId === savedMessagesRoomId);
     const matrixRoom = selectedRoomId ? client.getRoom(selectedRoomId) : null;
     const canInvite = matrixRoom?.canInvite(client.getUserId()!) || false;
     const scheduledForThisRoom = selectedRoomId
@@ -1525,13 +1515,12 @@ const handleSetChatBackground = (bgUrl: string) => {
 
     return (
         <div className="flex h-screen">
-            <ChatList
+            <RoomList
                 key={userProfileVersion}
-                rooms={filteredRooms}
-                allRooms={allRooms}
+                rooms={rooms}
                 selectedRoomId={selectedRoomId}
                 onSelectRoom={handleSelectRoom}
-                isLoading={isLoading}
+                isLoading={isRoomsLoading}
                 onLogout={logout}
                 client={client}
                 onOpenSettings={() => setIsSettingsOpen(true)}
@@ -1540,12 +1529,10 @@ const handleSetChatBackground = (bgUrl: string) => {
                 activeFolderId={activeFolderId}
                 onSelectFolder={setActiveFolderId}
                 onManageFolders={() => setIsManageFoldersOpen(true)}
-                searchTerm={searchTerm}
-                onSearchTermChange={setSearchTerm}
-                roomTypeFilter={roomTypeFilter}
-                onRoomTypeFilterChange={setRoomTypeFilter}
-                statusFilter={statusFilter}
-                onStatusFilterChange={setStatusFilter}
+                accounts={accountList}
+                activeAccountKey={activeAccountKey}
+                onSwitchAccount={key => switchAccount(key)}
+                onAddAccount={openAddAccount}
             />
             <main
                 style={{ backgroundImage: chatBackground ? `url(${chatBackground})` : 'none' }}
@@ -1775,7 +1762,7 @@ const handleSetChatBackground = (bgUrl: string) => {
                     onClose={() => setIsManageFoldersOpen(false)}
                     onSave={handleSaveFolders}
                     initialFolders={folders}
-                    allRooms={allRooms}
+                    allRooms={rooms}
                 />
             )}
             
@@ -1808,11 +1795,11 @@ const handleSetChatBackground = (bgUrl: string) => {
             )}
 
             {forwardingMessage && (
-                 <ForwardMessageModal
+                <ForwardMessageModal
                     isOpen={!!forwardingMessage}
                     onClose={() => setForwardingMessage(null)}
                     onForward={handleConfirmForward}
-                    rooms={allRooms.filter(r => r.roomId !== selectedRoomId && r.roomId !== savedMessagesRoomId)}
+                    rooms={rooms.filter(r => r.roomId !== selectedRoomId && r.roomId !== savedMessagesRoomId)}
                     message={forwardingMessage}
                     client={client}
                     savedMessagesRoom={savedMessagesRoom || null}
@@ -1829,7 +1816,7 @@ const handleSetChatBackground = (bgUrl: string) => {
                     isOpen={isSearchOpen}
                     onClose={() => setIsSearchOpen(false)}
                     client={client}
-                    rooms={allRooms}
+                    rooms={rooms}
                     onSelectResult={handleJumpToSearchResult}
                 />
             )}
