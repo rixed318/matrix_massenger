@@ -1,4 +1,4 @@
-import { MatrixClient, MatrixEvent, MatrixRoom, MatrixUser, Sticker, Gif } from '../types';
+import { MatrixClient, MatrixEvent, MatrixRoom, MatrixUser, Sticker, Gif, RoomCreationOptions } from '../types';
 import type { SecureCloudProfile } from './secureCloudService';
 import { normaliseSecureCloudProfile } from './secureCloudService';
 // FIX: `RoomCreateOptions` is not an exported member of `matrix-js-sdk`. Replaced with the correct type `ICreateRoomOpts`.
@@ -19,7 +19,27 @@ import type { HierarchyRoom } from 'matrix-js-sdk';
 
 
 // ===== Offline Outbox Queue (IndexedDB/SQLite) =====
-type OutboxPayload = {
+export interface OutboxAttachment {
+    id: string;
+    name: string;
+    size: number;
+    mimeType: string;
+    /**
+     * Serialized payload for the attachment. We use data URLs because they
+     * are self-contained and work in browsers without FileSystem Access.
+     */
+    dataUrl?: string;
+    /** Remote URL to fetch when flushing, used if dataUrl is not available. */
+    remoteUrl?: string;
+    /**
+     * Where in the event content the uploaded MXC URL should be injected.
+     * Accepts dot-notation (e.g. "url" or "file.url").
+     */
+    contentPath?: string;
+    kind?: 'file' | 'image' | 'audio' | 'video' | 'sticker' | 'voice' | 'other';
+}
+
+export type OutboxPayload = {
     id: string;                 // local id (txn-like)
     roomId: string;
     type: string;
@@ -28,6 +48,7 @@ type OutboxPayload = {
     attempts: number;
     threadRootId?: string;
     replyToEventId?: string;
+    attachments?: OutboxAttachment[];
 };
 
 export type OutboxEvent =
@@ -35,7 +56,8 @@ export type OutboxEvent =
   | { kind: 'enqueued'; item: OutboxPayload }
   | { kind: 'progress'; id: string; attempts: number }
   | { kind: 'sent'; id: string; serverEventId: string }
-  | { kind: 'error'; id: string; error: any };
+  | { kind: 'error'; id: string; error: any }
+  | { kind: 'cancelled'; id: string };
 
 type OutboxListener = (ev: OutboxEvent) => void;
 
@@ -98,6 +120,60 @@ const idbDelete = async (id: string) => {
     db.close();
 };
 
+const idbGet = async (id: string): Promise<OutboxPayload | null> => {
+    const db = await idbOpen();
+    const item: OutboxPayload | undefined = await new Promise((resolve, reject) => {
+        const tx = db.transaction(OUTBOX_STORE, 'readonly');
+        const req = tx.objectStore(OUTBOX_STORE).get(id);
+        req.onsuccess = () => resolve(req.result as OutboxPayload | undefined);
+        req.onerror = () => reject(req.error);
+    });
+    db.close();
+    return item ?? null;
+};
+
+const blobToDataUrl = (blob: Blob): Promise<string> => new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result as string);
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(blob);
+});
+
+const dataUrlToBlob = (dataUrl: string): Blob => {
+    const [meta, base64] = dataUrl.split(',');
+    const mimeMatch = /data:([^;]+);base64/.exec(meta);
+    const mimeType = mimeMatch ? mimeMatch[1] : 'application/octet-stream';
+    let binary: string;
+    if (typeof atob === 'function') {
+        binary = atob(base64);
+    } else if (typeof Buffer !== 'undefined') {
+        binary = Buffer.from(base64, 'base64').toString('binary');
+    } else {
+        throw new Error('Unable to decode dataUrl in this environment');
+    }
+    const len = binary.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i += 1) {
+        bytes[i] = binary.charCodeAt(i);
+    }
+    return new Blob([bytes], { type: mimeType });
+};
+
+const setContentPath = (target: any, path: string | undefined, value: any) => {
+    if (!path) return;
+    const segments = path.split('.').filter(Boolean);
+    if (segments.length === 0) return;
+    let current = target;
+    for (let i = 0; i < segments.length - 1; i += 1) {
+        const key = segments[i];
+        if (typeof current[key] !== 'object' || current[key] === null) {
+            current[key] = {};
+        }
+        current = current[key];
+    }
+    current[segments[segments.length - 1]] = value;
+};
+
 let _boundClient: MatrixClient | null = null;
 let _isSyncing = false;
 
@@ -120,6 +196,14 @@ export const bindOutboxToClient = (client: MatrixClient) => {
 
 const randomId = () => 'loc_' + Math.random().toString(36).slice(2) + Date.now().toString(36);
 
+const isOffline = () => typeof navigator !== 'undefined' && navigator.onLine === false;
+
+const shouldQueueFromError = (error: unknown) => {
+    if (isOffline()) return true;
+    const message = typeof (error as any)?.message === 'string' ? (error as any).message : '';
+    return /network|fetch|timeout|offline|abort/i.test(message);
+};
+
 export const getOutboxPending = async (roomId?: string): Promise<OutboxPayload[]> => {
     const all = await idbGetAll();
     return roomId ? all.filter(i => i.roomId === roomId) : all;
@@ -132,7 +216,34 @@ export const flushOutbox = async () => {
     for (const item of items) {
         try {
             _outboxEmitter.emit({ kind: 'progress', id: item.id, attempts: (item.attempts||0)+1 });
-            const sendRes = await _boundClient.sendEvent(item.roomId, item.type as any, item.content);
+            const baseContent = item.content ? JSON.parse(JSON.stringify(item.content)) : {};
+            if (Array.isArray(item.attachments) && item.attachments.length > 0) {
+                for (const attachment of item.attachments) {
+                    try {
+                        let blob: Blob;
+                        if (attachment.dataUrl) {
+                            blob = dataUrlToBlob(attachment.dataUrl);
+                        } else if (attachment.remoteUrl) {
+                            const response = await fetch(attachment.remoteUrl);
+                            blob = await response.blob();
+                        } else {
+                            throw new Error('Attachment payload missing data');
+                        }
+                        const fileName = attachment.name || 'attachment';
+                        const uploadSource = (typeof File !== 'undefined')
+                            ? new File([blob], fileName, { type: attachment.mimeType, lastModified: Date.now() })
+                            : blob;
+                        const { content_uri } = await _boundClient.uploadContent(uploadSource as any, {
+                            name: fileName,
+                            type: attachment.mimeType,
+                        });
+                        setContentPath(baseContent, attachment.contentPath ?? 'url', content_uri);
+                    } catch (uploadError) {
+                        throw uploadError;
+                    }
+                }
+            }
+            const sendRes = await _boundClient.sendEvent(item.roomId, item.type as any, baseContent);
             await idbDelete(item.id);
             _outboxEmitter.emit({ kind: 'sent', id: item.id, serverEventId: sendRes.event_id });
         } catch (e) {
@@ -146,7 +257,12 @@ export const flushOutbox = async () => {
     }
 };
 
-const enqueueOutbox = async (roomId: string, type: string, content: any, opts?: { threadRootId?: string; replyToEventId?: string }) => {
+export const enqueueOutbox = async (
+    roomId: string,
+    type: string,
+    content: any,
+    opts?: { threadRootId?: string; replyToEventId?: string; attachments?: OutboxAttachment[] }
+) => {
     const id = randomId();
     const payload: OutboxPayload = {
         id,
@@ -157,11 +273,58 @@ const enqueueOutbox = async (roomId: string, type: string, content: any, opts?: 
         attempts: 0,
         threadRootId: opts?.threadRootId,
         replyToEventId: opts?.replyToEventId,
+        attachments: opts?.attachments,
     };
     await idbPut(payload);
     _outboxEmitter.emit({ kind: 'enqueued', item: payload });
     return id;
 };
+
+export const cancelOutboxItem = async (id: string) => {
+    await idbDelete(id);
+    _outboxEmitter.emit({ kind: 'cancelled', id });
+};
+
+export const retryOutboxItem = async (id: string) => {
+    const existing = await idbGet(id);
+    if (!existing) return;
+    const updated: OutboxPayload = { ...existing, attempts: 0, ts: Date.now() };
+    await idbPut(updated);
+    _outboxEmitter.emit({ kind: 'enqueued', item: updated });
+    if (navigator.onLine) {
+        void flushOutbox();
+    }
+};
+
+export const serializeOutboxAttachment = async (
+    blob: Blob,
+    options?: { name?: string; contentPath?: string; kind?: OutboxAttachment['kind']; mimeTypeOverride?: string }
+): Promise<OutboxAttachment> => {
+    const name = options?.name ?? (blob instanceof File ? blob.name : 'attachment');
+    const mimeType = options?.mimeTypeOverride ?? (blob.type || 'application/octet-stream');
+    return {
+        id: randomId(),
+        name,
+        size: blob.size,
+        mimeType,
+        dataUrl: await blobToDataUrl(blob),
+        contentPath: options?.contentPath ?? 'url',
+        kind: options?.kind ?? 'file',
+    };
+};
+
+export const createRemoteOutboxAttachment = (
+    url: string,
+    options?: { name?: string; size?: number; mimeType?: string; contentPath?: string; kind?: OutboxAttachment['kind'] }
+): OutboxAttachment => ({
+    id: randomId(),
+    name: options?.name ?? 'attachment',
+    size: options?.size ?? 0,
+    mimeType: options?.mimeType ?? 'application/octet-stream',
+    remoteUrl: url,
+    contentPath: options?.contentPath ?? 'url',
+    kind: options?.kind ?? 'file',
+});
 // ===== Translation settings and utilities =====
 export interface TranslationSettings {
     baseUrl: string;                // Full endpoint like https://host/api/translate
@@ -632,6 +795,50 @@ const waitForFirstSync = (client: MatrixClient): Promise<void> =>
         client.on(ClientEvent.Sync as any, handler);
     });
 
+const delay = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
+
+const createAbortError = (): Error => {
+    const error = new Error('Aborted');
+    (error as any).name = 'AbortError';
+    return error;
+};
+
+const bootstrapAuthenticatedClient = async (client: MatrixClient, secureProfile?: SecureCloudProfile): Promise<void> => {
+    await initCryptoBackend(client);
+    const firstSync = waitForFirstSync(client);
+    await (client as any).startClient({ initialSyncLimit: 30, cryptoStore: _cryptoStore } as any);
+
+    try {
+        await (client as any).store?.startup?.();
+    } catch (e) {
+        console.warn('client.store.startup failed or not available', e);
+    }
+
+    try {
+        // Preload local history from the persistent store before network responses arrive
+        const rs = client.getRooms();
+        for (const r of rs) {
+            try {
+                r.getLiveTimeline();
+            } catch (_) {
+                // ignore
+            }
+        }
+    } catch (e) {
+        console.warn('Preload local history failed', e);
+    }
+
+    await firstSync;
+    try {
+        bindOutboxToClient(client);
+    } catch (e) {
+        console.warn('bindOutboxToClient failed', e);
+    }
+    if (secureProfile) {
+        setSecureCloudProfileForClient(client, secureProfile);
+    }
+};
+
 export const initClient = async (homeserverUrl: string, accessToken?: string, userId?: string): Promise<MatrixClient> => {
     const options: ICreateClientOpts = {
         baseUrl: homeserverUrl,
@@ -813,30 +1020,8 @@ export const login = async (
         }
     }
 
-    await initCryptoBackend(client);
-    const firstSync = waitForFirstSync(client);
-    await (client as any).startClient({ initialSyncLimit: 30, cryptoStore: _cryptoStore } as any);
+    await bootstrapAuthenticatedClient(client, options.secureProfile);
 
-    try {
-        await (client as any).store?.startup?.();
-    } catch (e) {
-        console.warn('client.store.startup failed or not available', e);
-    }
-    try {
-        // Preload local history from the persistent store before network responses arrive
-        const rs = client.getRooms();
-        for (const r of rs) {
-            try { r.getLiveTimeline(); } catch (_) {}
-        }
-    } catch (e) {
-        console.warn('Preload local history failed', e);
-    }
-
-    await firstSync;
-    try { bindOutboxToClient(client); } catch (e) { console.warn('bindOutboxToClient failed', e); }
-    if (options.secureProfile) {
-        setSecureCloudProfileForClient(client, options.secureProfile);
-    }
     return client;
 };
 
@@ -916,6 +1101,224 @@ export const register = async (homeserverUrl: string, username: string, password
 
     const userId = registerResponse?.user_id || username;
     return await login(homeserverUrl, userId, password);
+};
+
+export const loginWithToken = async (homeserverUrl: string, loginToken: string): Promise<MatrixClient> => {
+    if (!loginToken) {
+        throw new Error('Login token is required.');
+    }
+
+    const client = await initClient(homeserverUrl);
+    await client.login('m.login.token', { token: loginToken });
+    await bootstrapAuthenticatedClient(client);
+    return client;
+};
+
+export interface GenerateQrLoginOptions {
+    pollIntervalMs?: number;
+    signal?: AbortSignal;
+    fetchFn?: typeof fetch;
+}
+
+export interface QrLoginHandle {
+    matrixUri?: string | null;
+    expiresAt?: number | null;
+    fallbackUrl?: string | null;
+    pollLoginToken: (options?: { signal?: AbortSignal; pollIntervalMs?: number; timeoutMs?: number }) => Promise<string>;
+    cancel: () => Promise<void>;
+}
+
+const buildSsoFallbackUrl = (homeserverUrl: string): string => {
+    try {
+        const url = new URL('/_matrix/client/v3/login/sso/redirect', homeserverUrl);
+        url.searchParams.set('redirectUrl', 'https://matrix.to/#/');
+        return url.toString();
+    } catch (err) {
+        console.warn('Failed to build SSO fallback URL', err);
+        return homeserverUrl;
+    }
+};
+
+const readErrorMessage = async (response: Response): Promise<string> => {
+    try {
+        const text = await response.text();
+        if (!text) return '';
+        try {
+            const parsed = JSON.parse(text);
+            return parsed?.error || parsed?.message || text;
+        } catch {
+            return text;
+        }
+    } catch {
+        return '';
+    }
+};
+
+export const generateQrLogin = async (homeserverUrl: string, options: GenerateQrLoginOptions = {}): Promise<QrLoginHandle> => {
+    const fetchFn = options.fetchFn ?? (typeof fetch !== 'undefined' ? fetch.bind(globalThis) : undefined);
+    if (!fetchFn) {
+        throw new Error('QR login requires an environment with fetch support.');
+    }
+
+    const requestController = new AbortController();
+    const externalSignal = options.signal;
+    if (externalSignal) {
+        if (externalSignal.aborted) {
+            throw createAbortError();
+        }
+        const abortListener = () => requestController.abort();
+        externalSignal.addEventListener('abort', abortListener, { once: true });
+        requestController.signal.addEventListener(
+            'abort',
+            () => {
+                externalSignal.removeEventListener('abort', abortListener);
+            },
+            { once: true },
+        );
+    }
+
+    const codeUrl = new URL('/_matrix/client/v3/login/qr/code', homeserverUrl);
+    const response = await fetchFn(codeUrl.toString(), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: requestController.signal,
+    });
+
+    if (!response.ok) {
+        const errorMessage = await readErrorMessage(response);
+        const baseError = errorMessage || 'Сервер не поддерживает вход по QR-коду.';
+        throw new Error(baseError);
+    }
+
+    const payload: any = await response.json().catch(() => ({}));
+    const pollingToken: string | undefined =
+        payload?.polling?.token ?? payload?.polling_token ?? payload?.pollingToken ?? payload?.token;
+
+    if (!pollingToken) {
+        throw new Error('Сервер не вернул идентификатор QR-сессии.');
+    }
+
+    const matrixUri: string | null =
+        payload?.qr_code?.uri ?? payload?.qrUri ?? payload?.uri ?? payload?.qr_code_uri ?? payload?.qrCode?.uri ?? null;
+    const expiresAt: number | null =
+        typeof payload?.expires_at === 'number'
+            ? payload.expires_at
+            : typeof payload?.expires_in_ms === 'number'
+            ? Date.now() + payload.expires_in_ms
+            : null;
+
+    const pollUrl =
+        payload?.polling?.url ??
+        payload?.polling_url ??
+        (() => {
+            const url = new URL('/_matrix/client/v3/login/qr/attempt', homeserverUrl);
+            return url.toString();
+        })();
+
+    const cancelUrl: string | null =
+        payload?.polling?.cancel_url ??
+        payload?.cancel_url ??
+        (() => {
+            try {
+                const url = new URL('/_matrix/client/v3/login/qr/attempt', homeserverUrl);
+                return url.toString();
+            } catch (err) {
+                console.warn('Failed to build QR cancel URL', err);
+                return null;
+            }
+        })();
+
+    const defaultInterval =
+        typeof payload?.polling?.interval_ms === 'number'
+            ? Math.max(payload.polling.interval_ms, 1000)
+            : Math.max(options.pollIntervalMs ?? 5000, 1000);
+
+    const fallbackUrl: string | null = payload?.fallback_url ?? buildSsoFallbackUrl(homeserverUrl);
+
+    const pollLoginToken = async ({ signal, pollIntervalMs, timeoutMs }: { signal?: AbortSignal; pollIntervalMs?: number; timeoutMs?: number } = {}): Promise<string> => {
+        const interval = Math.max(pollIntervalMs ?? defaultInterval, 1000);
+        const startedAt = Date.now();
+        const loopController = new AbortController();
+
+        const abortHandler = () => {
+            loopController.abort();
+        };
+
+        const cleanup = () => {
+            if (signal) {
+                signal.removeEventListener('abort', abortHandler);
+            }
+        };
+
+        if (signal) {
+            if (signal.aborted) {
+                throw createAbortError();
+            }
+            signal.addEventListener('abort', abortHandler, { once: true });
+        }
+
+        try {
+            while (true) {
+                if (requestController.signal.aborted || loopController.signal.aborted) {
+                    throw createAbortError();
+                }
+
+                if (typeof timeoutMs === 'number' && timeoutMs > 0 && Date.now() - startedAt > timeoutMs) {
+                    throw new Error('Превышено время ожидания подтверждения QR-входа.');
+                }
+
+                if (expiresAt && Date.now() >= expiresAt) {
+                    throw new Error('QR-код истёк. Повторите попытку.');
+                }
+
+                const attemptResponse = await fetchFn(pollUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ token: pollingToken }),
+                    signal: requestController.signal,
+                });
+
+                if (attemptResponse.ok) {
+                    const result: any = await attemptResponse.json().catch(() => ({}));
+                    const loginToken: string | undefined =
+                        result?.login_token ?? result?.loginToken ?? result?.token ?? result?.access_token;
+                    if (loginToken) {
+                        cleanup();
+                        return loginToken;
+                    }
+                } else if (![401, 403, 404].includes(attemptResponse.status)) {
+                    const message = await readErrorMessage(attemptResponse);
+                    throw new Error(message || 'Не удалось проверить состояние QR-входа.');
+                }
+
+                await delay(interval);
+            }
+        } finally {
+            cleanup();
+        }
+    };
+
+    const cancel = async () => {
+        requestController.abort();
+        if (!cancelUrl) return;
+        try {
+            await fetchFn(cancelUrl, {
+                method: 'DELETE',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ token: pollingToken }),
+            });
+        } catch (err) {
+            console.warn('Failed to cancel QR login session', err);
+        }
+    };
+
+    return {
+        matrixUri,
+        expiresAt,
+        fallbackUrl,
+        pollLoginToken,
+        cancel,
+    } satisfies QrLoginHandle;
 };
 
 export const findOrCreateSavedMessagesRoom = async (client: MatrixClient): Promise<string> => {
@@ -1755,7 +2158,6 @@ export function sendMessage(
             return { event_id: localId };
         };
 
-        const isOffline = () => typeof navigator !== 'undefined' && navigator.onLine === false;
         if (isOffline()) {
             return queueOutbox();
         }
@@ -1763,9 +2165,7 @@ export function sendMessage(
         try {
             return await client.sendEvent(roomId, EventType.RoomMessage, content);
         } catch (error: any) {
-            const message = typeof error?.message === 'string' ? error.message : '';
-            const shouldQueue = isOffline() || /network|fetch/i.test(message);
-            if (shouldQueue) {
+            if (shouldQueueFromError(error)) {
                 return queueOutbox();
             }
             throw error;
@@ -1821,11 +2221,6 @@ export const compressImage = (file: File, maxWidth = 1280): Promise<File> => {
 export const sendImageMessage = async (client: MatrixClient, roomId: string, file: File): Promise<{ event_id: string }> => {
     const compressedFile = await compressImage(file);
 
-    const { content_uri: mxcUrl } = await client.uploadContent(compressedFile, {
-        name: compressedFile.name,
-        type: compressedFile.type,
-    });
-
     const content = {
         body: compressedFile.name,
         info: {
@@ -1833,18 +2228,41 @@ export const sendImageMessage = async (client: MatrixClient, roomId: string, fil
             size: compressedFile.size,
         },
         msgtype: MsgType.Image,
-        url: mxcUrl,
+        url: undefined as unknown as string,
+    };
+    const sendDirect = async () => {
+        const { content_uri: mxcUrl } = await client.uploadContent(compressedFile, {
+            name: compressedFile.name,
+            type: compressedFile.type,
+        });
+        return client.sendEvent(roomId, EventType.RoomMessage, { ...content, url: mxcUrl } as any);
     };
 
-    return client.sendEvent(roomId, EventType.RoomMessage, content as any);
+    const queueOutbox = async () => {
+        const attachment = await serializeOutboxAttachment(compressedFile, {
+            name: compressedFile.name,
+            contentPath: 'url',
+            kind: 'image',
+        });
+        const localId = await enqueueOutbox(roomId, EventType.RoomMessage, content, { attachments: [attachment] });
+        return { event_id: localId };
+    };
+
+    if (isOffline()) {
+        return queueOutbox();
+    }
+
+    try {
+        return await sendDirect();
+    } catch (error) {
+        if (shouldQueueFromError(error)) {
+            return queueOutbox();
+        }
+        throw error;
+    }
 };
 
 export const sendAudioMessage = async (client: MatrixClient, roomId: string, file: Blob, duration: number): Promise<{ event_id: string }> => {
-    const { content_uri: mxcUrl } = await client.uploadContent(file, {
-        name: "voice-message.ogg",
-        type: file.type,
-    });
-
     const content = {
         body: "Voice Message",
         info: {
@@ -1853,19 +2271,42 @@ export const sendAudioMessage = async (client: MatrixClient, roomId: string, fil
             duration: Math.round(duration * 1000), // duration in milliseconds
         },
         msgtype: MsgType.Audio,
-        url: mxcUrl,
+        url: undefined as unknown as string,
+    };
+    const sendDirect = async () => {
+        const { content_uri: mxcUrl } = await client.uploadContent(file, {
+            name: "voice-message.ogg",
+            type: file.type,
+        });
+        return client.sendEvent(roomId, EventType.RoomMessage, { ...content, url: mxcUrl } as any);
     };
 
-    return client.sendEvent(roomId, EventType.RoomMessage, content as any);
+    const queueOutbox = async () => {
+        const attachment = await serializeOutboxAttachment(file, {
+            name: 'voice-message.ogg',
+            contentPath: 'url',
+            kind: 'audio',
+        });
+        const localId = await enqueueOutbox(roomId, EventType.RoomMessage, content, { attachments: [attachment] });
+        return { event_id: localId };
+    };
+
+    if (isOffline()) {
+        return queueOutbox();
+    }
+
+    try {
+        return await sendDirect();
+    } catch (error) {
+        if (shouldQueueFromError(error)) {
+            return queueOutbox();
+        }
+        throw error;
+    }
 };
 
 
 export const sendFileMessage = async (client: MatrixClient, roomId: string, file: File): Promise<{ event_id: string }> => {
-    const { content_uri: mxcUrl } = await client.uploadContent(file, {
-        name: file.name,
-        type: file.type,
-    });
-
     const content = {
         body: file.name,
         info: {
@@ -1873,10 +2314,38 @@ export const sendFileMessage = async (client: MatrixClient, roomId: string, file
             size: file.size,
         },
         msgtype: MsgType.File,
-        url: mxcUrl,
+        url: undefined as unknown as string,
+    };
+    const sendDirect = async () => {
+        const { content_uri: mxcUrl } = await client.uploadContent(file, {
+            name: file.name,
+            type: file.type,
+        });
+        return client.sendEvent(roomId, EventType.RoomMessage, { ...content, url: mxcUrl } as any);
     };
 
-    return client.sendEvent(roomId, EventType.RoomMessage, content as any);
+    const queueOutbox = async () => {
+        const attachment = await serializeOutboxAttachment(file, {
+            name: file.name,
+            contentPath: 'url',
+            kind: 'file',
+        });
+        const localId = await enqueueOutbox(roomId, EventType.RoomMessage, content, { attachments: [attachment] });
+        return { event_id: localId };
+    };
+
+    if (isOffline()) {
+        return queueOutbox();
+    }
+
+    try {
+        return await sendDirect();
+    } catch (error) {
+        if (shouldQueueFromError(error)) {
+            return queueOutbox();
+        }
+        throw error;
+    }
 };
 
 export const sendStickerMessage = async (client: MatrixClient, roomId: string, stickerUrl: string, body: string, info: Sticker['info']): Promise<{ event_id: string }> => {
@@ -1887,23 +2356,29 @@ export const sendStickerMessage = async (client: MatrixClient, roomId: string, s
         msgtype: 'm.sticker',
     };
     // The matrix-js-sdk doesn't have m.sticker in its standard event types, so we cast to any.
-    return client.sendEvent(roomId, 'm.sticker' as any, content);
+    if (isOffline()) {
+        const localId = await enqueueOutbox(roomId, 'm.sticker', content);
+        return { event_id: localId };
+    }
+
+    try {
+        return await client.sendEvent(roomId, 'm.sticker' as any, content);
+    } catch (error) {
+        if (shouldQueueFromError(error)) {
+            const localId = await enqueueOutbox(roomId, 'm.sticker', content);
+            return { event_id: localId };
+        }
+        throw error;
+    }
 };
 
 export const sendGifMessage = async (client: MatrixClient, roomId: string, gif: Gif): Promise<{ event_id: string }> => {
     // We send GIFs as m.image events. We add a custom flag to help our UI distinguish it.
     const { url, title, dims } = gif;
-    
+
     // FIX: The `uploadContentFromUrl` method does not exist on the MatrixClient type.
     // The correct procedure is to fetch the content from the URL, convert it to a Blob,
     // and then upload it using `uploadContent`.
-    const response = await fetch(url);
-    const blob = await response.blob();
-    const { content_uri: mxcUrl } = await client.uploadContent(blob, {
-        name: title,
-        type: 'image/gif',
-    });
-
     const content = {
         body: title,
         info: {
@@ -1913,10 +2388,41 @@ export const sendGifMessage = async (client: MatrixClient, roomId: string, gif: 
             'xyz.amorgan.is_gif': true,
         },
         msgtype: MsgType.Image,
-        url: mxcUrl,
+        url: undefined as unknown as string,
+    };
+    const sendDirect = async () => {
+        const response = await fetch(url);
+        const blob = await response.blob();
+        const { content_uri: mxcUrl } = await client.uploadContent(blob, {
+            name: title,
+            type: 'image/gif',
+        });
+        return client.sendEvent(roomId, EventType.RoomMessage, { ...content, url: mxcUrl } as any);
     };
 
-    return client.sendEvent(roomId, EventType.RoomMessage, content as any);
+    const queueOutbox = async () => {
+        const attachment = createRemoteOutboxAttachment(url, {
+            name: title,
+            mimeType: 'image/gif',
+            kind: 'image',
+            contentPath: 'url',
+        });
+        const localId = await enqueueOutbox(roomId, EventType.RoomMessage, content, { attachments: [attachment] });
+        return { event_id: localId };
+    };
+
+    if (isOffline()) {
+        return queueOutbox();
+    }
+
+    try {
+        return await sendDirect();
+    } catch (error) {
+        if (shouldQueueFromError(error)) {
+            return queueOutbox();
+        }
+        throw error;
+    }
 };
 
 export const sendReaction = async (client: MatrixClient, roomId: string, eventId: string, emoji: string): Promise<void> => {
@@ -1927,7 +2433,20 @@ export const sendReaction = async (client: MatrixClient, roomId: string, eventId
             'key': emoji,
         },
     };
-    await client.sendEvent(roomId, EventType.Reaction, content as any);
+    if (isOffline()) {
+        await enqueueOutbox(roomId, EventType.Reaction, content);
+        return;
+    }
+
+    try {
+        await client.sendEvent(roomId, EventType.Reaction, content as any);
+    } catch (error) {
+        if (shouldQueueFromError(error)) {
+            await enqueueOutbox(roomId, EventType.Reaction, content);
+            return;
+        }
+        throw error;
+    }
 };
 
 export const sendTypingIndicator = async (client: MatrixClient, roomId: string, isTyping: boolean): Promise<void> => {
@@ -2020,31 +2539,106 @@ export const setAvatar = async (client: MatrixClient, file: File): Promise<void>
     }
 };
 
-export const createRoom = async (client: MatrixClient, options: { name: string, topic?: string, isPublic: boolean, isEncrypted: boolean }): Promise<string> => {
+const SLOW_MODE_EVENT_TYPE = 'org.matrix.msc3946.room.slow_mode';
+
+export const createRoom = async (client: MatrixClient, options: RoomCreationOptions): Promise<string> => {
     try {
-        // FIX: Replaced `RoomCreateOptions` with the correct type `ICreateRoomOpts`.
+        const slowModeSeconds = typeof options.slowModeSeconds === 'number'
+            ? Math.max(0, Math.floor(options.slowModeSeconds))
+            : undefined;
+
         const createOptions: ICreateRoomOpts = {
             name: options.name,
             topic: options.topic,
-            // FIX: Use Visibility enum instead of string literals for type safety.
             visibility: options.isPublic ? Visibility.Public : Visibility.Private,
+            preset: options.isPublic
+                ? Preset.PublicChat
+                : options.isEncrypted
+                    ? Preset.TrustedPrivateChat
+                    : Preset.PrivateChat,
         };
-        if (options.isEncrypted) {
-            createOptions.initial_state = [
-                {
-                    // FIX: This is a typing issue in the matrix-js-sdk where `m.room.encryption` is not
-                    // considered a valid key of `TimelineEvents`. Using @ts-ignore is a safe workaround
-                    // to bypass this strict compiler check for state events.
-                    // @ts-ignore
-                    type: EventType.RoomEncryption,
-                    state_key: "",
-                    content: {
-                        algorithm: "m.megolm.v1.aes-sha2",
-                    },
-                },
-            ];
+
+        if (options.roomAliasName) {
+            createOptions.room_alias_name = options.roomAliasName;
         }
+
+        const creationContent: Record<string, unknown> = {};
+        if (options.disableFederation) {
+            creationContent['m.federate'] = false;
+        }
+        if (Object.keys(creationContent).length > 0) {
+            createOptions.creation_content = creationContent;
+        }
+
+        if (options.mode === 'channel') {
+            createOptions.power_level_content_override = {
+                users_default: 0,
+                events_default: 0,
+                state_default: 50,
+                notifications: { room: 50 },
+                events: {
+                    [EventType.RoomMessage]: 50,
+                    'm.room.encrypted': 50,
+                    [EventType.Reaction]: 50,
+                    [EventType.RoomRedaction]: 50,
+                    'm.sticker': 50,
+                },
+            } as any;
+        }
+
+        const initialState: NonNullable<ICreateRoomOpts['initial_state']> = [];
+
+        if (options.isEncrypted) {
+            initialState.push({
+                // @ts-ignore - matrix-js-sdk typings do not expose m.room.encryption as a valid state key
+                type: EventType.RoomEncryption,
+                state_key: '',
+                content: {
+                    algorithm: 'm.megolm.v1.aes-sha2',
+                },
+            });
+        }
+
+        const joinRule = options.requireInvite || !options.isPublic ? 'invite' : 'public';
+        initialState.push({
+            type: EventType.RoomJoinRules,
+            state_key: '',
+            content: { join_rule: joinRule },
+        } as any);
+
+        if (options.historyVisibility) {
+            initialState.push({
+                type: EventType.RoomHistoryVisibility,
+                state_key: '',
+                content: { history_visibility: options.historyVisibility },
+            } as any);
+        }
+
+        if (slowModeSeconds && slowModeSeconds > 0) {
+            initialState.push({
+                type: SLOW_MODE_EVENT_TYPE as unknown as EventType,
+                state_key: '',
+                content: {
+                    enabled: true,
+                    seconds: slowModeSeconds,
+                },
+            } as any);
+        }
+
+        if (initialState.length > 0) {
+            createOptions.initial_state = initialState;
+        }
+
         const { room_id } = await client.createRoom(createOptions);
+
+        if (options.initialPost) {
+            try {
+                await client.sendTextMessage(room_id, options.initialPost);
+            } catch (error) {
+                console.error('Failed to send initial announcement:', error);
+            }
+        }
+
         return room_id;
     } catch(error) {
         console.error("Failed to create room:", error);

@@ -43,13 +43,38 @@ const AuthenticatedNavigator = () => {
 };
 
 const RootNavigator = () => {
-  const { session, loginWithPassword, isLoading, error } = useMatrixSession();
+  const {
+    session,
+    loginWithPassword,
+    loginWithToken,
+    loginWithSso,
+    beginQrLogin,
+    cancelQrLogin,
+    qrLoginState,
+    mfaState,
+    isLoading,
+    error,
+    clearError,
+  } = useMatrixSession();
 
   if (!session) {
     return (
       <Stack.Navigator screenOptions={{ headerShown: false }}>
         <Stack.Screen name="Login">
-          {() => <LoginScreen onSubmit={loginWithPassword} loading={isLoading} error={error} />}
+          {() => (
+            <LoginScreen
+              onSubmit={loginWithPassword}
+              onTokenLogin={loginWithToken}
+              onSsoLogin={loginWithSso}
+              onGenerateQr={beginQrLogin}
+              onCancelQr={cancelQrLogin}
+              loading={isLoading}
+              error={error}
+              qrState={qrLoginState}
+              mfaState={mfaState}
+              onClearError={clearError}
+            />
+          )}
         </Stack.Screen>
       </Stack.Navigator>
     );
