@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { ClientEvent, EventType, NotificationCountType, RoomEvent } from 'matrix-js-sdk';
-import { MatrixClient, MatrixEvent, MatrixRoom, Room as UIRoom } from '../types';
+import { MatrixClient, MatrixEvent, MatrixRoom, Room as UIRoom, RoomNotificationMode } from '../types';
 import { mxcToHttp } from '../services/matrixService';
 import { parseMatrixEvent } from '../utils/parseMatrixEvent';
+import { useAccountStore } from '../services/accountManager';
 
 export type ChatRoomType = 'all' | 'direct' | 'group' | 'saved';
 export type ChatRoomStatus = 'all' | 'joined' | 'invited' | 'left';
@@ -44,6 +45,10 @@ export function useChats({ client, savedMessagesRoomId }: UseChatsOptions): UseC
     const [searchTerm, setSearchTerm] = useState('');
     const [roomTypeFilter, setRoomTypeFilter] = useState<ChatRoomType>('all');
     const [statusFilter, setStatusFilter] = useState<ChatRoomStatus>('joined');
+    const roomNotificationModes = useAccountStore<Record<string, RoomNotificationMode>>(state => {
+        const activeKey = state.activeKey;
+        return activeKey ? (state.accounts[activeKey]?.roomNotificationModes ?? {}) : {};
+    });
 
     const buildRoom = useCallback((room: MatrixRoom): UIRoom | null => {
         if (!room) return null;
@@ -71,8 +76,9 @@ export function useChats({ client, savedMessagesRoomId }: UseChatsOptions): UseC
             status,
             lastMessagePreview: lastMessage?.content.body ?? null,
             lastMessageAt: lastMessage?.timestamp ?? lastEvent?.getTs() ?? null,
+            notificationMode: roomNotificationModes[room.roomId],
         } as UIRoom & { roomType: Exclude<ChatRoomType, 'all'>; status: ChatRoomStatus; lastMessagePreview: string | null; lastMessageAt: number | null; };
-    }, [client, savedMessagesRoomId]);
+    }, [client, roomNotificationModes, savedMessagesRoomId]);
 
     const refresh = useCallback(() => {
         const matrixRooms = client.getRooms();

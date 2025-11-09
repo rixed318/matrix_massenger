@@ -24,6 +24,7 @@ const createRoom = (overrides: Partial<Room> = {}): Room => ({
     status: 'joined',
     lastMessagePreview: null,
     lastMessageAt: null,
+    notificationMode: 'all',
     ...overrides,
 });
 
@@ -84,11 +85,45 @@ describe('ChatHeader', () => {
                 onOpenSearch={vi.fn()}
                 typingUsers={[]}
                 connectionStatus="online"
+                onNotificationModeChange={vi.fn()}
+                onMuteRoom={vi.fn()}
             />
         );
 
         fireEvent.click(screen.getByTitle('Start a call'));
         fireEvent.click(screen.getByText(/Voice call/i));
         expect(onPlaceCall).toHaveBeenCalledWith('voice');
+    });
+
+    it('allows switching notification modes from the notifications menu', () => {
+        const onNotificationModeChange = vi.fn();
+        const onMuteRoom = vi.fn();
+        render(
+            <ChatHeader
+                room={createRoom({ notificationMode: 'mentions' })}
+                canInvite
+                onOpenInvite={vi.fn()}
+                pinnedMessage={null}
+                onPinToggle={vi.fn()}
+                scheduledMessageCount={0}
+                onOpenViewScheduled={vi.fn()}
+                isDirectMessageRoom
+                onPlaceCall={vi.fn()}
+                onOpenSearch={vi.fn()}
+                typingUsers={[]}
+                connectionStatus="online"
+                notificationMode="mentions"
+                onNotificationModeChange={onNotificationModeChange}
+                onMuteRoom={onMuteRoom}
+            />
+        );
+
+        fireEvent.click(screen.getByTitle('Notifications'));
+        fireEvent.click(screen.getByText(/Enabled/i));
+        expect(onNotificationModeChange).toHaveBeenCalledWith('all');
+
+        fireEvent.click(screen.getByTitle('Notifications'));
+        fireEvent.click(screen.getByText(/Muted/i));
+        expect(onMuteRoom).toHaveBeenCalled();
     });
 });
