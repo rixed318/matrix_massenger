@@ -34,7 +34,7 @@ import GroupCallView from './GroupCallView';
 import CallParticipantsPanel from './CallParticipantsPanel';
 import SearchModal from './SearchModal';
 import { SearchResultItem } from '@matrix-messenger/core';
-import type { DraftContent, SendKeyBehavior, DraftAttachment } from '../types';
+import type { DraftContent, SendKeyBehavior, DraftAttachment, DraftAttachmentKind } from '../types';
 import SharedMediaPanel from './SharedMediaPanel';
 import type { RoomMediaSummary, SharedMediaCategory, RoomMediaItem } from '@matrix-messenger/core';
 // FIX: The `matrix-js-sdk` exports event names as enums. Import them to use with the event emitter.
@@ -128,35 +128,279 @@ const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, s
     const [sharedMediaData, setSharedMediaData] = useState<RoomMediaSummary | null>(null);
     const [isSharedMediaLoading, setIsSharedMediaLoading] = useState(false);
     const [isSharedMediaPaginating, setIsSharedMediaPaginating] = useState(false);
+
+    const inferMsgtypeFromAttachment = (attachment: DraftAttachment): string | undefined => {
+        if (attachment.msgtype) {
+            return attachment.msgtype;
+        }
+        switch (attachment.kind) {
+            case 'image':
+            case 'gif':
+                return MsgType.Image;
+            case 'audio':
+            case 'voice':
+                return MsgType.Audio;
+            case 'sticker':
+                return 'm.sticker';
+            case 'file':
+            default:
+                return MsgType.File;
+        }
+    };
+
+    const prepareScheduledContent = useCallback((draft: DraftContent): DraftContent => {
+        const normalized = normalizeDraft(draft);
+        const hasPlain = normalized.plain.trim().length > 0;
+        const hasAttachments = normalized.attachments.length > 0;
+        const inferredMsgtype = normalized.msgtype
+            ?? (hasAttachments ? inferMsgtypeFromAttachment(normalized.attachments[0]) : undefined)
+            ?? (hasPlain ? MsgType.Text : undefined);
+
+        return {
+            ...normalized,
+            msgtype: inferredMsgtype,
+        };
+    }, []);
+
+    const resolveAttachmentSource = useCallback((attachment: DraftAttachment): string | null => {
+        if (attachment.dataUrl) {
+            return attachment.dataUrl;
+        }
+        if (attachment.tempUrl) {
+            return attachment.tempUrl;
+        }
+        if (attachment.url) {
+            if (attachment.url.startsWith('mxc://')) {
+                const httpUrl = mxcToHttp(client, attachment.url);
+                return httpUrl ?? attachment.url;
+            }
+            return attachment.url;
+        }
+        return null;
+    }, [client]);
+
+    const fetchAttachmentBlob = useCallback(async (attachment: DraftAttachment): Promise<Blob> => {
+        const source = resolveAttachmentSource(attachment);
+        if (!source) {
+            throw new Error(`Attachment ${attachment.id} is missing data`);
+        }
+        const response = await fetch(source);
+        if (!response.ok) {
+            throw new Error(`Failed to load attachment (${response.status})`);
+        }
+        return await response.blob();
+    }, [resolveAttachmentSource]);
+
+    const attachmentToFile = useCallback(async (attachment: DraftAttachment): Promise<File> => {
+        const blob = await fetchAttachmentBlob(attachment);
+        const type = attachment.mimeType || blob.type || 'application/octet-stream';
+        const name = attachment.name || `attachment-${attachment.id}`;
+        return new File([blob], name, { type, lastModified: Date.now() });
+    }, [fetchAttachmentBlob]);
+
+    const sendScheduledAttachment = useCallback(async (roomId: string, attachment: DraftAttachment): Promise<void> => {
+        switch (attachment.kind) {
+            case 'sticker': {
+                if (!attachment.url) {
+                    throw new Error('Sticker attachment is missing url');
+                }
+                const allowedStickerTypes: Sticker['info']['mimetype'][] = ['image/svg+xml', 'image/png', 'image/webp'];
+                const stickerMimetype = allowedStickerTypes.includes(attachment.mimeType as Sticker['info']['mimetype'])
+                    ? attachment.mimeType as Sticker['info']['mimetype']
+                    : 'image/png';
+                await sendStickerMessage(client, roomId, attachment.url, attachment.body ?? attachment.name, {
+                    w: attachment.width ?? 0,
+                    h: attachment.height ?? 0,
+                    mimetype: stickerMimetype,
+                    size: attachment.size,
+                });
+                break;
+            }
+            case 'gif': {
+                const source = resolveAttachmentSource(attachment);
+                if (!source) {
+                    throw new Error('GIF attachment is missing data');
+                }
+                const gifPayload: Gif = {
+                    id: attachment.id,
+                    url: source,
+                    previewUrl: attachment.thumbnailUrl ?? source,
+                    title: attachment.name,
+                    dims: [attachment.width ?? 0, attachment.height ?? 0],
+                };
+                await sendGifMessage(client, roomId, gifPayload);
+                break;
+            }
+            case 'image': {
+                const file = await attachmentToFile(attachment);
+                await sendImageMessage(client, roomId, file);
+                break;
+            }
+            case 'audio':
+            case 'voice': {
+                const blob = await fetchAttachmentBlob(attachment);
+                const audioType = attachment.mimeType || blob.type || 'audio/ogg';
+                const normalizedBlob = blob.type === audioType ? blob : blob.slice(0, blob.size, audioType);
+                const durationRaw = attachment.duration ?? 0;
+                const durationSeconds = durationRaw > 1000 ? Math.round(durationRaw / 1000) : Math.round(durationRaw);
+                await sendAudioMessage(client, roomId, normalizedBlob, durationSeconds > 0 ? durationSeconds : 0);
+                break;
+            }
+            case 'file':
+            default: {
+                const file = await attachmentToFile(attachment);
+                await sendFileMessage(client, roomId, file);
+                break;
+            }
+        }
+    }, [attachmentToFile, client, resolveAttachmentSource]);
+
+    const dispatchScheduledMessage = useCallback(async (message: ScheduledMessage): Promise<void> => {
+        const prepared = prepareScheduledContent(message.content);
+        const hasAttachments = prepared.attachments.length > 0;
+        const plainBody = prepared.plain.trim();
+
+        if (hasAttachments) {
+            for (const attachment of prepared.attachments) {
+                await sendScheduledAttachment(message.roomId, attachment);
+            }
+            if (plainBody) {
+                await sendMessage(client, message.roomId, { body: plainBody, formattedBody: prepared.formatted });
+            }
+            return;
+        }
+
+        if (!plainBody) {
+            throw new Error('Scheduled message has no content');
+        }
+
+        await sendMessage(client, message.roomId, { body: plainBody, formattedBody: prepared.formatted });
+    }, [client, prepareScheduledContent, sendScheduledAttachment]);
+    const ATTACHMENT_KINDS: DraftAttachmentKind[] = ['file', 'image', 'audio', 'voice', 'sticker', 'gif'];
+
     const normalizeAttachments = (attachments: unknown): DraftAttachment[] => {
         if (!Array.isArray(attachments)) return [];
-        return attachments.flatMap(item => {
-            if (!item || typeof item !== 'object') return [];
-            const { id, name, size, mimeType, dataUrl, kind } = item as Partial<DraftAttachment> & Record<string, unknown>;
-            if (typeof id !== 'string' || typeof name !== 'string' || typeof dataUrl !== 'string') {
-                return [];
+
+        const toString = (value: unknown): string | undefined =>
+            typeof value === 'string' && value.length > 0 ? value : undefined;
+        const toNumber = (value: unknown): number | undefined => {
+            if (typeof value === 'number' && !Number.isNaN(value)) return value;
+            if (typeof value === 'string') {
+                const parsed = Number(value);
+                if (!Number.isNaN(parsed)) return parsed;
             }
-            return [{
+            return undefined;
+        };
+
+        return attachments.flatMap((item, index) => {
+            if (!item || typeof item !== 'object') return [];
+            const record = item as Record<string, unknown> & {
+                info?: Record<string, unknown>;
+                metadata?: Record<string, unknown>;
+            };
+
+            const id = toString(record.id) ?? `attachment_${Date.now()}_${index}`;
+            const name = toString(record.name) ?? toString(record.body) ?? 'attachment';
+
+            const info = record.info ?? {};
+            const metadata = record.metadata ?? {};
+
+            const mimeType = toString(record.mimeType)
+                ?? toString(info?.mimetype)
+                ?? toString(metadata?.mimeType)
+                ?? 'application/octet-stream';
+
+            const size = toNumber(record.size)
+                ?? toNumber(metadata?.size)
+                ?? 0;
+
+            const explicitKind = toString(record.kind);
+            const inferredKind: DraftAttachmentKind = explicitKind && ATTACHMENT_KINDS.includes(explicitKind as DraftAttachmentKind)
+                ? explicitKind as DraftAttachmentKind
+                : mimeType.startsWith('image/')
+                    ? 'image'
+                    : mimeType.startsWith('audio/')
+                        ? 'audio'
+                        : 'file';
+
+            const attachment: DraftAttachment = {
                 id,
                 name,
-                size: typeof size === 'number' ? size : 0,
-                mimeType: typeof mimeType === 'string' ? mimeType : 'application/octet-stream',
-                dataUrl,
-                kind: kind === 'file' ? 'file' : 'file',
-            }];
+                size,
+                mimeType,
+                kind: inferredKind,
+            };
+
+            const dataUrl = toString(record.dataUrl);
+            if (dataUrl) attachment.dataUrl = dataUrl;
+
+            const tempUrl = toString(record.tempUrl) ?? toString((record as any).blobUrl);
+            if (tempUrl) attachment.tempUrl = tempUrl;
+
+            const url = toString(record.url);
+            if (url) attachment.url = url;
+
+            const thumbnailUrl = toString((record as any).thumbnailUrl) ?? toString((record as any).previewUrl);
+            if (thumbnailUrl) attachment.thumbnailUrl = thumbnailUrl;
+
+            const width = toNumber(record.width) ?? toNumber(info?.w);
+            if (typeof width === 'number') attachment.width = width;
+
+            const height = toNumber(record.height) ?? toNumber(info?.h);
+            if (typeof height === 'number') attachment.height = height;
+
+            const duration = toNumber(record.duration) ?? toNumber(info?.duration);
+            if (typeof duration === 'number') attachment.duration = duration;
+
+            const waveformSource = Array.isArray((record as any).waveform)
+                ? (record as any).waveform
+                : Array.isArray(metadata?.waveform)
+                    ? metadata.waveform
+                    : undefined;
+            if (Array.isArray(waveformSource)) {
+                const waveform = waveformSource
+                    .map(entry => (typeof entry === 'number' ? entry : Number(entry)))
+                    .filter(entry => typeof entry === 'number' && !Number.isNaN(entry));
+                if (waveform.length > 0) {
+                    attachment.waveform = waveform;
+                }
+            }
+
+            const body = toString(record.body);
+            if (body) attachment.body = body;
+
+            const msgtype = toString(record.msgtype);
+            if (msgtype) attachment.msgtype = msgtype;
+
+            return [attachment];
         });
     };
+
+    const serializeAttachmentForComparison = (attachment: DraftAttachment) => ({
+        id: attachment.id,
+        name: attachment.name,
+        size: attachment.size,
+        mimeType: attachment.mimeType,
+        kind: attachment.kind,
+        dataUrl: attachment.dataUrl ?? null,
+        tempUrl: attachment.tempUrl ?? null,
+        url: attachment.url ?? null,
+        thumbnailUrl: attachment.thumbnailUrl ?? null,
+        width: attachment.width ?? null,
+        height: attachment.height ?? null,
+        duration: attachment.duration ?? null,
+        waveform: attachment.waveform ?? null,
+        body: attachment.body ?? null,
+        msgtype: attachment.msgtype ?? null,
+    });
 
     const areAttachmentsEqual = (a: DraftAttachment[], b: DraftAttachment[]) => {
         if (a.length !== b.length) return false;
         return a.every((att, index) => {
             const other = b[index];
-            return other
-                && att.id === other.id
-                && att.name === other.name
-                && att.mimeType === other.mimeType
-                && att.size === other.size
-                && att.dataUrl === other.dataUrl;
+            if (!other) return false;
+            return JSON.stringify(serializeAttachmentForComparison(att))
+                === JSON.stringify(serializeAttachmentForComparison(other));
         });
     };
 
@@ -168,14 +412,15 @@ const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, s
                 : typeof draft.content === 'string'
                     ? draft.content
                     : '';
-            const formatted = typeof draft.formatted === 'string' ? draft.formatted : plain;
+            const formatted = typeof draft.formatted === 'string' ? draft.formatted : undefined;
+            const msgtype = typeof draft.msgtype === 'string' ? draft.msgtype : undefined;
             const attachments = normalizeAttachments(draft.attachments);
-            return { plain, formatted, attachments };
+            return { plain, formatted, attachments, msgtype };
         }
         if (typeof value === 'string') {
-            return { plain: value, formatted: value, attachments: [] };
+            return { plain: value, formatted: undefined, attachments: [], msgtype: MsgType.Text };
         }
-        return { plain: '', formatted: '', attachments: [] };
+        return { plain: '', formatted: undefined, attachments: [], msgtype: undefined };
     };
 
     const [drafts, setDrafts] = useState<Record<string, DraftContent>>(() => {
@@ -743,7 +988,7 @@ const handleSetChatBackground = (bgUrl: string) => {
 
                     try {
                         console.log(`Sending scheduled message ${message.id} to room ${message.roomId}`);
-                        await sendMessage(client, message.roomId, message.content);
+                        await dispatchScheduledMessage(message);
                         await markScheduledMessageSent(client, message.id);
                     } catch (error) {
                         console.error(`Failed to send scheduled message ${message.id}:`, error);
@@ -764,7 +1009,7 @@ const handleSetChatBackground = (bgUrl: string) => {
             isDisposed = true;
             window.clearInterval(interval);
         };
-    }, [client]);
+    }, [client, dispatchScheduledMessage]);
 
 
     useEffect(() => {
@@ -1167,7 +1412,7 @@ const handleSetChatBackground = (bgUrl: string) => {
             if (prev[selectedRoomId] !== undefined) {
                 return prev;
             }
-            return { ...prev, [selectedRoomId]: { plain: '', formatted: '', attachments: [] } };
+            return { ...prev, [selectedRoomId]: { plain: '', formatted: undefined, attachments: [], msgtype: undefined } };
         });
 
         let isActive = true;
@@ -1369,7 +1614,7 @@ const handleSetChatBackground = (bgUrl: string) => {
                 isUploading: true
             } as any;
             setMessages(prev => [...prev, tempMessage]);
-            setDrafts(prev => ({ ...prev, [roomId]: { plain: '', formatted: '', attachments: [] } }));
+            setDrafts(prev => ({ ...prev, [roomId]: { plain: '', formatted: undefined, attachments: [], msgtype: undefined } }));
             setReplyingTo(null);
             setIsSending(false);
             return;
@@ -1389,7 +1634,7 @@ const handleSetChatBackground = (bgUrl: string) => {
                 if (existing && existing.plain === '' && existing.attachments.length === 0) {
                     return prev;
                 }
-                return { ...prev, [roomId]: { plain: '', formatted: '', attachments: [] } };
+                return { ...prev, [roomId]: { plain: '', formatted: undefined, attachments: [], msgtype: undefined } };
             });
         } catch (error) {
             console.error('Failed to send message:', error);
@@ -1669,12 +1914,16 @@ const handleSetChatBackground = (bgUrl: string) => {
     };
 
     const handleConfirmSchedule = async (sendAt: number) => {
-        if (selectedRoomId && contentToSchedule?.plain.trim()) {
-            try {
-                await addScheduledMessage(client, selectedRoomId, contentToSchedule.plain, sendAt);
-                setAllScheduledMessages(await getScheduledMessages(client));
-            } catch (error) {
-                console.error('Failed to schedule message', error);
+        if (selectedRoomId && contentToSchedule) {
+            const preparedContent = prepareScheduledContent(contentToSchedule);
+            const hasContent = preparedContent.plain.trim().length > 0 || preparedContent.attachments.length > 0 || !!preparedContent.msgtype;
+            if (hasContent) {
+                try {
+                    await addScheduledMessage(client, selectedRoomId, preparedContent, sendAt);
+                    setAllScheduledMessages(await getScheduledMessages(client));
+                } catch (error) {
+                    console.error('Failed to schedule message', error);
+                }
             }
         }
         setIsScheduleModalOpen(false);
@@ -1697,7 +1946,7 @@ const handleSetChatBackground = (bgUrl: string) => {
         }
 
         try {
-            await sendMessage(client, msg.roomId, msg.content);
+            await dispatchScheduledMessage(msg);
             await markScheduledMessageSent(client, msg.id);
         } catch (error) {
             console.error(`Failed to send scheduled message ${id} immediately:`, error);
@@ -2149,5 +2398,3 @@ const handleSetChatBackground = (bgUrl: string) => {
 };
 
 export default ChatPage;
-{/* OFFLINE STATUS */}
-</>
