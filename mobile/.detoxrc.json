@@ -1,0 +1,40 @@
+{
+  "testRunner": "jest",
+  "runnerConfig": "e2e/jest.config.js",
+  "apps": {
+    "ios.sim.debug": {
+      "type": "ios.app",
+      "build": "expo run:ios --scheme ExpoGo",
+      "binaryPath": "ios/build/Build/Products/Debug-iphonesimulator/MatrixMessenger.app"
+    },
+    "android.emu.debug": {
+      "type": "android.apk",
+      "build": "expo run:android --variant debug",
+      "binaryPath": "android/app/build/outputs/apk/debug/app-debug.apk"
+    }
+  },
+  "devices": {
+    "ios.sim": {
+      "type": "ios.simulator",
+      "device": {
+        "type": "iPhone 15"
+      }
+    },
+    "android.emu": {
+      "type": "android.emulator",
+      "device": {
+        "avdName": "Pixel_6_API_34"
+      }
+    }
+  },
+  "configurations": {
+    "ios.sim.debug": {
+      "device": "ios.sim",
+      "app": "ios.sim.debug"
+    },
+    "android.emu.debug": {
+      "device": "android.emu",
+      "app": "android.emu.debug"
+    }
+  }
+}

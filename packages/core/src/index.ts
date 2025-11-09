@@ -9,3 +9,7 @@ export * from '../../../src/services/secureCloudService';
 export * from '../../../src/services/gifService';
 export * from '../../../src/services/notificationService';
 export * from '../../../src/services/searchService';
+export * from '../../../src/hooks/useChats';
+export * from '../../../src/hooks/useRoomTimeline';
+export * from '../../../src/services/matrixRuntime';
+export * from '../../../src/services/matrixService';
