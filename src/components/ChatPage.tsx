@@ -38,19 +38,25 @@ import { SearchResultItem } from '@matrix-messenger/core';
 // FIX: Import event enums to use with the event emitter instead of string literals, which are not assignable.
 // FIX: `CallErrorCode` is not an exported member of `matrix-js-sdk`. It has been removed.
 import { NotificationCountType, EventType, MsgType, ClientEvent, RoomEvent, UserEvent, RelationType, CallEvent } from 'matrix-js-sdk';
-import { startSecureCloudSession, acknowledgeSuspiciousEvents } from '@matrix-messenger/core';
-import type { SuspiciousEventNotice, SecureCloudSession } from '@matrix-messenger/core';
+import { startSecureCloudSession, acknowledgeSuspiciousEvents } from '../services/secureCloudService';
+import type { SuspiciousEventNotice, SecureCloudSession } from '../services/secureCloudService';
+import { useAccountStore } from '../services/accountManager';
 
 interface ChatPageProps {
-    client: MatrixClient;
-    onLogout: () => void;
-    savedMessagesRoomId: string;
+    client?: MatrixClient;
+    onLogout?: () => void;
+    savedMessagesRoomId?: string;
 }
 
 const DRAFT_STORAGE_KEY = 'matrix-message-drafts';
 const DRAFT_ACCOUNT_DATA_EVENT = 'econix.message_drafts';
 
-const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoomId }) => {
+const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, savedMessagesRoomId: savedRoomIdProp }) => {
+    const activeRuntime = useAccountStore(state => (state.activeKey ? state.accounts[state.activeKey] : null));
+    const removeAccount = useAccountStore(state => state.removeAccount);
+    const client = (providedClient ?? activeRuntime?.client)!;
+    const savedMessagesRoomId = savedRoomIdProp ?? activeRuntime?.savedMessagesRoomId ?? '';
+    const logout = onLogout ?? (() => { void removeAccount(); });
     const [rooms, setRooms] = useState<UIRoom[]>([]);
     const [selectedRoomId, setSelectedRoomId] = useState<string | null>(null);
     const [messages, setMessages] = useState<Message[]>([]);
@@ -781,15 +787,41 @@ const handleSetChatBackground = (bgUrl: string) => {
             const roomData: UIRoom[] = sortedRooms.map(room => {
                 const lastEvent = room.timeline[room.timeline.length - 1];
                 const pinnedEvent = room.currentState.getStateEvents(EventType.RoomPinnedEvents, '');
+                const topicEvent = room.currentState.getStateEvents(EventType.RoomTopic, '');
+                const topicContent = topicEvent?.getContent?.();
+                const topic = typeof topicContent?.topic === 'string' ? topicContent.topic : undefined;
+                const canonicalAliasEvent = room.currentState.getStateEvents(EventType.RoomCanonicalAlias, '');
+                const canonicalAliasContent = canonicalAliasEvent?.getContent?.();
+                const canonicalAlias = typeof canonicalAliasContent?.alias === 'string'
+                    ? canonicalAliasContent.alias
+                    : (Array.isArray(canonicalAliasContent?.alt_aliases) && canonicalAliasContent.alt_aliases.length > 0
+                        ? canonicalAliasContent.alt_aliases[0]
+                        : undefined);
+                const roomType = room.getType() || null;
+                const isSpace = roomType === 'm.space';
+                const childEvents = room.currentState.getStateEvents(EventType.SpaceChild) as MatrixEvent[] | undefined;
+                const spaceChildIds = (Array.isArray(childEvents) ? childEvents : [])
+                    .map(ev => ev.getStateKey())
+                    .filter((id): id is string => !!id);
+                const parentEvents = room.currentState.getStateEvents(EventType.SpaceParent) as MatrixEvent[] | undefined;
+                const spaceParentIds = (Array.isArray(parentEvents) ? parentEvents : [])
+                    .map(ev => ev.getStateKey())
+                    .filter((id): id is string => !!id);
                 const uiRoom: UIRoom = {
                     roomId: room.roomId,
                     name: room.name,
+                    topic,
                     avatarUrl: mxcToHttp(client, room.getMxcAvatarUrl()),
                     lastMessage: lastEvent ? parseMatrixEvent(lastEvent) : null,
                     unreadCount: room.getUnreadNotificationCount(NotificationCountType.Total),
                     pinnedEvents: pinnedEvent?.getContent().pinned || [],
                     isEncrypted: client.isRoomEncrypted(room.roomId),
                     isDirectMessageRoom: room.getJoinedMemberCount() === 2,
+                    roomType,
+                    isSpace,
+                    spaceChildIds,
+                    spaceParentIds,
+                    canonicalAlias: canonicalAlias ?? null,
                 };
 
                 if (room.roomId === savedMessagesRoomId) {
@@ -1539,7 +1571,7 @@ if (isOffline) {
                 selectedRoomId={selectedRoomId}
                 onSelectRoom={handleSelectRoom}
                 isLoading={isLoading}
-                onLogout={onLogout}
+                onLogout={logout}
                 client={client}
                 onOpenSettings={() => setIsSettingsOpen(true)}
                 onOpenCreateRoom={() => setIsCreateRoomOpen(true)}

@@ -2,10 +2,11 @@ import React, { useState, FormEvent, useEffect } from 'react';
 import { MatrixClient } from '@matrix-messenger/core';
 import { login, resolveHomeserverBaseUrl, HomeserverDiscoveryError, register as registerAccount } from '@matrix-messenger/core';
 import ServerDeploymentWizard from './ServerDeploymentWizard';
+import { useAccountStore } from '../services/accountManager';
 
 interface LoginPageProps {
-  onLoginSuccess: (client: MatrixClient) => void;
-  initialError: string | null;
+  onLoginSuccess?: (client: MatrixClient) => void;
+  initialError?: string | null;
   savedAccounts?: { key: string; homeserver_url: string; user_id: string; access_token: string }[];
   isEmbedded?: boolean;
 }
@@ -480,49 +481,65 @@ const RegisterForm: React.FC<{
   );
 };
 
-const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess, initialError, savedAccounts = [], isEmbedded }) => {
+const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess, initialError, savedAccounts: savedAccountsProp, isEmbedded }) => {
+  const addAccount = useAccountStore(state => state.addClientAccount);
+  const savedAccountsFromStore = useAccountStore(state => Object.values(state.accounts).map(a => a.creds));
+  const storeError = useAccountStore(state => state.error);
+  const setStoreError = useAccountStore(state => state.setError);
+
+  const resolvedOnLoginSuccess = onLoginSuccess ?? addAccount;
+  const savedAccounts = savedAccountsProp ?? savedAccountsFromStore;
+  const initialErrorValue = initialError ?? storeError ?? null;
+
   const [isLoading, setIsLoading] = useState(false);
-  const [error, setError] = useState<string | null>(initialError);
+  const [error, setErrorState] = useState<string | null>(initialErrorValue);
   const [connectionType, setConnectionType] = useState<ConnectionType | null>(null);
   const [mode, setMode] = useState<AuthMode>('choose');
   const [showDeploymentWizard, setShowDeploymentWizard] = useState(false);
 
-  useEffect(() => setError(initialError), [initialError]);
+  const applyError = (value: string | null) => {
+    setErrorState(value);
+    setStoreError(value);
+  };
+
+  useEffect(() => {
+    applyError(initialErrorValue);
+  }, [initialErrorValue]);
 
   const handleLogin = async (homeserverInput: string, username: string, password: string) => {
-    setError(null);
+    applyError(null);
     setIsLoading(true);
     try {
       const baseUrl = await resolveHomeserverBaseUrl(homeserverInput);
       const client = await login(baseUrl, username, password);
-      onLoginSuccess(client);
+      await resolvedOnLoginSuccess(client);
     } catch (err: any) {
       console.error(err);
-      if (err instanceof HomeserverDiscoveryError) setError(err.message);
-      else if (err.message?.includes('M_FORBIDDEN')) setError('Неверный логин или пароль.');
-      else if (err.message?.includes('M_UNKNOWN_TOKEN')) setError('Токен недействителен.');
-      else setError(err.message || 'Вход не выполнен.');
+      if (err instanceof HomeserverDiscoveryError) applyError(err.message);
+      else if (err.message?.includes('M_FORBIDDEN')) applyError('Неверный логин или пароль.');
+      else if (err.message?.includes('M_UNKNOWN_TOKEN')) applyError('Токен недействителен.');
+      else applyError(err.message || 'Вход не выполнен.');
     } finally {
       setIsLoading(false);
     }
   };
 
   const handleRegister = async (homeserverUrl: string, username: string, password: string) => {
-    setError(null);
+    applyError(null);
     setIsLoading(true);
     try {
       const client = await registerAccount(homeserverUrl, username, password);
-      onLoginSuccess(client);
+      await resolvedOnLoginSuccess(client);
     } catch (err: any) {
       console.error(err);
-      setError(err.message || 'Регистрация не выполнена.');
+      applyError(err.message || 'Регистрация не выполнена.');
     } finally {
       setIsLoading(false);
     }
   };
 
   const resetToChoose = () => {
-    setError(null);
+    applyError(null);
     setConnectionType(null);
     setMode('choose');
   };
@@ -530,19 +547,19 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess, initialError, sav
   const handleDeploymentComplete = async (homeserverUrl: string, username: string, password: string) => {
     setShowDeploymentWizard(false);
     setIsLoading(true);
-    setError(null);
+    applyError(null);
 
     try {
       const resolvedUrl = await resolveHomeserverBaseUrl(homeserverUrl);
       const client = await login(resolvedUrl, username, password);
-      onLoginSuccess(client);
+      await resolvedOnLoginSuccess(client);
     } catch (err) {
       if (err instanceof HomeserverDiscoveryError) {
-        setError(err.message);
+        applyError(err.message);
       } else if (err instanceof Error) {
-        setError(err.message);
+        applyError(err.message);
       } else {
-        setError('Failed to connect to deployed server. Please try manual login.');
+        applyError('Failed to connect to deployed server. Please try manual login.');
       }
     } finally {
       setIsLoading(false);
@@ -575,7 +592,7 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess, initialError, sav
           error={error}
           onBack={resetToChoose}
           onSwitchToRegister={() => {
-            setError(null);
+            applyError(null);
             setMode('register');
           }}
         />
@@ -591,7 +608,7 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess, initialError, sav
           error={error}
           onBack={resetToChoose}
           onSwitchToLogin={() => {
-            setError(null);
+            applyError(null);
             setMode('login');
           }}
         />
@@ -658,7 +675,7 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess, initialError, sav
           <span className="text-xs text-indigo-200">Автоматическая установка Matrix на ваш VPS (5-10 мин)</span>
         </button>
         <SavedList />
-        {initialError && !error && <p className="text-error text-sm text-center">{initialError}</p>}
+        {initialErrorValue && !error && <p className="text-error text-sm text-center">{initialErrorValue}</p>}
       </div>
     );
   };
