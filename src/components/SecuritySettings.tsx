@@ -90,34 +90,95 @@ const SecuritySettings: React.FC<SecuritySettingsProps> = ({ client, isOpen, onC
   const [backupStatus, setBackupStatus] = useState(getKeyBackupStatus());
   const [feedback, setFeedback] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [devicesStatus, setDevicesStatus] = useState<string | null>(null);
+  const [devicesLoading, setDevicesLoading] = useState(false);
+  const [deviceToDelete, setDeviceToDelete] = useState<DeviceSummary | null>(null);
+  const [deletePassword, setDeletePassword] = useState('');
+  const [deleteLoading, setDeleteLoading] = useState(false);
+  const [deviceToRename, setDeviceToRename] = useState<DeviceSummary | null>(null);
+  const [renameValue, setRenameValue] = useState('');
+  const [renameLoading, setRenameLoading] = useState(false);
   const [qrState, setQrState] = useState<{ request: any | null; dataUrl: string | null; message: string | null }>({
     request: null,
     dataUrl: null,
     message: null,
   });
 
-  const refreshDevices = useCallback(() => {
+  const refreshDevices = useCallback(async () => {
     const userId = client.getUserId();
     if (!userId) return;
-    const rawDevices: any[] = client.getStoredDevicesForUser?.(userId) ?? [];
-    const mapped = rawDevices.map((device) => {
-      const trust = client.checkDeviceTrust?.(userId, device.deviceId);
-      const verified = Boolean(trust?.isLocallyVerified?.() || trust?.isCrossSigningVerified?.());
-      return {
-        deviceId: device.deviceId,
-        displayName: device.getDisplayName?.() || device.deviceId,
-        lastSeenIp: device.lastSeenIp,
-        lastSeenTs: device.lastSeenTs,
-        verified,
-        crossSigningVerified: Boolean(trust?.isCrossSigningVerified?.()),
-      } satisfies DeviceSummary;
-    });
-    setDevices(mapped);
+    setDevicesLoading(true);
+    setDevicesStatus('Обновление списка устройств...');
+    try {
+      const storedDevices: any[] = client.getStoredDevicesForUser?.(userId) ?? [];
+      const storedMap = new Map<string, any>();
+      storedDevices.forEach((device: any) => {
+        const id = device.deviceId ?? device.device_id;
+        if (id) storedMap.set(id, device);
+      });
+
+      let remoteDevices: any[] = [];
+      if (client.getDevices) {
+        try {
+          const response = await client.getDevices();
+          remoteDevices = response?.devices ?? [];
+        } catch (err) {
+          console.warn('Не удалось получить удалённые устройства', err);
+        }
+      }
+
+      const seenIds = new Set<string>();
+      const buildDeviceSummary = (raw: any): DeviceSummary | null => {
+        const deviceId = raw?.deviceId ?? raw?.device_id;
+        if (!deviceId) return null;
+        const stored = storedMap.get(deviceId) ?? raw;
+        const trust = client.checkDeviceTrust?.(userId, deviceId);
+        const verified = Boolean(trust?.isLocallyVerified?.() || trust?.isCrossSigningVerified?.());
+        return {
+          deviceId,
+          displayName:
+            stored?.getDisplayName?.() ??
+            stored?.display_name ??
+            raw?.display_name ??
+            raw?.displayName ??
+            deviceId,
+          lastSeenIp: raw?.last_seen_ip ?? raw?.lastSeenIp ?? stored?.lastSeenIp,
+          lastSeenTs: raw?.last_seen_ts ?? raw?.lastSeenTs ?? stored?.lastSeenTs,
+          verified,
+          crossSigningVerified: Boolean(trust?.isCrossSigningVerified?.()),
+        } satisfies DeviceSummary;
+      };
+
+      const mapped: DeviceSummary[] = [];
+      remoteDevices.forEach((device: any) => {
+        const summary = buildDeviceSummary(device);
+        if (summary) {
+          mapped.push(summary);
+          seenIds.add(summary.deviceId);
+        }
+      });
+
+      storedDevices.forEach((device: any) => {
+        const deviceId = device.deviceId ?? device.device_id;
+        if (!deviceId || seenIds.has(deviceId)) return;
+        const summary = buildDeviceSummary(device);
+        if (summary) mapped.push(summary);
+      });
+
+      mapped.sort((a, b) => a.displayName.localeCompare(b.displayName));
+      setDevices(mapped);
+      setDevicesStatus('Список устройств обновлён.');
+    } catch (err: any) {
+      setDevicesStatus('Не удалось обновить устройства.');
+      setError(`Ошибка обновления устройств: ${err?.message ?? err}`);
+    } finally {
+      setDevicesLoading(false);
+    }
   }, [client]);
 
   useEffect(() => {
     if (!isOpen) return;
-    refreshDevices();
+    void refreshDevices();
     setBackupStatus(getKeyBackupStatus());
     return () => {
       setDevices([]);
@@ -175,10 +236,89 @@ const SecuritySettings: React.FC<SecuritySettingsProps> = ({ client, isOpen, onC
       const userId = client.getUserId();
       if (!userId) throw new Error('Неизвестный пользователь.');
       await client.setDeviceVerified?.(userId, deviceId, true);
-      refreshDevices();
+      await refreshDevices();
       setFeedback('Устройство помечено как доверенное.');
     } catch (err: any) {
       setError(`Не удалось подтвердить устройство: ${err?.message ?? err}`);
+    }
+  };
+
+  const handleOpenDelete = (device: DeviceSummary) => {
+    setDeviceToDelete(device);
+    setDeletePassword('');
+    setError(null);
+    setFeedback(null);
+  };
+
+  const handleConfirmDelete = async () => {
+    if (!deviceToDelete) return;
+    setError(null);
+    setFeedback(null);
+    const userId = client.getUserId();
+    if (!userId) {
+      setError('Неизвестный пользователь.');
+      return;
+    }
+    setDeleteLoading(true);
+    try {
+      if (client.deleteDevice) {
+        if (!deletePassword) {
+          throw new Error('Введите пароль для подтверждения.');
+        }
+        await client.deleteDevice(deviceToDelete.deviceId, {
+          auth: {
+            type: 'm.login.password',
+            identifier: { type: 'm.id.user', user: userId },
+            password: deletePassword,
+          },
+        } as any);
+      } else if (client.setDeviceBlocked) {
+        await client.setDeviceBlocked(userId, deviceToDelete.deviceId, true);
+      } else {
+        throw new Error('Клиент не поддерживает завершение сеансов.');
+      }
+      setDeviceToDelete(null);
+      setDeletePassword('');
+      await refreshDevices();
+      setFeedback('Сеанс завершён.');
+    } catch (err: any) {
+      setError(`Не удалось завершить сеанс: ${err?.message ?? err}`);
+    } finally {
+      setDeleteLoading(false);
+    }
+  };
+
+  const handleOpenRename = (device: DeviceSummary) => {
+    setDeviceToRename(device);
+    setRenameValue(device.displayName);
+    setError(null);
+    setFeedback(null);
+  };
+
+  const handleConfirmRename = async () => {
+    if (!deviceToRename) return;
+    setError(null);
+    setFeedback(null);
+    const newName = renameValue.trim();
+    if (!newName) {
+      setError('Введите новое имя устройства.');
+      return;
+    }
+    if (!client.setDeviceDetails) {
+      setError('Клиент не поддерживает переименование устройств.');
+      return;
+    }
+    setRenameLoading(true);
+    try {
+      await client.setDeviceDetails(deviceToRename.deviceId, { display_name: newName });
+      setDeviceToRename(null);
+      setRenameValue('');
+      await refreshDevices();
+      setFeedback('Имя устройства обновлено.');
+    } catch (err: any) {
+      setError(`Не удалось переименовать устройство: ${err?.message ?? err}`);
+    } finally {
+      setRenameLoading(false);
     }
   };
 
@@ -314,15 +454,32 @@ const SecuritySettings: React.FC<SecuritySettingsProps> = ({ client, isOpen, onC
                           </span>
                         )}
                       </td>
-                      <td className="px-4 py-2 text-right">
-                        {!device.verified && (
+                      <td className="px-4 py-2">
+                        <div className="flex flex-col sm:flex-row sm:justify-end gap-2">
+                          {!device.verified && (
+                            <button
+                              onClick={() => handleMarkDeviceVerified(device.deviceId)}
+                              className="px-3 py-1 rounded-md bg-accent text-white hover:bg-accent/90 disabled:opacity-50"
+                              disabled={devicesLoading}
+                            >
+                              Пометить доверенным
+                            </button>
+                          )}
                           <button
-                            onClick={() => handleMarkDeviceVerified(device.deviceId)}
-                            className="px-3 py-1 rounded-md bg-accent text-white hover:bg-accent/90"
+                            onClick={() => handleOpenRename(device)}
+                            className="px-3 py-1 rounded-md border border-border-primary hover:bg-bg-tertiary disabled:opacity-50"
+                            disabled={devicesLoading}
                           >
-                            Пометить доверенным
+                            Переименовать
                           </button>
-                        )}
+                          <button
+                            onClick={() => handleOpenDelete(device)}
+                            className="px-3 py-1 rounded-md border border-red-500 text-red-400 hover:bg-red-500/10 disabled:opacity-50"
+                            disabled={devicesLoading}
+                          >
+                            Завершить сеанс
+                          </button>
+                        </div>
                       </td>
                     </tr>
                   ))}
@@ -335,6 +492,9 @@ const SecuritySettings: React.FC<SecuritySettingsProps> = ({ client, isOpen, onC
                   )}
                 </tbody>
               </table>
+              {devicesStatus && (
+                <div className="px-4 py-2 text-xs text-text-secondary">{devicesStatus}</div>
+              )}
             </div>
           </section>
 
@@ -426,6 +586,99 @@ const SecuritySettings: React.FC<SecuritySettingsProps> = ({ client, isOpen, onC
           </section>
         </div>
       </div>
+      {deviceToDelete && (
+        <div className="fixed inset-0 bg-bg-secondary/70 flex items-center justify-center z-[60]" onClick={() => {
+          if (!deleteLoading) {
+            setDeviceToDelete(null);
+            setDeletePassword('');
+          }
+        }}>
+          <div
+            className="bg-bg-primary rounded-lg shadow-xl w-full max-w-md p-6 space-y-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h4 className="text-lg font-semibold text-text-primary">Завершить сеанс</h4>
+            <p className="text-sm text-text-secondary">
+              Подтвердите завершение сеанса для устройства «{deviceToDelete.displayName}». Для удаления потребуется пароль от аккаунта.
+            </p>
+            {client.deleteDevice && (
+              <input
+                type="password"
+                placeholder="Введите пароль для подтверждения"
+                value={deletePassword}
+                onChange={(e) => setDeletePassword(e.target.value)}
+                className="w-full px-3 py-2 rounded-md border border-border-primary bg-bg-secondary text-text-primary focus:outline-none focus:ring-2 focus:ring-accent/50"
+                disabled={deleteLoading}
+              />
+            )}
+            <div className="flex justify-end gap-2">
+              <button
+                onClick={() => {
+                  if (!deleteLoading) {
+                    setDeviceToDelete(null);
+                    setDeletePassword('');
+                  }
+                }}
+                className="px-3 py-1 rounded-md border border-border-primary hover:bg-bg-tertiary disabled:opacity-50"
+                disabled={deleteLoading}
+              >
+                Отмена
+              </button>
+              <button
+                onClick={handleConfirmDelete}
+                className="px-3 py-1 rounded-md bg-red-500 text-white hover:bg-red-500/90 disabled:opacity-50"
+                disabled={deleteLoading}
+              >
+                Подтвердить завершение
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {deviceToRename && (
+        <div className="fixed inset-0 bg-bg-secondary/70 flex items-center justify-center z-[60]" onClick={() => {
+          if (!renameLoading) {
+            setDeviceToRename(null);
+            setRenameValue('');
+          }
+        }}>
+          <div
+            className="bg-bg-primary rounded-lg shadow-xl w-full max-w-md p-6 space-y-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h4 className="text-lg font-semibold text-text-primary">Переименовать устройство</h4>
+            <input
+              type="text"
+              placeholder="Новое имя устройства"
+              value={renameValue}
+              onChange={(e) => setRenameValue(e.target.value)}
+              className="w-full px-3 py-2 rounded-md border border-border-primary bg-bg-secondary text-text-primary focus:outline-none focus:ring-2 focus:ring-accent/50"
+              disabled={renameLoading}
+            />
+            <div className="flex justify-end gap-2">
+              <button
+                onClick={() => {
+                  if (!renameLoading) {
+                    setDeviceToRename(null);
+                    setRenameValue('');
+                  }
+                }}
+                className="px-3 py-1 rounded-md border border-border-primary hover:bg-bg-tertiary disabled:opacity-50"
+                disabled={renameLoading}
+              >
+                Отмена
+              </button>
+              <button
+                onClick={handleConfirmRename}
+                className="px-3 py-1 rounded-md bg-accent text-white hover:bg-accent/90 disabled:opacity-50"
+                disabled={renameLoading}
+              >
+                Сохранить имя
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

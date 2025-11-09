@@ -9,6 +9,7 @@ export * from '../../../src/services/secureCloudService';
 export * from '../../../src/services/gifService';
 export * from '../../../src/services/notificationService';
 export * from '../../../src/services/pushService';
+export * from '../../../src/services/roomNotificationService';
 export * from '../../../src/services/searchService';
 export * from '../../../src/hooks/useChats';
 export * from '../../../src/hooks/useRoomTimeline';

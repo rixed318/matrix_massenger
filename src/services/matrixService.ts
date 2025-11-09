@@ -864,6 +864,334 @@ export const mxcToHttp = (client: MatrixClient, mxcUrl: string | null | undefine
     }
 };
 
+export type SharedMediaCategory = 'media' | 'files' | 'links' | 'voice';
+
+export interface RoomMediaItem {
+    eventId: string;
+    roomId: string;
+    timestamp: number;
+    senderId: string;
+    senderName: string;
+    senderAvatarUrl: string | null;
+    body?: string;
+    mimetype?: string;
+    size?: number;
+    url?: string | null;
+    thumbnailUrl?: string | null;
+    info?: Record<string, unknown> | null;
+    eventType: 'm.image' | 'm.video' | 'm.audio' | 'm.file' | 'm.sticker' | 'm.location';
+    category: SharedMediaCategory;
+    isVoiceMessage?: boolean;
+    linkUrl?: string | null;
+    geoUri?: string | null;
+}
+
+export interface RoomMediaSummary {
+    itemsByCategory: Record<SharedMediaCategory, RoomMediaItem[]>;
+    countsByCategory: Record<SharedMediaCategory, number>;
+    hasMore: boolean;
+    eventIds: string[];
+}
+
+export interface RoomMediaPaginationOptions {
+    limit?: number;
+    knownEventIds?: Set<string>;
+}
+
+export interface RoomMediaPaginationResult {
+    itemsByCategory: Record<SharedMediaCategory, RoomMediaItem[]>;
+    countsByCategory: Record<SharedMediaCategory, number>;
+    newEventIds: string[];
+    hasMore: boolean;
+}
+
+const createCategoryBuckets = (): Record<SharedMediaCategory, RoomMediaItem[]> => ({
+    media: [],
+    files: [],
+    links: [],
+    voice: [],
+});
+
+const thumbnailCache = new Map<string, string | null>();
+
+const getThumbnailFromCache = (
+    client: MatrixClient,
+    mxcUrl: string | undefined,
+    size?: number,
+): string | null => {
+    if (!mxcUrl) {
+        return null;
+    }
+    const key = `${mxcUrl}|${size ?? 0}`;
+    if (thumbnailCache.has(key)) {
+        return thumbnailCache.get(key) ?? null;
+    }
+    const httpUrl = mxcToHttp(client, mxcUrl, size);
+    thumbnailCache.set(key, httpUrl ?? null);
+    return httpUrl ?? null;
+};
+
+const deriveSenderInfo = (client: MatrixClient, room: MatrixRoom, senderId: string) => {
+    const member = room.getMember?.(senderId);
+    const senderName = member?.name || senderId;
+    const senderAvatarUrl = member?.getMxcAvatarUrl ? mxcToHttp(client, member.getMxcAvatarUrl(), 96) : null;
+    return { senderName, senderAvatarUrl };
+};
+
+const buildMediaItemsFromEvent = (
+    client: MatrixClient,
+    room: MatrixRoom,
+    event: MatrixEvent,
+): RoomMediaItem[] => {
+    const eventType = event.getType();
+    const items: RoomMediaItem[] = [];
+    const eventId = event.getId() || event.getTxnId();
+    if (!eventId) {
+        return items;
+    }
+
+    if (eventType !== EventType.RoomMessage && eventType !== EventType.Sticker) {
+        return items;
+    }
+
+    const content: any = event.getContent() ?? {};
+    const msgtype = content.msgtype;
+
+    const senderId = event.getSender() || '';
+    const { senderName, senderAvatarUrl } = deriveSenderInfo(client, room, senderId);
+    const timestamp = event.getTs?.() ?? Date.now();
+    const commonBase: Partial<RoomMediaItem> = {
+        eventId,
+        roomId: room.roomId,
+        timestamp,
+        senderId,
+        senderName,
+        senderAvatarUrl,
+        body: typeof content.body === 'string' ? content.body : undefined,
+        mimetype: typeof content?.info?.mimetype === 'string' ? content.info.mimetype : undefined,
+        size: typeof content?.info?.size === 'number' ? content.info.size : undefined,
+        info: typeof content?.info === 'object' && content.info ? content.info as Record<string, unknown> : null,
+    };
+
+    const pushItem = (item: RoomMediaItem) => {
+        items.push(item);
+    };
+
+    const ensureMainUrl = (mxcUrl?: string | null, sizeHint?: number) => {
+        if (!mxcUrl) return null;
+        return mxcToHttp(client, mxcUrl, sizeHint ?? undefined);
+    };
+
+    if (eventType === EventType.Sticker) {
+        const thumbnail = getThumbnailFromCache(client, content?.info?.thumbnail_url || content?.info?.thumbnail_file?.url, 256);
+        pushItem({
+            ...commonBase,
+            eventType: 'm.sticker',
+            category: 'media',
+            thumbnailUrl: thumbnail ?? ensureMainUrl(content?.url ?? null, 320),
+            url: ensureMainUrl(content?.url ?? null),
+        } as RoomMediaItem);
+        return items;
+    }
+
+    switch (msgtype) {
+        case MsgType.Image: {
+            const mxcUrl = content?.file?.url || content?.url;
+            const thumbMxc = content?.info?.thumbnail_file?.url || content?.info?.thumbnail_url;
+            const thumbnailUrl = getThumbnailFromCache(client, thumbMxc, 512) ?? ensureMainUrl(mxcUrl, 512);
+            pushItem({
+                ...commonBase,
+                eventType: 'm.image',
+                category: 'media',
+                url: ensureMainUrl(mxcUrl),
+                thumbnailUrl,
+            } as RoomMediaItem);
+            break;
+        }
+        case MsgType.Video: {
+            const mxcUrl = content?.file?.url || content?.url;
+            const thumbMxc = content?.info?.thumbnail_file?.url || content?.info?.thumbnail_url;
+            const thumbnailUrl = getThumbnailFromCache(client, thumbMxc, 512);
+            pushItem({
+                ...commonBase,
+                eventType: 'm.video',
+                category: 'media',
+                url: ensureMainUrl(mxcUrl),
+                thumbnailUrl: thumbnailUrl ?? ensureMainUrl(mxcUrl, 256),
+            } as RoomMediaItem);
+            break;
+        }
+        case MsgType.Audio: {
+            const isVoice = Boolean(content?.['org.matrix.msc3245.voice'] || content?.voice);
+            const thumbMxc = content?.info?.thumbnail_file?.url || content?.info?.thumbnail_url;
+            const thumbnailUrl = getThumbnailFromCache(client, thumbMxc, 256);
+            pushItem({
+                ...commonBase,
+                eventType: 'm.audio',
+                category: isVoice ? 'voice' : 'media',
+                url: ensureMainUrl(content?.file?.url || content?.url),
+                thumbnailUrl,
+                isVoiceMessage: isVoice,
+            } as RoomMediaItem);
+            break;
+        }
+        case MsgType.File: {
+            const mxcUrl = content?.file?.url || content?.url;
+            const thumbMxc = content?.info?.thumbnail_file?.url || content?.info?.thumbnail_url;
+            pushItem({
+                ...commonBase,
+                eventType: 'm.file',
+                category: 'files',
+                url: ensureMainUrl(mxcUrl),
+                thumbnailUrl: getThumbnailFromCache(client, thumbMxc, 256),
+            } as RoomMediaItem);
+            break;
+        }
+        case MsgType.Location: {
+            const thumbMxc = content?.info?.thumbnail_file?.url || content?.info?.thumbnail_url;
+            const externalUrl = typeof content?.external_url === 'string' ? content.external_url : undefined;
+            const geoUri = typeof content?.geo_uri === 'string' ? content.geo_uri : undefined;
+            pushItem({
+                ...commonBase,
+                eventType: 'm.location',
+                category: 'links',
+                url: externalUrl || geoUri || undefined,
+                linkUrl: externalUrl || geoUri || null,
+                geoUri: geoUri || null,
+                thumbnailUrl: getThumbnailFromCache(client, thumbMxc, 256),
+            } as RoomMediaItem);
+            break;
+        }
+        default:
+            break;
+    }
+
+    return items;
+};
+
+const mergeItemsIntoBuckets = (
+    buckets: Record<SharedMediaCategory, RoomMediaItem[]>,
+    items: RoomMediaItem[],
+) => {
+    for (const item of items) {
+        buckets[item.category].push(item);
+    }
+};
+
+const toCounts = (buckets: Record<SharedMediaCategory, RoomMediaItem[]>): Record<SharedMediaCategory, number> => ({
+    media: buckets.media.length,
+    files: buckets.files.length,
+    links: buckets.links.length,
+    voice: buckets.voice.length,
+});
+
+const sortBuckets = (buckets: Record<SharedMediaCategory, RoomMediaItem[]>) => {
+    for (const key of Object.keys(buckets) as SharedMediaCategory[]) {
+        buckets[key] = buckets[key].sort((a, b) => b.timestamp - a.timestamp);
+    }
+};
+
+export const getRoomMediaSummary = (
+    client: MatrixClient,
+    room: MatrixRoom,
+    options?: { limit?: number },
+): RoomMediaSummary => {
+    const limit = options?.limit ?? 50;
+    const buckets = createCategoryBuckets();
+    const timeline = room.getLiveTimeline?.();
+    const events = timeline?.getEvents?.() ?? [];
+    const sortedEvents = [...events].sort((a, b) => (b.getTs?.() ?? 0) - (a.getTs?.() ?? 0));
+    const eventIds = new Set<string>();
+
+    for (const event of sortedEvents) {
+        if (eventIds.size >= limit) {
+            break;
+        }
+        const items = buildMediaItemsFromEvent(client, room, event);
+        if (!items.length) continue;
+        mergeItemsIntoBuckets(buckets, items);
+        const id = event.getId() || event.getTxnId();
+        if (id) {
+            eventIds.add(id);
+        }
+    }
+
+    sortBuckets(buckets);
+    const hasMore = Boolean(room.canPaginate?.('b', timeline)) || (timeline?.getPaginationToken?.('b') ?? null) != null;
+
+    return {
+        itemsByCategory: buckets,
+        countsByCategory: toCounts(buckets),
+        hasMore,
+        eventIds: Array.from(eventIds),
+    };
+};
+
+export const paginateRoomMedia = async (
+    client: MatrixClient,
+    room: MatrixRoom,
+    options: RoomMediaPaginationOptions = {},
+): Promise<RoomMediaPaginationResult> => {
+    const { limit = 30, knownEventIds = new Set<string>() } = options;
+    const buckets = createCategoryBuckets();
+    const timeline = room.getLiveTimeline?.();
+    if (!timeline) {
+        return {
+            itemsByCategory: buckets,
+            countsByCategory: toCounts(buckets),
+            newEventIds: [],
+            hasMore: false,
+        };
+    }
+
+    const canPaginate = room.canPaginate?.('b', timeline) ?? Boolean(timeline.getPaginationToken?.('b'));
+    if (!canPaginate) {
+        return {
+            itemsByCategory: buckets,
+            countsByCategory: toCounts(buckets),
+            newEventIds: [],
+            hasMore: false,
+        };
+    }
+
+    const ok = await client.paginateEventTimeline(timeline, { backwards: true, limit });
+    if (!ok) {
+        return {
+            itemsByCategory: buckets,
+            countsByCategory: toCounts(buckets),
+            newEventIds: [],
+            hasMore: room.canPaginate?.('b', timeline) ?? false,
+        };
+    }
+
+    const events = timeline.getEvents?.() ?? [];
+    const sortedEvents = [...events].sort((a, b) => (b.getTs?.() ?? 0) - (a.getTs?.() ?? 0));
+    const newIds = new Set<string>();
+    for (const event of sortedEvents) {
+        const id = event.getId() || event.getTxnId();
+        if (!id || knownEventIds.has(id)) {
+            continue;
+        }
+        const items = buildMediaItemsFromEvent(client, room, event);
+        if (!items.length) continue;
+        mergeItemsIntoBuckets(buckets, items);
+        newIds.add(id);
+        if (newIds.size >= limit) {
+            break;
+        }
+    }
+
+    sortBuckets(buckets);
+    const hasMore = room.canPaginate?.('b', timeline) ?? Boolean(timeline.getPaginationToken?.('b'));
+
+    return {
+        itemsByCategory: buckets,
+        countsByCategory: toCounts(buckets),
+        newEventIds: Array.from(newIds),
+        hasMore,
+    };
+};
+
 // ===== Space hierarchy helpers =====
 
 export const SPACE_ROOM_TYPE = 'm.space';
