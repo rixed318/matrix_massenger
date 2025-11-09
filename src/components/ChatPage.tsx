@@ -40,17 +40,23 @@ import { SearchResultItem } from '../services/searchService';
 import { NotificationCountType, EventType, MsgType, ClientEvent, RoomEvent, UserEvent, RelationType, CallEvent } from 'matrix-js-sdk';
 import { startSecureCloudSession, acknowledgeSuspiciousEvents } from '../services/secureCloudService';
 import type { SuspiciousEventNotice, SecureCloudSession } from '../services/secureCloudService';
+import { useAccountStore } from '../services/accountManager';
 
 interface ChatPageProps {
-    client: MatrixClient;
-    onLogout: () => void;
-    savedMessagesRoomId: string;
+    client?: MatrixClient;
+    onLogout?: () => void;
+    savedMessagesRoomId?: string;
 }
 
 const DRAFT_STORAGE_KEY = 'matrix-message-drafts';
 const DRAFT_ACCOUNT_DATA_EVENT = 'econix.message_drafts';
 
-const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoomId }) => {
+const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, savedMessagesRoomId: savedRoomIdProp }) => {
+    const activeRuntime = useAccountStore(state => (state.activeKey ? state.accounts[state.activeKey] : null));
+    const removeAccount = useAccountStore(state => state.removeAccount);
+    const client = (providedClient ?? activeRuntime?.client)!;
+    const savedMessagesRoomId = savedRoomIdProp ?? activeRuntime?.savedMessagesRoomId ?? '';
+    const logout = onLogout ?? (() => { void removeAccount(); });
     const [rooms, setRooms] = useState<UIRoom[]>([]);
     const [selectedRoomId, setSelectedRoomId] = useState<string | null>(null);
     const [messages, setMessages] = useState<Message[]>([]);
@@ -1539,7 +1545,7 @@ if (isOffline) {
                 selectedRoomId={selectedRoomId}
                 onSelectRoom={handleSelectRoom}
                 isLoading={isLoading}
-                onLogout={onLogout}
+                onLogout={logout}
                 client={client}
                 onOpenSettings={() => setIsSettingsOpen(true)}
                 onOpenCreateRoom={() => setIsCreateRoomOpen(true)}
