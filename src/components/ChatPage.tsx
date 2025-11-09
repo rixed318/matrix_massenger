@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 // FIX: Import MatrixRoom to correctly type room objects from the SDK.
 import { Room as UIRoom, Message, MatrixEvent, Reaction, ReplyInfo, MatrixClient, MatrixRoom, ActiveThread, MatrixUser, Poll, PollResult, Folder, ScheduledMessage, MatrixCall, LinkPreviewData, Sticker, Gif, RoomNotificationMode } from '@matrix-messenger/core';
 import RoomList from './RoomList';
@@ -49,7 +49,14 @@ import type {
     SecureCloudDetectorState,
     SecureCloudDetectorStatus,
 } from '../services/secureCloudService';
-import { setSecureCloudProfileForClient } from '../services/matrixService';
+import {
+    setSecureCloudProfileForClient,
+    onOutboxEvent,
+    getOutboxPending,
+    cancelOutboxItem,
+    retryOutboxItem,
+    OutboxPayload,
+} from '../services/matrixService';
 import { useAccountStore } from '../services/accountManager';
 
 interface ChatPageProps {
@@ -60,6 +67,8 @@ interface ChatPageProps {
 
 const DRAFT_STORAGE_KEY = 'matrix-message-drafts';
 const DRAFT_ACCOUNT_DATA_EVENT = 'econix.message_drafts';
+
+type PendingQueueSummary = OutboxPayload & { attempts: number; error?: string };
 
 const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, savedMessagesRoomId: savedRoomIdProp }) => {
     const activeRuntime = useAccountStore(state => (state.activeKey ? state.accounts[state.activeKey] : null));
@@ -128,6 +137,7 @@ const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, s
     const [sharedMediaData, setSharedMediaData] = useState<RoomMediaSummary | null>(null);
     const [isSharedMediaLoading, setIsSharedMediaLoading] = useState(false);
     const [isSharedMediaPaginating, setIsSharedMediaPaginating] = useState(false);
+    const [outboxItems, setOutboxItems] = useState<Record<string, { payload: OutboxPayload; attempts: number; error?: string }>>({});
     const normalizeAttachments = (attachments: unknown): DraftAttachment[] => {
         if (!Array.isArray(attachments)) return [];
         return attachments.flatMap(item => {
@@ -159,6 +169,18 @@ const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, s
                 && att.dataUrl === other.dataUrl;
         });
     };
+
+    const formatOutboxError = useCallback((error: unknown): string => {
+        if (!error) return 'Неизвестная ошибка';
+        if (error instanceof Error) return error.message;
+        if (typeof error === 'string') return error;
+        if (typeof (error as any)?.message === 'string') return (error as any).message;
+        try {
+            return JSON.stringify(error);
+        } catch {
+            return 'Неизвестная ошибка';
+        }
+    }, []);
 
     const normalizeDraft = (value: unknown): DraftContent => {
         if (value && typeof value === 'object') {
@@ -568,78 +590,7 @@ const handleLayoutChange = useCallback((layout: 'grid'|'spotlight') => {
 // ===== end group call handlers =====
 
     
-// ===== Offline outbox (IndexedDB) =====
-const OUTBOX_DB = 'econix-offline';
-const OUTBOX_STORE = 'outbox';
-type OutboxItem = { id: string; roomId: string; content: { body: string; formattedBody?: string }; ts: number; threadRootId?: string };
-
-const outboxOpen = (): Promise<IDBDatabase> => {
-    return new Promise((resolve, reject) => {
-        const req = indexedDB.open(OUTBOX_DB, 1);
-        req.onupgradeneeded = () => {
-            const db = req.result;
-            if (!db.objectStoreNames.contains(OUTBOX_STORE)) {
-                db.createObjectStore(OUTBOX_STORE, { keyPath: 'id' });
-            }
-        };
-        req.onsuccess = () => resolve(req.result);
-        req.onerror = () => reject(req.error);
-    });
-};
-
-const outboxPut = async (item: OutboxItem) => {
-    const db = await outboxOpen();
-    await new Promise<void>((resolve, reject) => {
-        const tx = db.transaction(OUTBOX_STORE, 'readwrite');
-        tx.objectStore(OUTBOX_STORE).put(item);
-        tx.oncomplete = () => resolve();
-        tx.onerror = () => reject(tx.error);
-    });
-    db.close();
-};
-
-const outboxAll = async (): Promise<OutboxItem[]> => {
-    const db = await outboxOpen();
-    const items: OutboxItem[] = await new Promise((resolve, reject) => {
-        const tx = db.transaction(OUTBOX_STORE, 'readonly');
-        const store = tx.objectStore(OUTBOX_STORE);
-        const req = store.getAll();
-        req.onsuccess = () => resolve(req.result as OutboxItem[]);
-        req.onerror = () => reject(req.error);
-    });
-    db.close();
-    return items;
-};
-
-const outboxDelete = async (id: string) => {
-    const db = await outboxOpen();
-    await new Promise<void>((resolve, reject) => {
-        const tx = db.transaction(OUTBOX_STORE, 'readwrite');
-        tx.objectStore(OUTBOX_STORE).delete(id);
-        tx.oncomplete = () => resolve();
-        tx.onerror = () => reject(tx.error);
-    });
-    db.close();
-};
-
-const flushOutbox = useCallback(async () => {
-    try {
-        const items = await outboxAll();
-        for (const item of items.sort((a, b) => a.ts - b.ts)) {
-            try {
-                await sendMessage(client, item.roomId, item.content, undefined, item.threadRootId, roomMembers);
-                await outboxDelete(item.id);
-            } catch (e) {
-                // stop flushing if we fail, likely still offline
-                break;
-            }
-        }
-    } catch (e) {
-        console.error('flushOutbox failed', e);
-    }
-}, [client, roomMembers]);
-
-const handleSetChatBackground = (bgUrl: string) => {
+    const handleSetChatBackground = (bgUrl: string) => {
         setChatBackground(bgUrl);
         localStorage.setItem('matrix-chat-bg', bgUrl);
     };
@@ -651,6 +602,22 @@ const handleSetChatBackground = (bgUrl: string) => {
 
     const handleSendKeyBehaviorChange = useCallback((behavior: SendKeyBehavior) => {
         setSendKeyBehavior(behavior);
+    }, []);
+
+    const handleCancelPending = useCallback(async (id: string) => {
+        try {
+            await cancelOutboxItem(id);
+        } catch (error) {
+            console.error('Failed to cancel queued event', error);
+        }
+    }, []);
+
+    const handleRetryPending = useCallback(async (id: string) => {
+        try {
+            await retryOutboxItem(id);
+        } catch (error) {
+            console.error('Failed to retry queued event', error);
+        }
     }, []);
     const handleAcceptVerification = async (req: any) => {
         try {
@@ -765,6 +732,135 @@ const handleSetChatBackground = (bgUrl: string) => {
             window.clearInterval(interval);
         };
     }, [client]);
+
+    useEffect(() => {
+        let disposed = false;
+        const syncInitial = async () => {
+            try {
+                const existing = await getOutboxPending();
+                if (disposed) return;
+                const mapped = existing.reduce<Record<string, { payload: OutboxPayload; attempts: number; error?: string }>>((acc, item) => {
+                    acc[item.id] = { payload: item, attempts: item.attempts ?? 0 };
+                    return acc;
+                }, {});
+                setOutboxItems(mapped);
+            } catch (error) {
+                console.error('Failed to load pending outbox items', error);
+            }
+        };
+        void syncInitial();
+
+        const unsubscribe = onOutboxEvent(event => {
+            if (event.kind === 'status') {
+                setIsOffline(!event.online);
+                return;
+            }
+
+            setOutboxItems(prev => {
+                const next = { ...prev };
+                switch (event.kind) {
+                    case 'enqueued':
+                        next[event.item.id] = { payload: event.item, attempts: event.item.attempts ?? 0 };
+                        break;
+                    case 'progress':
+                        if (next[event.id]) {
+                            next[event.id] = { ...next[event.id], attempts: event.attempts, error: undefined };
+                        }
+                        break;
+                    case 'sent':
+                    case 'cancelled':
+                        delete next[event.id];
+                        break;
+                    case 'error':
+                        if (next[event.id]) {
+                            next[event.id] = { ...next[event.id], error: formatOutboxError(event.error) };
+                        }
+                        break;
+                    default:
+                        return prev;
+                }
+                return next;
+            });
+        });
+
+        return () => {
+            disposed = true;
+            unsubscribe?.();
+        };
+    }, [formatOutboxError]);
+
+    const pendingQueueForRoom = useMemo<PendingQueueSummary[]>(() => {
+        if (!selectedRoomId) {
+            return [];
+        }
+        return Object.values(outboxItems)
+            .filter(entry => entry.payload.roomId === selectedRoomId)
+            .map(entry => ({
+                ...entry.payload,
+                attempts: entry.attempts,
+                error: entry.error,
+            }));
+    }, [outboxItems, selectedRoomId]);
+
+    const buildPendingMessage = useCallback((entry: PendingQueueSummary): Message | null => {
+        if (entry.type !== EventType.RoomMessage) {
+            return null;
+        }
+
+        const userId = client.getUserId();
+        if (!userId) {
+            return null;
+        }
+
+        const user = client.getUser(userId);
+        const baseContent = entry.content ? { ...entry.content } : {};
+        if (typeof baseContent.body !== 'string' || baseContent.body.trim().length === 0) {
+            const attachmentName = entry.attachments?.find(att => att?.name)?.name;
+            if (attachmentName) {
+                baseContent.body = attachmentName;
+            }
+        }
+
+        const pending: Message = {
+            id: entry.id,
+            sender: {
+                id: userId,
+                name: user?.displayName || 'Я',
+                avatarUrl: mxcToHttp(client, user?.avatarUrl),
+            },
+            content: baseContent,
+            timestamp: entry.ts ?? Date.now(),
+            isOwn: true,
+            reactions: null,
+            isEdited: false,
+            isRedacted: false,
+            replyTo: null,
+            readBy: {},
+            threadReplyCount: 0,
+        } as Message;
+
+        (pending as any).isUploading = true;
+        (pending as any).isPending = true;
+        (pending as any).outboxAttempts = entry.attempts;
+        if (entry.error) {
+            (pending as any).outboxError = entry.error;
+        }
+
+        const firstAttachment = entry.attachments?.[0];
+        if (firstAttachment?.dataUrl) {
+            (pending as any).localUrl = firstAttachment.dataUrl;
+        } else if (firstAttachment?.remoteUrl) {
+            (pending as any).localUrl = firstAttachment.remoteUrl;
+        }
+
+        return pending;
+    }, [client]);
+
+    const pendingMessages = useMemo(() => (
+        pendingQueueForRoom
+            .map(buildPendingMessage)
+            .filter((msg): msg is Message => Boolean(msg))
+    ), [pendingQueueForRoom, buildPendingMessage]);
 
 
     useEffect(() => {
@@ -1338,45 +1434,10 @@ const handleSetChatBackground = (bgUrl: string) => {
 
     const handleSendMessage = async (content: { body: string; formattedBody?: string }, threadRootId?: string) => {
         const trimmedBody = content.body.trim();
-        if (!trimmedBody) {
+        if (!trimmedBody || !selectedRoomId) {
             return;
         }
 
-        if (isOffline) {
-            const roomId = selectedRoomId;
-            if (!roomId) {
-                setIsSending(false);
-                return;
-            }
-            const id = `outbox-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-            await outboxPut({ id, roomId, content: { body: trimmedBody, formattedBody: content.formattedBody }, ts: Date.now(), threadRootId });
-            const user = client.getUser(client.getUserId()!);
-            const tempMessage: Message = {
-                id,
-                sender: {
-                    id: client.getUserId()!,
-                    name: user?.displayName || 'Me',
-                    avatarUrl: mxcToHttp(client, user?.avatarUrl),
-                },
-                content: {
-                    body: trimmedBody,
-                    msgtype: MsgType.Text,
-                    ...(content.formattedBody ? { formatted_body: content.formattedBody, format: 'org.matrix.custom.html' } : {}),
-                },
-                timestamp: Date.now(),
-                isOwn: true,
-                reactions: null, isEdited: false, isRedacted: false, replyTo: null, readBy: {}, threadReplyCount: 0,
-                isUploading: true
-            } as any;
-            setMessages(prev => [...prev, tempMessage]);
-            setDrafts(prev => ({ ...prev, [roomId]: { plain: '', formatted: '', attachments: [] } }));
-            setReplyingTo(null);
-            setIsSending(false);
-            return;
-        }
-
-
-        if (!selectedRoomId) return;
         const roomId = selectedRoomId;
         setIsSending(true);
         try {
@@ -1970,7 +2031,7 @@ const handleSetChatBackground = (bgUrl: string) => {
                             </div>
                         )}
                         {/* ===== end E2EE banners ===== */}
-<MessageView
+                        <MessageView
                             messages={messages}
                             client={client}
                             onReaction={handleReaction}
@@ -1992,6 +2053,10 @@ const handleSetChatBackground = (bgUrl: string) => {
                             canPin={canPin}
                             onPinToggle={handlePinToggle}
                             highlightedMessageId={highlightedMessage?.roomId === selectedRoomId ? highlightedMessage.eventId : null}
+                            pendingMessages={pendingMessages}
+                            pendingQueue={pendingQueueForRoom}
+                            onRetryPending={handleRetryPending}
+                            onCancelPending={handleCancelPending}
                         />
                          {showScrollToBottom && (
                             <button
@@ -2022,6 +2087,9 @@ const handleSetChatBackground = (bgUrl: string) => {
                             onDraftChange={handleActiveDraftChange}
                             isOffline={isOffline}
                             sendKeyBehavior={sendKeyBehavior}
+                            pendingQueue={pendingQueueForRoom}
+                            onRetryPending={handleRetryPending}
+                            onCancelPending={handleCancelPending}
                         />
                     </>
                 ) : <WelcomeView client={client} />}
