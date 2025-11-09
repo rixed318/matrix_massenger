@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { MatrixCall, MatrixClient } from '../types';
+import { MatrixCall, MatrixClient } from '@matrix-messenger/core';
 import Avatar from './Avatar';
-import { mxcToHttp } from '../services/matrixService';
+import { mxcToHttp } from '@matrix-messenger/core';
 // FIX: Use CallEvent enum for event listeners. CallState is not exported in this SDK version, so string literals will be used for state values.
 import { CallEvent } from 'matrix-js-sdk';
 

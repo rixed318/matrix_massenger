@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
-import { Room, Message, MatrixClient } from '../types';
+import { Room, Message, MatrixClient } from '@matrix-messenger/core';
 import Avatar from './Avatar';
-import { mxcToHttp } from '../services/matrixService';
+import { mxcToHttp } from '@matrix-messenger/core';
 
 interface ForwardMessageModalProps {
     isOpen: boolean;

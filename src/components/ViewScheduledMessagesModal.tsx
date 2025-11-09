@@ -1,5 +1,5 @@
 import React from 'react';
-import { ScheduledMessage } from '../types';
+import { ScheduledMessage } from '@matrix-messenger/core';
 import { format } from 'date-fns';
 
 interface ViewScheduledMessagesModalProps {

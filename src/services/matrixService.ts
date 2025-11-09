@@ -11,10 +11,9 @@ import {
     Visibility,
     AutoDiscovery,
     AutoDiscoveryAction,
-    AutoDiscoveryError,
-    IndexedDBStore, IndexedDBCryptoStore, ClientEvent, MemoryStore, MatrixScheduler} from 'matrix-js-sdk';
-import { exportRoomKeysAsJson, importRoomKeysFromJson, saveEncryptedSeed, loadEncryptedSeed } from './e2eeService';
-import { SecureCloudProfile } from './secureCloudService';
+    AutoDiscoveryError, 
+    IndexedDBStore, IndexedDBCryptoStore, ClientEvent, MemoryStore, MatrixScheduler, Preset} from 'matrix-js-sdk';
+import type { HierarchyRoom } from 'matrix-js-sdk';
 
 
 // ===== Offline Outbox Queue (IndexedDB/SQLite) =====
@@ -861,6 +860,354 @@ export const mxcToHttp = (client: MatrixClient, mxcUrl: string | null | undefine
         console.error("Failed to convert mxc URL:", e);
         return null;
     }
+};
+
+// ===== Space hierarchy helpers =====
+
+export const SPACE_ROOM_TYPE = 'm.space';
+
+export interface SpaceRoomSummary {
+    roomId: string;
+    name: string;
+    topic?: string;
+    avatarUrl: string | null;
+    roomType?: string | null;
+    canonicalAlias?: string | null;
+    numJoinedMembers?: number;
+    worldReadable?: boolean;
+    guestCanJoin?: boolean;
+    isSpace: boolean;
+    parentIds: string[];
+}
+
+export interface SpaceHierarchyRelation {
+    viaServers: string[];
+    suggested: boolean;
+    order?: string;
+}
+
+export interface SpaceHierarchyNode extends SpaceRoomSummary {
+    relation?: SpaceHierarchyRelation;
+    children: SpaceHierarchyNode[];
+    depth: number;
+}
+
+export interface SpaceHierarchyOptions {
+    limit?: number;
+    maxDepth?: number;
+    suggestedOnly?: boolean;
+    from?: string;
+}
+
+export interface SpaceHierarchyResult {
+    root: SpaceHierarchyNode | null;
+    rooms: Record<string, SpaceRoomSummary>;
+    nextBatch?: string;
+}
+
+export interface SpaceChildOptions {
+    viaServers?: string[];
+    order?: string;
+    suggested?: boolean;
+    canonical?: boolean;
+}
+
+export const isSpaceRoom = (room?: MatrixRoom | null): boolean => {
+    if (!room) {
+        return false;
+    }
+    try {
+        return room.getType?.() === SPACE_ROOM_TYPE;
+    } catch (error) {
+        console.warn('Failed to read room type for space detection', error);
+        return false;
+    }
+};
+
+export const getJoinedSpaces = (client: MatrixClient): MatrixRoom[] => {
+    return client
+        .getRooms()
+        .filter(room => room.getMyMembership?.() === 'join' && isSpaceRoom(room));
+};
+
+export interface CreateSpaceOptions {
+    name: string;
+    topic?: string;
+    isPublic?: boolean;
+    invite?: string[];
+    alias?: string;
+    powerLevelContentOverride?: Record<string, unknown>;
+}
+
+export const createSpace = async (client: MatrixClient, options: CreateSpaceOptions): Promise<string> => {
+    const {
+        name,
+        topic,
+        isPublic = false,
+        invite,
+        alias,
+        powerLevelContentOverride,
+    } = options;
+
+    const createOptions: ICreateRoomOpts = {
+        name,
+        topic,
+        visibility: isPublic ? Visibility.Public : Visibility.Private,
+        preset: isPublic ? Preset.PublicChat : Preset.PrivateChat,
+        creation_content: { type: SPACE_ROOM_TYPE },
+    };
+
+    if (alias) {
+        createOptions.room_alias_name = alias;
+    }
+    if (invite?.length) {
+        createOptions.invite = invite;
+    }
+    if (powerLevelContentOverride) {
+        createOptions.power_level_content_override = powerLevelContentOverride as any;
+    }
+
+    const { room_id } = await client.createRoom(createOptions);
+    return room_id;
+};
+
+export const linkRoomToSpace = async (
+    client: MatrixClient,
+    spaceId: string,
+    childRoomId: string,
+    options?: SpaceChildOptions,
+): Promise<void> => {
+    const viaServers = options?.viaServers?.filter(Boolean) ?? [];
+    const childContent: Record<string, unknown> = {};
+    if (viaServers.length) {
+        childContent.via = viaServers;
+    }
+    if (options?.order) {
+        childContent.order = options.order;
+    }
+    if (typeof options?.suggested === 'boolean') {
+        childContent.suggested = options.suggested;
+    }
+
+    await client.sendStateEvent(spaceId, EventType.SpaceChild, childContent, childRoomId);
+
+    const parentContent: Record<string, unknown> = {};
+    if (viaServers.length) {
+        parentContent.via = viaServers;
+    }
+    if (typeof options?.canonical === 'boolean') {
+        parentContent.canonical = options.canonical;
+    }
+
+    await client.sendStateEvent(childRoomId, EventType.SpaceParent, parentContent, spaceId);
+};
+
+export const unlinkRoomFromSpace = async (
+    client: MatrixClient,
+    spaceId: string,
+    childRoomId: string,
+): Promise<void> => {
+    await client.sendStateEvent(spaceId, EventType.SpaceChild, {}, childRoomId);
+    await client.sendStateEvent(childRoomId, EventType.SpaceParent, {}, spaceId);
+};
+
+type HierarchyEdge = {
+    childId: string;
+    relation: SpaceHierarchyRelation;
+};
+
+const ensureSpaceSummary = (
+    summaries: Map<string, SpaceRoomSummary>,
+    client: MatrixClient,
+    room: Partial<HierarchyRoom> & { room_id: string },
+): SpaceRoomSummary => {
+    if (!summaries.has(room.room_id)) {
+        const initialAvatar = room.avatar_url !== undefined ? mxcToHttp(client, room.avatar_url || null) : null;
+        const initialRoomType = room.room_type ?? null;
+        summaries.set(room.room_id, {
+            roomId: room.room_id,
+            name: room.name || room.canonical_alias || room.room_id,
+            topic: typeof room.topic === 'string' ? room.topic : undefined,
+            avatarUrl: initialAvatar,
+            roomType: initialRoomType,
+            canonicalAlias: room.canonical_alias ?? null,
+            numJoinedMembers: room.num_joined_members,
+            worldReadable: room.world_readable,
+            guestCanJoin: room.guest_can_join,
+            isSpace: initialRoomType === SPACE_ROOM_TYPE,
+            parentIds: [],
+        });
+    }
+
+    const summary = summaries.get(room.room_id)!;
+    if (typeof room.name === 'string' && room.name.trim().length > 0) {
+        summary.name = room.name;
+    } else if (!summary.name && typeof room.canonical_alias === 'string') {
+        summary.name = room.canonical_alias;
+    }
+    if (typeof room.topic === 'string') {
+        summary.topic = room.topic;
+    }
+    if (room.avatar_url !== undefined) {
+        summary.avatarUrl = mxcToHttp(client, room.avatar_url || null);
+    }
+    if (room.room_type !== undefined) {
+        summary.roomType = room.room_type ?? null;
+        summary.isSpace = summary.isSpace || room.room_type === SPACE_ROOM_TYPE;
+    }
+    if (room.canonical_alias !== undefined) {
+        summary.canonicalAlias = room.canonical_alias ?? null;
+    }
+    if (room.num_joined_members !== undefined) {
+        summary.numJoinedMembers = room.num_joined_members;
+    }
+    if (room.world_readable !== undefined) {
+        summary.worldReadable = room.world_readable;
+    }
+    if (room.guest_can_join !== undefined) {
+        summary.guestCanJoin = room.guest_can_join;
+    }
+
+    return summary;
+};
+
+export const getSpaceHierarchy = async (
+    client: MatrixClient,
+    spaceId: string,
+    options?: SpaceHierarchyOptions,
+): Promise<SpaceHierarchyResult> => {
+    const hierarchy = await (client as any).getRoomHierarchy(
+        spaceId,
+        options?.limit,
+        options?.maxDepth,
+        options?.suggestedOnly ?? false,
+        options?.from,
+    );
+
+    const rooms = (hierarchy?.rooms as HierarchyRoom[] | undefined) ?? [];
+    const summaries = new Map<string, SpaceRoomSummary>();
+    const edges = new Map<string, HierarchyEdge[]>();
+
+    if (!rooms.length) {
+        // Ensure we still have a summary entry for the requested space if it is known locally.
+        const localRoom = client.getRoom(spaceId);
+        if (localRoom) {
+            summaries.set(spaceId, {
+                roomId: localRoom.roomId,
+                name: localRoom.name || localRoom.roomId,
+                topic: localRoom.currentState.getStateEvents(EventType.RoomTopic, '')?.getContent()?.topic,
+                avatarUrl: mxcToHttp(client, localRoom.getMxcAvatarUrl()),
+                roomType: localRoom.getType() || null,
+                canonicalAlias:
+                    localRoom.currentState.getStateEvents(EventType.RoomCanonicalAlias, '')?.getContent()?.alias || null,
+                numJoinedMembers: localRoom.getJoinedMemberCount(),
+                worldReadable: undefined,
+                guestCanJoin: undefined,
+                isSpace: isSpaceRoom(localRoom),
+                parentIds: [],
+            });
+        }
+    }
+
+    rooms.forEach(room => {
+        const summary = ensureSpaceSummary(summaries, client, room);
+        const childRelations = room.children_state || [];
+        if (!edges.has(room.room_id)) {
+            edges.set(room.room_id, []);
+        }
+
+        childRelations.forEach(relation => {
+            const childId = relation.state_key;
+            if (!childId) {
+                return;
+            }
+
+            ensureSpaceSummary(summaries, client, { room_id: childId });
+            const childSummary = summaries.get(childId)!;
+            if (!childSummary.parentIds.includes(room.room_id)) {
+                childSummary.parentIds.push(room.room_id);
+            }
+
+            const viaServers = Array.isArray(relation.content?.via)
+                ? (relation.content?.via as string[]).filter((value): value is string => !!value)
+                : [];
+            const relationInfo: SpaceHierarchyRelation = {
+                viaServers,
+                suggested: !!relation.content?.suggested,
+                order: relation.content?.order,
+            };
+
+            const list = edges.get(room.room_id)!;
+            const existingIndex = list.findIndex(edge => edge.childId === childId);
+            if (existingIndex >= 0) {
+                list[existingIndex] = { childId, relation: relationInfo };
+            } else {
+                list.push({ childId, relation: relationInfo });
+            }
+        });
+    });
+
+    const buildNode = (
+        roomId: string,
+        relation: SpaceHierarchyRelation | undefined,
+        depth: number,
+    ): SpaceHierarchyNode => {
+        const summary = summaries.get(roomId) ?? {
+            roomId,
+            name: roomId,
+            topic: undefined,
+            avatarUrl: null,
+            roomType: null,
+            canonicalAlias: null,
+            numJoinedMembers: undefined,
+            worldReadable: undefined,
+            guestCanJoin: undefined,
+            isSpace: false,
+            parentIds: [],
+        };
+
+        const childEdges = edges.get(roomId) ?? [];
+        const children = childEdges
+            .map(edge => buildNode(edge.childId, edge.relation, depth + 1))
+            .sort((a, b) => {
+                const aOrder = a.relation?.order ?? '';
+                const bOrder = b.relation?.order ?? '';
+                if (aOrder && bOrder && aOrder !== bOrder) {
+                    return aOrder.localeCompare(bOrder);
+                }
+                if (aOrder && !bOrder) {
+                    return -1;
+                }
+                if (!aOrder && bOrder) {
+                    return 1;
+                }
+                return a.name.localeCompare(b.name);
+            });
+
+        return {
+            ...summary,
+            parentIds: [...summary.parentIds],
+            relation,
+            children,
+            depth,
+        };
+    };
+
+    const root = summaries.has(spaceId) ? buildNode(spaceId, undefined, 0) : null;
+
+    const roomsRecord: Record<string, SpaceRoomSummary> = {};
+    summaries.forEach(summary => {
+        roomsRecord[summary.roomId] = {
+            ...summary,
+            parentIds: [...summary.parentIds],
+        };
+    });
+
+    return {
+        root,
+        rooms: roomsRecord,
+        nextBatch: hierarchy?.next_batch,
+    };
 };
 
 const URL_REGEX = /(https?:\/\/[^\s]+)/;

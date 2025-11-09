@@ -1,0 +1,18 @@
+{
+  "name": "@matrix-messenger/core",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "publishConfig": {
+    "access": "restricted"
+  },
+  "peerDependencies": {
+    "matrix-js-sdk": "^30.1.0"
+  }
+}

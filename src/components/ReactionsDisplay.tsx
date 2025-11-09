@@ -1,5 +1,5 @@
 import React from 'react';
-import { Reaction } from '../types';
+import { Reaction } from '@matrix-messenger/core';
 
 interface ReactionsDisplayProps {
     reactions: Record<string, Reaction>;
