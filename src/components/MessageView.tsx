@@ -72,6 +72,121 @@ const TTLCountdown: React.FC<{ message: Message }> = ({ message }) => {
 };
 
 
+const ESTIMATED_ITEM_HEIGHT = 120;
+const OVERSCAN_COUNT = 6;
+const INITIAL_RENDER_COUNT = 20;
+
+interface VirtualMeasurement {
+    index: number;
+    start: number;
+    end: number;
+    size: number;
+}
+
+const findNearestItemIndex = (measurements: VirtualMeasurement[], offset: number): number => {
+    if (measurements.length === 0) return 0;
+    const clampedOffset = Math.max(0, offset);
+    let low = 0;
+    let high = measurements.length - 1;
+    let nearest = measurements.length - 1;
+
+    while (low <= high) {
+        const mid = Math.floor((low + high) / 2);
+        const measurement = measurements[mid];
+        if (measurement.end > clampedOffset) {
+            nearest = mid;
+            high = mid - 1;
+        } else {
+            low = mid + 1;
+        }
+    }
+
+    return nearest;
+};
+
+interface VirtualizedMessageRowProps {
+    message: Message;
+    start: number;
+    isLast: boolean;
+    registerHeight: (messageId: string, height: number) => void;
+    children: React.ReactNode;
+}
+
+const VirtualizedMessageRow: React.FC<VirtualizedMessageRowProps> = ({ message, start, isLast, registerHeight, children }) => {
+    const rowRef = React.useRef<HTMLDivElement | null>(null);
+
+    React.useLayoutEffect(() => {
+        const element = rowRef.current;
+        if (!element) return;
+
+        let animationFrame: number | null = null;
+
+        const measure = () => {
+            const rect = element.getBoundingClientRect();
+            const height = rect.height;
+            if (height > 0) {
+                registerHeight(message.id, Math.round(height));
+            }
+        };
+
+        const scheduleMeasure = () => {
+            if (animationFrame !== null && typeof cancelAnimationFrame === 'function') {
+                cancelAnimationFrame(animationFrame);
+            }
+
+            if (typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function') {
+                animationFrame = window.requestAnimationFrame(() => {
+                    measure();
+                    animationFrame = null;
+                });
+            } else {
+                measure();
+                animationFrame = null;
+            }
+        };
+
+        scheduleMeasure();
+
+        if (typeof ResizeObserver !== 'undefined') {
+            const observer = new ResizeObserver(scheduleMeasure);
+            observer.observe(element);
+            return () => {
+                if (animationFrame !== null && typeof cancelAnimationFrame === 'function') {
+                    cancelAnimationFrame(animationFrame);
+                    animationFrame = null;
+                }
+                observer.disconnect();
+            };
+        }
+
+        window.addEventListener('resize', scheduleMeasure);
+        return () => {
+            if (animationFrame !== null && typeof cancelAnimationFrame === 'function') {
+                cancelAnimationFrame(animationFrame);
+                animationFrame = null;
+            }
+            window.removeEventListener('resize', scheduleMeasure);
+        };
+    }, [message, registerHeight, isLast]);
+
+    return (
+        <div
+            ref={rowRef}
+            data-virtualized-message="true"
+            style={{
+                position: 'absolute',
+                top: start,
+                left: 0,
+                width: '100%',
+                paddingBottom: isLast ? 0 : 16,
+            }}
+        >
+            {children}
+        </div>
+    );
+};
+
+
 const MessageView: React.FC<MessageViewProps> = ({
     messages, client, onReaction, onEditMessage, onDeleteMessage,
     onSetReplyTo, onForwardMessage, onImageClick, onOpenThread, onPollVote,
@@ -80,16 +195,120 @@ const MessageView: React.FC<MessageViewProps> = ({
     pinnedEventIds, canPin, onPinToggle, highlightedMessageId
 }) => {
     
-    const handleScroll = () => {
+    const paginationSnapshotRef = React.useRef<{ scrollHeight: number; scrollTop: number } | null>(null);
+    const heightCacheRef = React.useRef<Map<string, number>>(new Map());
+    const [measurementVersion, setMeasurementVersion] = React.useState(0);
+    const [scrollState, setScrollState] = React.useState({ scrollTop: 0, viewportHeight: 0 });
+
+    const registerHeight = React.useCallback((messageId: string, height: number) => {
+        const normalizedHeight = Math.max(1, Math.round(height));
+        const previousHeight = heightCacheRef.current.get(messageId);
+        if (previousHeight !== normalizedHeight) {
+            heightCacheRef.current.set(messageId, normalizedHeight);
+            setMeasurementVersion((version) => version + 1);
+        }
+    }, []);
+
+    const measurements = React.useMemo<VirtualMeasurement[]>(() => {
+        const result: VirtualMeasurement[] = [];
+        let offset = 0;
+
+        for (let index = 0; index < messages.length; index += 1) {
+            const message = messages[index];
+            const size = heightCacheRef.current.get(message.id) ?? ESTIMATED_ITEM_HEIGHT;
+            const start = offset;
+            const end = start + size;
+            result.push({ index, start, end, size });
+            offset = end;
+        }
+
+        return result;
+    }, [messages, measurementVersion]);
+
+    const totalHeight = measurements.length > 0 ? measurements[measurements.length - 1].end : 0;
+
+    const virtualItems = React.useMemo(() => {
+        if (measurements.length === 0) return [] as VirtualMeasurement[];
+
+        if (scrollState.viewportHeight <= 0) {
+            const endIndex = Math.min(measurements.length, INITIAL_RENDER_COUNT) - 1;
+            return measurements.slice(0, Math.max(0, endIndex + 1));
+        }
+
+        const startIndex = findNearestItemIndex(measurements, scrollState.scrollTop);
+        const endIndex = findNearestItemIndex(measurements, scrollState.scrollTop + scrollState.viewportHeight);
+        const rangeStart = Math.max(0, startIndex - OVERSCAN_COUNT);
+        const rangeEnd = Math.min(measurements.length - 1, endIndex + OVERSCAN_COUNT);
+        return measurements.slice(rangeStart, rangeEnd + 1);
+    }, [measurements, scrollState.scrollTop, scrollState.viewportHeight]);
+
+    const handleScroll = React.useCallback(() => {
         onScroll();
         const container = scrollContainerRef.current;
-        if (container && container.scrollTop === 0 && !isPaginating && canPaginate) {
+        if (!container) return;
+
+        setScrollState((state) => {
+            if (state.scrollTop === container.scrollTop) return state;
+            return { ...state, scrollTop: container.scrollTop };
+        });
+
+        if (isPaginating || !canPaginate) return;
+
+        if (container.scrollTop <= 16) {
+            paginationSnapshotRef.current = {
+                scrollHeight: container.scrollHeight,
+                scrollTop: container.scrollTop,
+            };
             onPaginate();
         }
-    };
+    }, [onScroll, scrollContainerRef, isPaginating, canPaginate, onPaginate]);
+
+    React.useLayoutEffect(() => {
+        const container = scrollContainerRef.current;
+        if (!container) return;
+
+        const updateViewportHeight = () => {
+            const nextHeight = container.clientHeight;
+            setScrollState((state) => {
+                if (state.viewportHeight === nextHeight) return state;
+                return { ...state, viewportHeight: nextHeight };
+            });
+        };
+
+        updateViewportHeight();
+
+        if (typeof ResizeObserver !== 'undefined') {
+            const observer = new ResizeObserver(updateViewportHeight);
+            observer.observe(container);
+            return () => observer.disconnect();
+        }
+
+        window.addEventListener('resize', updateViewportHeight);
+        return () => window.removeEventListener('resize', updateViewportHeight);
+    }, [scrollContainerRef]);
+
+    React.useLayoutEffect(() => {
+        const container = scrollContainerRef.current;
+        const snapshot = paginationSnapshotRef.current;
+        if (!container || !snapshot) return;
+
+        const delta = container.scrollHeight - snapshot.scrollHeight;
+        const nextScrollTop = snapshot.scrollTop + delta;
+        container.scrollTop = nextScrollTop;
+        paginationSnapshotRef.current = null;
+        setScrollState((state) => {
+            if (state.scrollTop === nextScrollTop) return state;
+            return { ...state, scrollTop: nextScrollTop };
+        });
+    }, [messages, scrollContainerRef]);
 
     return (
-        <div ref={scrollContainerRef} onScroll={handleScroll} className="flex-1 overflow-y-auto p-4 space-y-4">
+        <div
+            ref={scrollContainerRef}
+            onScroll={handleScroll}
+            data-testid="message-scroll-container"
+            className="flex-1 overflow-y-auto p-4"
+        >
             {isPaginating && (
                 <div className="flex justify-center items-center p-4">
                     <div className="animate-spin rounded-full h-8 w-8 border-t-2 border-b-2 border-blue-500"></div>
@@ -100,30 +319,47 @@ const MessageView: React.FC<MessageViewProps> = ({
                     Beginning of conversation history
                 </div>
             )}
-            {messages.map((msg) => (
-                <div>
-                <ChatMessage
-                    key={msg.id}
-                    message={msg}
-                    client={client}
-                    onReaction={(emoji, reaction) => onReaction(msg.id, emoji, reaction)}
-                    onEdit={onEditMessage}
-                    onDelete={() => onDeleteMessage(msg.id)}
-                    onSetReplyTo={() => onSetReplyTo(msg)}
-                    onForward={() => onForwardMessage(msg)}
-                    onImageClick={onImageClick}
-                    onOpenThread={() => onOpenThread(msg)}
-                    onPollVote={(optionId) => onPollVote(msg.id, optionId)}
-                    isPinned={pinnedEventIds.includes(msg.id)}
-                    canPin={canPin}
-                    onPinToggle={() => onPinToggle(msg.id)}
-                    onTranslateMessage={onTranslateMessage}
-                    translatedMessage={translatedMessages[msg.id]}
-                    isHighlighted={highlightedMessageId === msg.id}
-                />
-                <TTLCountdown message={msg} />
-                </div>
-            ))}
+            <div
+                style={{
+                    height: totalHeight,
+                    position: 'relative',
+                }}
+            >
+                {virtualItems.map((virtualItem) => {
+                    const msg = messages[virtualItem.index];
+                    if (!msg) return null;
+
+                    return (
+                        <VirtualizedMessageRow
+                            key={msg.id}
+                            message={msg}
+                            start={virtualItem.start}
+                            isLast={virtualItem.index === messages.length - 1}
+                            registerHeight={registerHeight}
+                        >
+                            <ChatMessage
+                                message={msg}
+                                client={client}
+                                onReaction={(emoji, reaction) => onReaction(msg.id, emoji, reaction)}
+                                onEdit={onEditMessage}
+                                onDelete={() => onDeleteMessage(msg.id)}
+                                onSetReplyTo={() => onSetReplyTo(msg)}
+                                onForward={() => onForwardMessage(msg)}
+                                onImageClick={onImageClick}
+                                onOpenThread={() => onOpenThread(msg)}
+                                onPollVote={(optionId) => onPollVote(msg.id, optionId)}
+                                isPinned={pinnedEventIds.includes(msg.id)}
+                                canPin={canPin}
+                                onPinToggle={() => onPinToggle(msg.id)}
+                                onTranslateMessage={onTranslateMessage}
+                                translatedMessage={translatedMessages[msg.id]}
+                                isHighlighted={highlightedMessageId === msg.id}
+                            />
+                            <TTLCountdown message={msg} />
+                        </VirtualizedMessageRow>
+                    );
+                })}
+            </div>
         </div>
     );
 };
