@@ -22,12 +22,16 @@ interface RoomListProps {
   activeAccountKey: string | null;
   onSwitchAccount: (key: string) => void;
   onAddAccount: () => void;
+  hiddenRoomIds?: string[];
+  onUnlockHidden?: () => void;
+  isHiddenUnlocked?: boolean;
 }
 
 const RoomList: React.FC<RoomListProps> = ({
   rooms, selectedRoomId, onSelectRoom, isLoading, onLogout, client,
   onOpenSettings, onOpenCreateRoom, folders, activeFolderId, onSelectFolder, onManageFolders,
   accounts, activeAccountKey, onSwitchAccount, onAddAccount,
+  hiddenRoomIds = [], onUnlockHidden, isHiddenUnlocked = true,
 }) => {
   const user = client.getUser(client.getUserId());
   const userAvatarUrl = mxcToHttp(client, user?.avatarUrl);
@@ -129,6 +133,15 @@ const RoomList: React.FC<RoomListProps> = ({
           className="w-full bg-bg-secondary text-text-primary px-3 py-2 rounded-md focus:outline-none focus:ring-1 focus:ring-ring-focus sm:text-sm"
         />
       </div>
+
+      {!isHiddenUnlocked && hiddenRoomIds.length > 0 && (
+        <div className="px-3 pb-2 text-xs text-text-secondary flex items-center justify-between gap-2">
+          <span>Скрытые чаты заблокированы PIN-кодом.</span>
+          {onUnlockHidden && (
+            <button onClick={onUnlockHidden} className="text-accent hover:underline text-xs font-semibold">Разблокировать</button>
+          )}
+        </div>
+      )}
 
       <div className="flex-1 overflow-y-auto">
         {isLoading ? (

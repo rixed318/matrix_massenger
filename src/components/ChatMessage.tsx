@@ -40,6 +40,7 @@ const ChatMessage: React.FC<ChatMessageProps> = ({
     const editInputRef = useRef<HTMLInputElement>(null);
     const isOwn = message.isOwn;
     const isReadByOthers = isOwn && Object.keys(message.readBy).some(userId => userId !== client.getUserId());
+    const [remainingSeconds, setRemainingSeconds] = useState<number | null>(null);
 
     useEffect(() => {
         if (isEditing) {
@@ -51,6 +52,20 @@ const ChatMessage: React.FC<ChatMessageProps> = ({
     useEffect(() => {
         setEditedContent(message.content.body);
     }, [message.content.body]);
+
+    useEffect(() => {
+        if (!message.selfDestruct?.expiresAt) {
+            setRemainingSeconds(null);
+            return;
+        }
+        const updateTimer = () => {
+            const diff = Math.floor((message.selfDestruct!.expiresAt - Date.now()) / 1000);
+            setRemainingSeconds(diff >= 0 ? diff : 0);
+        };
+        updateTimer();
+        const interval = window.setInterval(updateTimer, 1000);
+        return () => window.clearInterval(interval);
+    }, [message.selfDestruct?.expiresAt]);
 
     const handleSelectEmoji = (emoji: string) => {
         onReaction(emoji, message.reactions?.[emoji]);
@@ -275,6 +290,22 @@ const ChatMessage: React.FC<ChatMessageProps> = ({
         ? '' // No padding/bg for stickers/gifs
         : `p-2 rounded-lg max-w-lg ${isOwn ? 'bg-accent text-text-inverted rounded-br-none' : 'bg-bg-primary text-text-primary rounded-bl-none'} ${isPinned ? 'ring-2 ring-yellow-400' : ''} ${isHighlighted ? 'ring-2 ring-accent shadow-lg animate-pulse' : ''}`;
 
+    const formatCountdown = (seconds: number): string => {
+        if (seconds >= 3600) {
+            const hours = Math.floor(seconds / 3600);
+            const mins = Math.floor((seconds % 3600) / 60);
+            return `${hours}ч ${mins}м`;
+        }
+        if (seconds >= 60) {
+            const mins = Math.floor(seconds / 60);
+            const secs = seconds % 60;
+            return `${mins}:${secs.toString().padStart(2, '0')}`;
+        }
+        return `${seconds}с`;
+    };
+
+    const countdownLabel = remainingSeconds !== null ? formatCountdown(remainingSeconds) : null;
+
 
     return (
         <div id={`message-${message.id}`} className={`group flex items-start gap-3 relative ${isOwn ? 'flex-row-reverse' : ''}`}>
@@ -353,6 +384,13 @@ const ChatMessage: React.FC<ChatMessageProps> = ({
                     </span>
                 </div>
                 <div className={`mt-1 relative ${messageContainerClass}`}>
+                    {countdownLabel && (
+                        <span
+                            className={`absolute -top-4 ${isOwn ? 'right-0' : 'left-0'} text-[10px] uppercase tracking-wide px-2 py-0.5 rounded-full ${remainingSeconds !== null && remainingSeconds <= 10 ? 'bg-red-500/20 text-red-200' : 'bg-bg-tertiary text-text-secondary'}`}
+                        >
+                            Самоуничтожение {countdownLabel}
+                        </span>
+                    )}
                     {renderMessageContent()}
                     {renderTranslation()}
                 </div>

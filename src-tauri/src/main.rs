@@ -756,6 +756,7 @@ async fn test_ssh_connection(
 fn main() {
   tauri::Builder::default()
     .plugin(tauri_plugin_store::Builder::default().build())
+    .plugin(tauri_plugin_secure_storage::Plugin::new())
     .plugin(tauri_plugin_notification::init())
     .setup(|app| {
       #[cfg(not(debug_assertions))]

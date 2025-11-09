@@ -5,7 +5,7 @@ import RoomList from './RoomList';
 import MessageView from './MessageView';
 import ChatHeader from './ChatHeader';
 import MessageInput from './MessageInput';
-import { mxcToHttp, sendReaction, sendTypingIndicator, editMessage, sendMessage, deleteMessage, sendImageMessage, sendReadReceipt, sendFileMessage, setDisplayName, setAvatar, createRoom, inviteUser, forwardMessage, paginateRoomHistory, sendAudioMessage, setPinnedMessages, sendPollStart, sendPollResponse, translateText, sendStickerMessage, sendGifMessage, getSecureCloudProfileForClient, getRoomNotificationMode, setRoomNotificationMode as updateRoomPushRule, RoomCreationOptions } from '@matrix-messenger/core';
+import { mxcToHttp, sendReaction, sendTypingIndicator, editMessage, sendMessage, deleteMessage, sendImageMessage, sendReadReceipt, sendFileMessage, setDisplayName, setAvatar, createRoom, inviteUser, forwardMessage, paginateRoomHistory, sendAudioMessage, setPinnedMessages, sendPollStart, sendPollResponse, translateText, sendStickerMessage, sendGifMessage, getSecureCloudProfileForClient, getRoomNotificationMode, setRoomNotificationMode as updateRoomPushRule, RoomCreationOptions, getRoomTTL, setRoomTTL, isRoomHidden, setRoomHidden } from '@matrix-messenger/core';
 import { startGroupCall, joinGroupCall, getDisplayMedia, enumerateDevices } from '@matrix-messenger/core';
 import {
     getScheduledMessages,
@@ -58,6 +58,7 @@ import {
     OutboxPayload,
 } from '../services/matrixService';
 import { useAccountStore } from '../services/accountManager';
+import { getAppLockSnapshot, unlockWithPin, unlockWithBiometric, isSessionUnlocked, ensureAppLockConsistency } from '../services/appLockService';
 
 interface ChatPageProps {
     client?: MatrixClient;
@@ -138,6 +139,17 @@ const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, s
     const [isSharedMediaLoading, setIsSharedMediaLoading] = useState(false);
     const [isSharedMediaPaginating, setIsSharedMediaPaginating] = useState(false);
     const [outboxItems, setOutboxItems] = useState<Record<string, { payload: OutboxPayload; attempts: number; error?: string }>>({});
+    const [currentSelfDestructSeconds, setCurrentSelfDestructSeconds] = useState<number | null>(null);
+    const [appLockState, setAppLockState] = useState<{ enabled: boolean; biometricEnabled: boolean; unlocked: boolean }>(() => ({
+        enabled: false,
+        biometricEnabled: false,
+        unlocked: isSessionUnlocked(),
+    }));
+    const [isPinPromptOpen, setIsPinPromptOpen] = useState(false);
+    const [pinInput, setPinInput] = useState('');
+    const [pinError, setPinError] = useState<string | null>(null);
+    const [pendingHiddenRoomId, setPendingHiddenRoomId] = useState<string | null>(null);
+    const [hiddenRoomIds, setHiddenRoomIds] = useState<string[]>([]);
     const normalizeAttachments = (attachments: unknown): DraftAttachment[] => {
         if (!Array.isArray(attachments)) return [];
 
@@ -235,6 +247,72 @@ const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, s
             return [attachment];
         });
     };
+
+    useEffect(() => {
+        const initialiseAppLock = async () => {
+            try {
+                await ensureAppLockConsistency();
+                const snapshot = await getAppLockSnapshot();
+                setAppLockState({
+                    enabled: snapshot.enabled,
+                    biometricEnabled: snapshot.biometricEnabled,
+                    unlocked: snapshot.enabled ? isSessionUnlocked() : true,
+                });
+            } catch (error) {
+                console.warn('Failed to load app lock snapshot', error);
+            }
+        };
+        void initialiseAppLock();
+    }, []);
+
+    useEffect(() => {
+        if (!isSettingsOpen) {
+            const refreshSnapshot = async () => {
+                try {
+                    const snapshot = await getAppLockSnapshot();
+                    setAppLockState(prev => ({
+                        enabled: snapshot.enabled,
+                        biometricEnabled: snapshot.biometricEnabled,
+                        unlocked: snapshot.enabled ? isSessionUnlocked() : true,
+                    }));
+                } catch (error) {
+                    console.warn('Failed to refresh app lock snapshot', error);
+                }
+            };
+            void refreshSnapshot();
+        }
+    }, [isSettingsOpen]);
+
+    const describeTimer = useCallback((seconds: number | null): string => {
+        if (!seconds) return 'отключено';
+        if (seconds < 60) return `${seconds} секунд`;
+        if (seconds < 3600) {
+            const minutes = Math.round(seconds / 60);
+            return `${minutes} минут`;
+        }
+        if (seconds < 86400) {
+            const hours = Math.round(seconds / 3600);
+            return `${hours} часов`;
+        }
+        const days = Math.round(seconds / 86400);
+        return `${days} дней`;
+    }, []);
+
+    const notifyTimerChange = useCallback(async (seconds: number | null) => {
+        if (!selectedRoomId) return;
+        const description = describeTimer(seconds);
+        const body = seconds
+            ? `🔒 Автоудаление сообщений включено: ${description}.`
+            : '🔓 Автоудаление сообщений отключено.';
+        try {
+            await client.sendEvent(selectedRoomId, EventType.RoomMessage, {
+                msgtype: MsgType.Notice,
+                body,
+            } as any);
+        } catch (error) {
+            console.warn('Failed to broadcast timer change', error);
+        }
+    }, [client, describeTimer, selectedRoomId]);
 
     const serializeAttachmentForComparison = (attachment: DraftAttachment) => ({
         id: attachment.id,
@@ -1055,6 +1133,8 @@ const handleLayoutChange = useCallback((layout: 'grid'|'spotlight') => {
 
         let savedMessagesRoom: UIRoom | null = null;
 
+        const nextHiddenRoomIds: string[] = [];
+
         const roomData: UIRoom[] = sortedRooms.map(room => {
             const lastEvent = room.timeline[room.timeline.length - 1];
             const pinnedEvent = room.currentState.getStateEvents(EventType.RoomPinnedEvents, '');
@@ -1078,6 +1158,13 @@ const handleLayoutChange = useCallback((layout: 'grid'|'spotlight') => {
             const spaceParentIds = (Array.isArray(parentEvents) ? parentEvents : [])
                 .map(ev => ev.getStateKey())
                 .filter((id): id is string => !!id);
+            const ttlAccountData = room.getAccountData('m.room.ttl' as any);
+            const ttlValue = typeof ttlAccountData?.getContent?.()?.ttl === 'number' ? ttlAccountData.getContent().ttl as number : null;
+            const ttlSeconds = ttlValue ? Math.round(ttlValue / 1000) : null;
+            const hidden = isRoomHidden(client, room.roomId);
+            if (hidden) {
+                nextHiddenRoomIds.push(room.roomId);
+            }
             const uiRoom: UIRoom = {
                 roomId: room.roomId,
                 name: room.name,
@@ -1093,6 +1180,8 @@ const handleLayoutChange = useCallback((layout: 'grid'|'spotlight') => {
                 spaceChildIds,
                 spaceParentIds,
                 canonicalAlias: canonicalAlias ?? null,
+                isHidden: hidden,
+                selfDestructSeconds: ttlSeconds,
             };
 
             if (room.roomId === savedMessagesRoomId) {
@@ -1100,6 +1189,15 @@ const handleLayoutChange = useCallback((layout: 'grid'|'spotlight') => {
                     ...uiRoom,
                     name: 'Saved Messages',
                     isSavedMessages: true,
+                };
+            }
+
+            if (hidden && appLockState.enabled && !appLockState.unlocked) {
+                return {
+                    ...uiRoom,
+                    name: '🔒 Hidden chat',
+                    lastMessage: null,
+                    unreadCount: 0,
                 };
             }
 
@@ -1114,7 +1212,8 @@ const handleLayoutChange = useCallback((layout: 'grid'|'spotlight') => {
         }
 
         setIsRoomsLoading(false);
-    }, [client, savedMessagesRoomId, parseMatrixEvent]);
+        setHiddenRoomIds(nextHiddenRoomIds);
+    }, [client, savedMessagesRoomId, parseMatrixEvent, appLockState.enabled, appLockState.unlocked]);
 
     useEffect(() => {
         loadRooms();
@@ -1264,6 +1363,16 @@ const handleLayoutChange = useCallback((layout: 'grid'|'spotlight') => {
     }, [activeCall]);
 
     const handleSelectRoom = useCallback(async (roomId: string) => {
+        const targetRoom = client.getRoom(roomId);
+        const hidden = targetRoom ? isRoomHidden(client, roomId) : false;
+        if (hidden && appLockState.enabled && !appLockState.unlocked) {
+            setPendingHiddenRoomId(roomId);
+            setPinInput('');
+            setPinError(null);
+            setIsPinPromptOpen(true);
+            return;
+        }
+
         if (selectedRoomId) {
              await sendTypingIndicator(client, selectedRoomId, false);
         }
@@ -1277,7 +1386,7 @@ const handleLayoutChange = useCallback((layout: 'grid'|'spotlight') => {
         setHighlightedMessage(null);
         setPendingScrollTarget(null);
         focusEventIdRef.current = null;
-        const room = client.getRoom(roomId);
+        const room = targetRoom;
         if (room) {
             setCanPin(room.currentState.maySendStateEvent(EventType.RoomPinnedEvents, client.getUserId()!));
             loadPinnedMessage(roomId);
@@ -1293,9 +1402,80 @@ const handleLayoutChange = useCallback((layout: 'grid'|'spotlight') => {
             // FIX: The `getMembersWithTyping` method exists at runtime but is not in the SDK's Room type definition. Cast to `any` to use it.
             setTypingUsers((room as any).getMembersWithTyping().map((m: any) => m.name));
 
+            const ttlAccountData = room.getAccountData('m.room.ttl' as any);
+            const ttlValue = typeof ttlAccountData?.getContent?.()?.ttl === 'number' ? ttlAccountData.getContent().ttl as number : null;
+            setCurrentSelfDestructSeconds(ttlValue ? Math.round(ttlValue / 1000) : null);
+
             setTimeout(() => scrollToBottom('auto'), 100);
+        } else {
+            setCurrentSelfDestructSeconds(null);
         }
-    }, [client, selectedRoomId, scrollToBottom, loadRoomMessages, loadPinnedMessage]);
+    }, [client, selectedRoomId, scrollToBottom, loadRoomMessages, loadPinnedMessage, appLockState.enabled, appLockState.unlocked]);
+
+    const handleSelfDestructChange = useCallback(async (seconds: number | null) => {
+        if (!selectedRoomId) return;
+        try {
+            await setRoomTTL(client, selectedRoomId, seconds ? seconds * 1000 : null);
+            setCurrentSelfDestructSeconds(seconds);
+            await notifyTimerChange(seconds);
+            loadRooms();
+        } catch (error) {
+            console.error('Failed to update self-destruct timer', error);
+        }
+    }, [client, selectedRoomId, notifyTimerChange, loadRooms]);
+
+    const handleToggleHiddenRoom = useCallback(async () => {
+        if (!selectedRoomId) return;
+        const room = client.getRoom(selectedRoomId);
+        const hidden = room ? isRoomHidden(client, selectedRoomId) : false;
+        if (!hidden && !appLockState.enabled) {
+            window.alert('Сначала включите блокировку приложения и задайте PIN в настройках безопасности.');
+            return;
+        }
+        if (!hidden && appLockState.enabled && !appLockState.unlocked) {
+            setPendingHiddenRoomId(selectedRoomId);
+            setPinInput('');
+            setPinError(null);
+            setIsPinPromptOpen(true);
+            return;
+        }
+        try {
+            await setRoomHidden(client, selectedRoomId, !hidden);
+            loadRooms();
+        } catch (error) {
+            console.error('Failed to toggle hidden state', error);
+        }
+    }, [client, selectedRoomId, appLockState.enabled, appLockState.unlocked, loadRooms]);
+
+    const handleUnlockByPin = useCallback(async () => {
+        const result = await unlockWithPin(pinInput);
+        if (!result.success) {
+            setPinError(result.error ?? 'Не удалось проверить PIN');
+            return;
+        }
+        setAppLockState(prev => ({ ...prev, unlocked: true }));
+        setIsPinPromptOpen(false);
+        const target = pendingHiddenRoomId;
+        setPendingHiddenRoomId(null);
+        if (target) {
+            await handleSelectRoom(target);
+        }
+    }, [pinInput, handleSelectRoom, pendingHiddenRoomId]);
+
+    const handleUnlockByBiometric = useCallback(async () => {
+        const result = await unlockWithBiometric();
+        if (!result.success) {
+            setPinError(result.error ?? 'Биометрическая проверка не удалась');
+            return;
+        }
+        setAppLockState(prev => ({ ...prev, unlocked: true }));
+        setIsPinPromptOpen(false);
+        const target = pendingHiddenRoomId;
+        setPendingHiddenRoomId(null);
+        if (target) {
+            await handleSelectRoom(target);
+        }
+    }, [handleSelectRoom, pendingHiddenRoomId]);
 
     const handleJumpToSearchResult = useCallback(async (result: SearchResultItem) => {
         const eventId = result.event.getId();
@@ -1969,6 +2149,14 @@ const handleLayoutChange = useCallback((layout: 'grid'|'spotlight') => {
                 activeAccountKey={activeAccountKey}
                 onSwitchAccount={key => switchAccount(key)}
                 onAddAccount={openAddAccount}
+                hiddenRoomIds={hiddenRoomIds}
+                onUnlockHidden={() => {
+                    setPendingHiddenRoomId(hiddenRoomIds[0] ?? null);
+                    setPinInput('');
+                    setPinError(null);
+                    setIsPinPromptOpen(true);
+                }}
+                isHiddenUnlocked={appLockState.unlocked || !appLockState.enabled}
             />
             <main
                 style={{ backgroundImage: chatBackground ? `url(${chatBackground})` : 'none' }}
@@ -1993,6 +2181,11 @@ const handleLayoutChange = useCallback((layout: 'grid'|'spotlight') => {
                             notificationMode={selectedRoom.notificationMode ?? accountRoomNotificationModes[selectedRoom.roomId] ?? 'all'}
                             onNotificationModeChange={(mode) => handleSetNotificationLevel(selectedRoom.roomId, mode)}
                             onMuteRoom={() => handleMuteRoom(selectedRoom.roomId)}
+                            selfDestructSeconds={currentSelfDestructSeconds}
+                            onSelfDestructChange={handleSelfDestructChange}
+                            isHiddenRoom={selectedRoom.isHidden ?? false}
+                            onToggleHiddenRoom={handleToggleHiddenRoom}
+                            appLockEnabled={appLockState.enabled}
                         />
                         {isSecureCloudActive && (
                             <div className="px-4 pt-3 space-y-3">
@@ -2266,6 +2459,53 @@ const handleLayoutChange = useCallback((layout: 'grid'|'spotlight') => {
                     onDelete={handleDeleteScheduled}
                     onSendNow={handleSendScheduledNow}
                 />
+            )}
+
+            {isPinPromptOpen && (
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+                    <div className="bg-bg-primary rounded-lg shadow-xl w-full max-w-sm p-6 space-y-4">
+                        <h3 className="text-lg font-semibold text-text-primary">Разблокировать скрытые чаты</h3>
+                        <p className="text-sm text-text-secondary">
+                            Введите PIN, установленный в настройках безопасности, чтобы открыть скрытые беседы.
+                        </p>
+                        <input
+                            type="password"
+                            value={pinInput}
+                            onChange={e => setPinInput(e.target.value.replace(/\D+/g, ''))}
+                            maxLength={12}
+                            inputMode="numeric"
+                            className="w-full bg-bg-secondary text-text-primary px-3 py-2 rounded-md border border-border-primary focus:outline-none focus:ring-1 focus:ring-ring-focus"
+                            placeholder="PIN"
+                        />
+                        {pinError && <p className="text-sm text-red-400">{pinError}</p>}
+                        <div className="flex flex-wrap gap-2 justify-end">
+                            <button
+                                onClick={() => {
+                                    setIsPinPromptOpen(false);
+                                    setPendingHiddenRoomId(null);
+                                    setPinError(null);
+                                }}
+                                className="px-3 py-2 text-sm text-text-secondary hover:text-text-primary"
+                            >
+                                Отмена
+                            </button>
+                            {appLockState.biometricEnabled && (
+                                <button
+                                    onClick={handleUnlockByBiometric}
+                                    className="px-3 py-2 text-sm bg-purple-500/20 text-purple-200 rounded-md hover:bg-purple-500/30"
+                                >
+                                    Биометрия
+                                </button>
+                            )}
+                            <button
+                                onClick={handleUnlockByPin}
+                                className="px-3 py-2 text-sm bg-accent text-text-inverted rounded-md hover:bg-accent/90"
+                            >
+                                Разблокировать
+                            </button>
+                        </div>
+                    </div>
+                </div>
             )}
 
             {isInviteUserOpen && selectedRoom && (

@@ -14,7 +14,7 @@ import {
     AutoDiscovery,
     AutoDiscoveryAction,
     AutoDiscoveryError, 
-    IndexedDBStore, IndexedDBCryptoStore, ClientEvent, MemoryStore, MatrixScheduler, Preset} from 'matrix-js-sdk';
+    IndexedDBStore, IndexedDBCryptoStore, ClientEvent, MemoryStore, MatrixScheduler, Preset, RoomEvent} from 'matrix-js-sdk';
 import type { HierarchyRoom } from 'matrix-js-sdk';
 
 
@@ -833,6 +833,11 @@ const bootstrapAuthenticatedClient = async (client: MatrixClient, secureProfile?
         bindOutboxToClient(client);
     } catch (e) {
         console.warn('bindOutboxToClient failed', e);
+    }
+    try {
+        bindSelfDestructWatcher(client);
+    } catch (e) {
+        console.warn('bindSelfDestructWatcher failed', e);
     }
     if (secureProfile) {
         setSecureCloudProfileForClient(client, secureProfile);
@@ -2150,11 +2155,24 @@ export function sendMessage(
             };
         }
 
+        let ttlForMessage = getNextMessageTTL(roomId);
+        if (ttlForMessage == null) {
+            ttlForMessage = await getRoomTTL(client, roomId);
+        }
+        if (typeof ttlForMessage === 'number' && ttlForMessage > 0) {
+            const expiresAt = Date.now() + ttlForMessage;
+            content[SELF_DESTRUCT_CONTENT_KEY] = {
+                ttlMs: ttlForMessage,
+                expiresAt,
+            };
+        }
+
         const queueOutbox = async () => {
             const localId = await enqueueOutbox(roomId, EventType.RoomMessage, content, {
                 threadRootId,
                 replyToEventId: replyToEvent?.getId(),
             });
+            clearNextMessageTTL(roomId);
             return { event_id: localId };
         };
 
@@ -2163,7 +2181,9 @@ export function sendMessage(
         }
 
         try {
-            return await client.sendEvent(roomId, EventType.RoomMessage, content);
+            const result = await client.sendEvent(roomId, EventType.RoomMessage, content);
+            clearNextMessageTTL(roomId);
+            return result;
         } catch (error: any) {
             if (shouldQueueFromError(error)) {
                 return queueOutbox();
@@ -2868,6 +2888,11 @@ export function swapVideoTrack(stream: MediaStream, newTrack: MediaStreamTrack):
 // In-memory storage for per-room TTL settings and next message TTL
 const roomTTLCache = new Map<string, number | null>();
 const nextMessageTTLCache = new Map<string, number | null>();
+const SELF_DESTRUCT_CONTENT_KEY = 'com.matrix_messenger.self_destruct';
+const HIDDEN_ROOM_TAG = 'com.matrix_messenger.hidden';
+
+const selfDestructTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const selfDestructBindings = new WeakMap<MatrixClient, () => void>();
 
 /**
  * Get the default TTL for a room (in milliseconds).
@@ -2944,3 +2969,150 @@ export function getNextMessageTTL(roomId: string): number | null {
 export function clearNextMessageTTL(roomId: string): void {
   nextMessageTTLCache.delete(roomId);
 }
+
+const makeSelfDestructKey = (roomId: string, eventId: string) => `${roomId}/${eventId}`;
+
+const cancelSelfDestructTimer = (roomId: string, eventId: string) => {
+  const key = makeSelfDestructKey(roomId, eventId);
+  const timer = selfDestructTimers.get(key);
+  if (timer) {
+    clearTimeout(timer);
+    selfDestructTimers.delete(key);
+  }
+};
+
+const scheduleSelfDestruct = (client: MatrixClient, roomId: string, eventId: string, expiresAt: number) => {
+  if (!eventId || !roomId || Number.isNaN(expiresAt)) return;
+  const key = makeSelfDestructKey(roomId, eventId);
+  const delay = Math.max(expiresAt - Date.now(), 0);
+  cancelSelfDestructTimer(roomId, eventId);
+  if (delay <= 0) {
+    void client.redactEvent(roomId, eventId, undefined, { reason: 'Self-destruct timer elapsed' }).catch(error => {
+      console.warn('Failed to redact expired event', error);
+    });
+    return;
+  }
+  const timeout = setTimeout(() => {
+    selfDestructTimers.delete(key);
+    void client.redactEvent(roomId, eventId, undefined, { reason: 'Self-destruct timer elapsed' }).catch(error => {
+      console.warn('Failed to redact event after TTL', error);
+    });
+  }, delay);
+  selfDestructTimers.set(key, timeout);
+};
+
+const extractSelfDestruct = (event: MatrixEvent): { expiresAt: number } | null => {
+  const content = event.getContent();
+  const payload = content?.[SELF_DESTRUCT_CONTENT_KEY];
+  if (!payload || typeof payload !== 'object') return null;
+  const expiresAt = typeof payload.expiresAt === 'number' ? payload.expiresAt : undefined;
+  const ttlMs = typeof payload.ttlMs === 'number' ? payload.ttlMs : undefined;
+  if (typeof expiresAt === 'number' && Number.isFinite(expiresAt)) {
+    return { expiresAt };
+  }
+  if (typeof ttlMs === 'number' && Number.isFinite(ttlMs)) {
+    return { expiresAt: event.getTs() + ttlMs };
+  }
+  return null;
+};
+
+export const bindSelfDestructWatcher = (client: MatrixClient): void => {
+  if (selfDestructBindings.has(client)) {
+    return;
+  }
+
+  const onTimeline = (event: MatrixEvent, room?: MatrixRoom) => {
+    if (!room) return;
+    const eventId = event.getId();
+    if (!eventId) return;
+    const info = extractSelfDestruct(event);
+    if (!info) return;
+    scheduleSelfDestruct(client, room.roomId, eventId, info.expiresAt);
+  };
+
+  const onRedaction = (event: MatrixEvent, room?: MatrixRoom) => {
+    if (!room) return;
+    const targetId = event.getRedacts?.();
+    if (typeof targetId === 'string') {
+      cancelSelfDestructTimer(room.roomId, targetId);
+    }
+  };
+
+  client.on(RoomEvent.Timeline, onTimeline);
+  client.on(RoomEvent.Redaction, onRedaction as any);
+
+  client.getRooms().forEach(room => {
+    const events = room.getLiveTimeline().getEvents();
+    events.forEach(ev => {
+      const info = extractSelfDestruct(ev);
+      if (info && ev.getId()) {
+        scheduleSelfDestruct(client, room.roomId, ev.getId()!, info.expiresAt);
+      }
+    });
+  });
+
+  selfDestructBindings.set(client, () => {
+    client.removeListener(RoomEvent.Timeline, onTimeline);
+    client.removeListener(RoomEvent.Redaction, onRedaction as any);
+  });
+};
+
+const readRoomTags = (room: MatrixRoom): Record<string, any> => {
+  const tags: Record<string, any> = {};
+  try {
+    const accountData = room.getAccountData('m.tag' as any);
+    const accountTags = accountData?.getContent()?.tags;
+    if (accountTags && typeof accountTags === 'object') {
+      Object.assign(tags, accountTags);
+    }
+  } catch (error) {
+    // ignore
+  }
+  const runtimeTags = (room as any).tags;
+  if (runtimeTags && typeof runtimeTags === 'object') {
+    Object.assign(tags, runtimeTags);
+  }
+  return tags;
+};
+
+export const isRoomHidden = (client: MatrixClient, roomId: string): boolean => {
+  const room = client.getRoom(roomId);
+  if (!room) return false;
+  return Boolean(readRoomTags(room)[HIDDEN_ROOM_TAG]);
+};
+
+export const setRoomHidden = async (client: MatrixClient, roomId: string, hidden: boolean): Promise<void> => {
+  const room = client.getRoom(roomId);
+  try {
+    if (hidden) {
+      if (typeof client.setRoomTag === 'function') {
+        await client.setRoomTag(roomId, HIDDEN_ROOM_TAG, { hidden: true });
+      } else {
+        await client.setRoomAccountData(roomId, 'm.tag' as any, { tags: { [HIDDEN_ROOM_TAG]: { hidden: true } } });
+      }
+    } else if (typeof client.deleteRoomTag === 'function') {
+      await client.deleteRoomTag(roomId, HIDDEN_ROOM_TAG);
+    } else {
+      const tags = room ? readRoomTags(room) : {};
+      delete tags[HIDDEN_ROOM_TAG];
+      await client.setRoomAccountData(roomId, 'm.tag' as any, { tags });
+    }
+  } catch (error) {
+    console.warn('Failed to update hidden tag', error);
+  }
+
+  if (room) {
+    (room as any).tags = readRoomTags(room);
+    if (hidden) {
+      (room as any).tags[HIDDEN_ROOM_TAG] = { hidden: true };
+    } else {
+      delete (room as any).tags[HIDDEN_ROOM_TAG];
+    }
+  }
+};
+
+export const getHiddenRoomIds = (client: MatrixClient): string[] =>
+  client
+    .getRooms()
+    .filter(room => Boolean(readRoomTags(room)[HIDDEN_ROOM_TAG]))
+    .map(room => room.roomId);

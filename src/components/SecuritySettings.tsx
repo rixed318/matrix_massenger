@@ -12,6 +12,12 @@ import {
   restoreRoomKeysFromBackup,
 } from '../services/matrixService';
 import { requestSelfVerification } from '../services/e2eeService';
+import {
+  getAppLockSnapshot,
+  enableAppLock,
+  disableAppLock,
+  AppLockSnapshot,
+} from '../services/appLockService';
 
 interface SecuritySettingsProps {
   client: MatrixClient;
@@ -103,6 +109,24 @@ const SecuritySettings: React.FC<SecuritySettingsProps> = ({ client, isOpen, onC
     dataUrl: null,
     message: null,
   });
+  const [appLockSnapshot, setAppLockSnapshot] = useState<AppLockSnapshot>({ enabled: false, biometricEnabled: false });
+  const [pinValue, setPinValue] = useState('');
+  const [pinConfirm, setPinConfirm] = useState('');
+  const [appLockBiometric, setAppLockBiometric] = useState(false);
+  const [appLockLoading, setAppLockLoading] = useState(false);
+  const isTauriRuntime = typeof window !== 'undefined' && Boolean((window as any).__TAURI__);
+
+  const refreshAppLock = useCallback(async () => {
+    try {
+      const snapshot = await getAppLockSnapshot();
+      setAppLockSnapshot(snapshot);
+      setAppLockBiometric(snapshot.biometricEnabled);
+      setPinValue('');
+      setPinConfirm('');
+    } catch (err) {
+      console.warn('Failed to load app lock snapshot', err);
+    }
+  }, []);
 
   const refreshDevices = useCallback(async () => {
     const userId = client.getUserId();
@@ -184,6 +208,11 @@ const SecuritySettings: React.FC<SecuritySettingsProps> = ({ client, isOpen, onC
       setDevices([]);
     };
   }, [client, isOpen, refreshDevices]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    void refreshAppLock();
+  }, [isOpen, refreshAppLock]);
 
   useEffect(() => () => {
     autoBackupStopper?.();
@@ -378,6 +407,49 @@ const SecuritySettings: React.FC<SecuritySettingsProps> = ({ client, isOpen, onC
     setFeedback('Фоновое резервное копирование включено.');
   };
 
+  const handleEnableAppLock = async () => {
+    if (!isTauriRuntime) {
+      setError('Блокировка приложения доступна только в настольном приложении.');
+      return;
+    }
+    if (pinValue.length < 4) {
+      setError('PIN должен содержать минимум 4 цифры.');
+      return;
+    }
+    if (pinValue !== pinConfirm) {
+      setError('PIN и подтверждение не совпадают.');
+      return;
+    }
+    setAppLockLoading(true);
+    setError(null);
+    setFeedback(null);
+    try {
+      await enableAppLock(pinValue, appLockBiometric);
+      setFeedback('Блокировка приложения включена. Скрытые чаты будут доступны только после разблокировки.');
+      await refreshAppLock();
+    } catch (err: any) {
+      setError(`Не удалось включить блокировку: ${err?.message ?? err}`);
+    } finally {
+      setAppLockLoading(false);
+    }
+  };
+
+  const handleDisableAppLock = async () => {
+    if (!isTauriRuntime) return;
+    setAppLockLoading(true);
+    setError(null);
+    setFeedback(null);
+    try {
+      await disableAppLock();
+      setFeedback('Блокировка приложения выключена.');
+      await refreshAppLock();
+    } catch (err: any) {
+      setError(`Не удалось отключить блокировку: ${err?.message ?? err}`);
+    } finally {
+      setAppLockLoading(false);
+    }
+  };
+
   const handleStartQrVerification = async () => {
     setError(null);
     setFeedback(null);
@@ -418,6 +490,96 @@ const SecuritySettings: React.FC<SecuritySettingsProps> = ({ client, isOpen, onC
               {error ?? feedback}
             </div>
           )}
+
+          <section className="space-y-4">
+            <div className="flex items-center justify-between">
+              <div>
+                <h3 className="text-lg font-semibold text-text-primary">Блокировка приложения</h3>
+                <p className="text-sm text-text-secondary">
+                  Защитите скрытые чаты PIN-кодом и, при поддержке системы, биометрией. Настройка хранится в защищённом хранилище Tauri.
+                </p>
+                {appLockSnapshot.updatedAt && (
+                  <p className="text-xs text-text-secondary mt-1">
+                    Обновлено {formatDistanceToNow(appLockSnapshot.updatedAt, { addSuffix: true })}
+                  </p>
+                )}
+                {!isTauriRuntime && (
+                  <p className="text-xs text-amber-400 mt-1">
+                    Доступно только в настольном приложении.
+                  </p>
+                )}
+              </div>
+              <div className="flex flex-col items-end gap-2">
+                <span className={`px-3 py-1 rounded-full text-xs font-semibold ${appLockSnapshot.enabled ? 'bg-emerald-500/10 text-emerald-300' : 'bg-bg-tertiary text-text-secondary'}`}>
+                  {appLockSnapshot.enabled ? 'Включена' : 'Выключена'}
+                </span>
+                {appLockSnapshot.enabled && (
+                  <button
+                    onClick={handleDisableAppLock}
+                    className="text-xs text-red-400 hover:text-red-300"
+                    disabled={appLockLoading || !isTauriRuntime}
+                  >
+                    Отключить
+                  </button>
+                )}
+              </div>
+            </div>
+            <div className="grid gap-4 md:grid-cols-2">
+              <label className="block">
+                <span className="block text-sm font-medium text-text-secondary mb-1">Новый PIN</span>
+                <input
+                  type="password"
+                  value={pinValue}
+                  onChange={e => setPinValue(e.target.value.replace(/\D+/g, ''))}
+                  maxLength={12}
+                  className="w-full bg-bg-secondary text-text-primary px-3 py-2 rounded-md border border-border-primary focus:outline-none focus:ring-1 focus:ring-ring-focus"
+                  placeholder="Введите 4-12 цифр"
+                  inputMode="numeric"
+                  disabled={!isTauriRuntime || appLockLoading}
+                />
+              </label>
+              <label className="block">
+                <span className="block text-sm font-medium text-text-secondary mb-1">Подтверждение PIN</span>
+                <input
+                  type="password"
+                  value={pinConfirm}
+                  onChange={e => setPinConfirm(e.target.value.replace(/\D+/g, ''))}
+                  maxLength={12}
+                  className="w-full bg-bg-secondary text-text-primary px-3 py-2 rounded-md border border-border-primary focus:outline-none focus:ring-1 focus:ring-ring-focus"
+                  placeholder="Повторите PIN"
+                  inputMode="numeric"
+                  disabled={!isTauriRuntime || appLockLoading}
+                />
+              </label>
+            </div>
+            <div className="flex items-center gap-3">
+              <input
+                id="app-lock-biometric"
+                type="checkbox"
+                className="h-4 w-4"
+                checked={appLockBiometric}
+                onChange={e => setAppLockBiometric(e.target.checked)}
+                disabled={!isTauriRuntime || appLockLoading}
+              />
+              <label htmlFor="app-lock-biometric" className="text-sm text-text-secondary">
+                Разрешить разблокировку через биометрию (если поддерживается ОС)
+              </label>
+            </div>
+            <div className="flex flex-wrap gap-3">
+              <button
+                onClick={handleEnableAppLock}
+                className="px-4 py-2 bg-accent text-text-inverted rounded-md hover:bg-accent/90 disabled:opacity-50"
+                disabled={!isTauriRuntime || appLockLoading}
+              >
+                Сохранить PIN
+              </button>
+              {appLockSnapshot.enabled && (
+                <span className="text-xs text-text-secondary self-center">
+                  При смене PIN скрытые чаты потребуют повторной разблокировки.
+                </span>
+              )}
+            </div>
+          </section>
 
           <section>
             <h3 className="text-lg font-semibold text-text-primary mb-4">Устройства</h3>
