@@ -1,4 +1,5 @@
 import React, { createContext, useContext, useEffect } from 'react';
+import { ClientEvent, RoomEvent } from 'matrix-js-sdk';
 import { invoke } from '@tauri-apps/api/core';
 import { createStore, StoreApi } from 'zustand/vanilla';
 import { useStore } from 'zustand';
@@ -9,6 +10,14 @@ import {
   createMatrixSession,
   createMatrixSessionFromExistingClient,
 } from './matrixRuntime';
+import {
+  collectUnifiedRooms,
+  buildQuickFilterSummaries,
+  type UnifiedAccountDescriptor,
+  type UnifiedRoomSummary,
+  type UniversalQuickFilterId,
+  type UniversalQuickFilterSummary,
+} from '../utils/chatSelectors';
 
 const RESTORE_ERROR_MESSAGE = 'Не удалось восстановить сессии. Авторизуйтесь заново.';
 
@@ -29,12 +38,21 @@ export interface AccountRuntime {
   roomNotificationModes: Record<string, RoomNotificationMode>;
 }
 
+export type InboxViewMode = 'active' | 'all';
+
+export type AggregatedRoomSnapshot = UnifiedRoomSummary;
+
 export interface AccountStoreState {
   accounts: Record<string, AccountRuntime>;
   activeKey: string | null;
   isBooting: boolean;
   error: string | null;
   isAddAccountOpen: boolean;
+  aggregatedRooms: AggregatedRoomSnapshot[];
+  aggregatedQuickFilters: UniversalQuickFilterSummary[];
+  aggregatedUnread: number;
+  universalMode: InboxViewMode;
+  activeQuickFilterId: UniversalQuickFilterId;
   boot: () => Promise<void>;
   addClientAccount: (client: MatrixClient) => Promise<void>;
   removeAccount: (key?: string) => Promise<void>;
@@ -45,6 +63,9 @@ export interface AccountStoreState {
   updateAccountCredentials: (key: string, updater: (creds: StoredAccount) => StoredAccount) => Promise<void>;
   setRoomNotificationMode: (roomId: string, mode: RoomNotificationMode, key?: string | null) => void;
   setRoomNotificationModes: (modes: Record<string, RoomNotificationMode>, key?: string | null) => void;
+  refreshAggregatedState: () => void;
+  setUniversalMode: (mode: InboxViewMode) => void;
+  setActiveQuickFilterId: (id: UniversalQuickFilterId) => void;
 }
 
 export const createAccountKey = (creds: AccountCredentials) =>
@@ -74,6 +95,51 @@ export const createAccountStore = () => {
   };
 
   const store = createStore<AccountStoreState>((set, get) => {
+    const refreshAggregatedState = () => {
+      const { accounts, activeQuickFilterId: currentFilter } = get();
+      const descriptors: UnifiedAccountDescriptor[] = Object.values(accounts).map(runtime => ({
+        key: runtime.creds.key,
+        client: runtime.client,
+        savedMessagesRoomId: runtime.savedMessagesRoomId,
+        roomNotificationModes: runtime.roomNotificationModes,
+        userId: runtime.creds.user_id,
+        displayName: runtime.displayName,
+        avatarUrl: runtime.avatarUrl,
+        homeserverUrl: runtime.creds.homeserver_url,
+      }));
+
+      const aggregatedRooms = collectUnifiedRooms(descriptors);
+      const aggregatedQuickFilters = buildQuickFilterSummaries(aggregatedRooms);
+      const aggregatedUnread = aggregatedQuickFilters.find(filter => filter.id === 'all')?.unreadCount ?? 0;
+      const availableFilterIds = new Set(aggregatedQuickFilters.map(filter => filter.id));
+      const nextFilter: UniversalQuickFilterId = availableFilterIds.has(currentFilter) ? currentFilter : 'all';
+
+      set({
+        aggregatedRooms,
+        aggregatedQuickFilters,
+        aggregatedUnread,
+        activeQuickFilterId: nextFilter,
+      });
+    };
+
+    const attachAggregatedListeners = (key: string, client: MatrixClient) => {
+      const handleRefresh = () => {
+        refreshAggregatedState();
+      };
+
+      client.on(RoomEvent.Timeline, handleRefresh as any);
+      client.on(RoomEvent.Receipt, handleRefresh as any);
+      client.on(ClientEvent.Sync, handleRefresh as any);
+      client.on(ClientEvent.Room, handleRefresh as any);
+
+      return () => {
+        client.removeListener(RoomEvent.Timeline, handleRefresh as any);
+        client.removeListener(RoomEvent.Receipt, handleRefresh as any);
+        client.removeListener(ClientEvent.Sync, handleRefresh as any);
+        client.removeListener(ClientEvent.Room, handleRefresh as any);
+      };
+    };
+
     const toRuntime = async (
       account: StoredAccount,
       existingClient?: MatrixClient,
@@ -91,6 +157,7 @@ export const createAccountStore = () => {
             },
           };
         });
+        refreshAggregatedState();
       };
 
       const session: MatrixSession = existingClient
@@ -98,7 +165,10 @@ export const createAccountStore = () => {
         : await createMatrixSession(account, updateUnread);
 
       cleanupSession(account.key);
+      const detachAggregated = attachAggregatedListeners(account.key, session.client);
+
       sessionCleanup.set(account.key, () => {
+        try { detachAggregated(); } catch (error) { console.warn('aggregation detach failed', error); }
         try { session.dispose(); } catch (error) { console.warn('dispose failed', error); }
         try { session.client.stopClient?.(); } catch (error) { console.warn('stopClient failed', error); }
       });
@@ -120,6 +190,7 @@ export const createAccountStore = () => {
 
       if (!isTauriAvailable()) {
         set({ accounts: {}, activeKey: null, isBooting: false });
+        refreshAggregatedState();
         return;
       }
 
@@ -127,6 +198,7 @@ export const createAccountStore = () => {
         const stored = await invoke<StoredAccount[]>('load_credentials');
         if (!stored || stored.length === 0) {
           set({ accounts: {}, activeKey: null });
+          refreshAggregatedState();
           return;
         }
 
@@ -151,9 +223,11 @@ export const createAccountStore = () => {
           activeKey: firstKey,
           error: runtimes.length === 0 ? RESTORE_ERROR_MESSAGE : null,
         });
+        refreshAggregatedState();
       } catch (error) {
         console.error('restore failed', error);
         set({ accounts: {}, activeKey: null, error: RESTORE_ERROR_MESSAGE });
+        refreshAggregatedState();
       } finally {
         set({ isBooting: false });
       }
@@ -181,6 +255,7 @@ export const createAccountStore = () => {
         isAddAccountOpen: false,
         error: null,
       }));
+      refreshAggregatedState();
     };
 
     const removeAccount: AccountStoreState['removeAccount'] = async (key) => {
@@ -211,6 +286,7 @@ export const createAccountStore = () => {
           activeKey: state.activeKey === targetKey ? (remainingKeys[0] ?? null) : state.activeKey,
         };
       });
+      refreshAggregatedState();
     };
 
     const setActiveKey: AccountStoreState['setActiveKey'] = (key) => {
@@ -240,6 +316,7 @@ export const createAccountStore = () => {
         },
       }));
       await persistAccount(updatedCreds);
+      refreshAggregatedState();
     };
 
     const setError: AccountStoreState['setError'] = (value) => set({ error: value });
@@ -264,6 +341,7 @@ export const createAccountStore = () => {
           },
         },
       }));
+      refreshAggregatedState();
     };
 
     const setRoomNotificationMode: AccountStoreState['setRoomNotificationMode'] = (roomId, mode, key = get().activeKey) => {
@@ -279,6 +357,11 @@ export const createAccountStore = () => {
       isBooting: false,
       error: null,
       isAddAccountOpen: false,
+       aggregatedRooms: [],
+       aggregatedQuickFilters: buildQuickFilterSummaries([]),
+       aggregatedUnread: 0,
+       universalMode: 'active',
+       activeQuickFilterId: 'all',
       boot,
       addClientAccount,
       removeAccount,
@@ -289,6 +372,9 @@ export const createAccountStore = () => {
       updateAccountCredentials,
       setRoomNotificationMode,
       setRoomNotificationModes,
+      refreshAggregatedState,
+      setUniversalMode: (mode) => set({ universalMode: mode }),
+      setActiveQuickFilterId: (id) => set({ activeQuickFilterId: id }),
     };
   });
 

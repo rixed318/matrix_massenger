@@ -11,6 +11,10 @@ const AppContent: React.FC = () => {
   const activeKey = useAccountStore(state => state.activeKey);
   const isAddAccountOpen = useAccountStore(state => state.isAddAccountOpen);
   const closeAddAccount = useAccountStore(state => state.closeAddAccount);
+  const universalMode = useAccountStore(state => state.universalMode);
+  const setUniversalMode = useAccountStore(state => state.setUniversalMode);
+  const aggregatedUnread = useAccountStore(state => state.aggregatedUnread);
+  const aggregatedRooms = useAccountStore(state => state.aggregatedRooms);
 
   useEffect(() => {
     const savedTheme = localStorage.getItem('matrix-theme') || '';
@@ -22,6 +26,12 @@ const AppContent: React.FC = () => {
   }, [boot]);
 
   const active = activeKey ? accounts[activeKey] : null;
+  const canUseUniversal = active && (Object.keys(accounts).length > 1 || aggregatedRooms.length > 0);
+
+  const modeButtonClass = (mode: 'active' | 'all') =>
+    `px-3 py-1 text-xs font-semibold rounded-full transition-colors ${
+      universalMode === mode ? 'bg-chip-selected text-text-inverted shadow-sm' : 'text-text-secondary hover:text-text-primary'
+    }`;
 
   if (isBooting) {
     return (
@@ -34,6 +44,29 @@ const AppContent: React.FC = () => {
 
   return (
     <div className="h-screen w-screen bg-bg-primary text-text-primary font-sans">
+      {canUseUniversal && (
+        <div className="fixed top-4 right-4 z-40 flex items-center gap-2 bg-bg-primary/90 border border-border-secondary rounded-full px-3 py-1 shadow-lg backdrop-blur">
+          <button
+            type="button"
+            className={modeButtonClass('active')}
+            onClick={() => setUniversalMode('active')}
+          >
+            Текущий аккаунт
+          </button>
+          <button
+            type="button"
+            className={`${modeButtonClass('all')} flex items-center gap-1`}
+            onClick={() => setUniversalMode('all')}
+          >
+            Все аккаунты
+            {aggregatedUnread > 0 && (
+              <span className="inline-flex items-center justify-center rounded-full bg-accent text-text-inverted px-1.5 text-[10px] leading-none">
+                {aggregatedUnread}
+              </span>
+            )}
+          </button>
+        </div>
+      )}
       {active ? (
         <>
           <AppErrorBoundary key={activeKey || 'chat'}>

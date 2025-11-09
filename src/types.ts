@@ -74,6 +74,8 @@ export interface Room {
   joinRule?: RoomJoinRule | null;
   isFederationEnabled?: boolean;
   slowModeSeconds?: number | null;
+  isHidden?: boolean;
+  selfDestructSeconds?: number | null;
 }
 
 export interface LinkPreviewData {
@@ -125,6 +127,10 @@ export interface Message {
   linkPreview?: LinkPreviewData;
   isSticker?: boolean;
   isGif?: boolean;
+  selfDestruct?: {
+    expiresAt: number;
+    ttlMs?: number;
+  } | null;
 }
 
 export interface ActiveThread {
