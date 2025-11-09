@@ -37,6 +37,7 @@ export interface Poll {
 export interface Room {
   roomId: string;
   name: string;
+  topic?: string;
   avatarUrl: string | null;
   lastMessage: Message | null;
   unreadCount: number;
@@ -44,10 +45,11 @@ export interface Room {
   isEncrypted: boolean;
   isDirectMessageRoom: boolean;
   isSavedMessages?: boolean;
-  roomType?: 'direct' | 'group' | 'saved';
-  status?: 'joined' | 'invited' | 'left';
-  lastMessagePreview?: string | null;
-  lastMessageAt?: number | null;
+  roomType?: string | null;
+  isSpace?: boolean;
+  spaceChildIds?: string[];
+  spaceParentIds?: string[];
+  canonicalAlias?: string | null;
 }
 
 export interface LinkPreviewData {

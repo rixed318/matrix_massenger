@@ -1,12 +1,12 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 // FIX: Import MatrixRoom to correctly type room objects from the SDK.
-import { Room as UIRoom, Message, MatrixEvent, MatrixClient, MatrixRoom, ActiveThread, MatrixUser, Poll, PollResult, Folder, ScheduledMessage, MatrixCall, LinkPreviewData, Sticker, Gif } from '../types';
-import ChatList from './ChatList';
+import { Room as UIRoom, Message, MatrixEvent, Reaction, ReplyInfo, MatrixClient, MatrixRoom, ActiveThread, MatrixUser, Poll, PollResult, Folder, ScheduledMessage, MatrixCall, LinkPreviewData, Sticker, Gif } from '@matrix-messenger/core';
+import RoomList from './RoomList';
 import MessageView from './MessageView';
 import ChatHeader from './ChatHeader';
-import MessageComposer from './MessageComposer';
-import { mxcToHttp, sendReaction, sendTypingIndicator, editMessage, sendMessage, deleteMessage, sendImageMessage, sendReadReceipt, sendFileMessage, setDisplayName, setAvatar, createRoom, inviteUser, forwardMessage, paginateRoomHistory, sendAudioMessage, setPinnedMessages, sendPollStart, sendPollResponse, translateText, sendStickerMessage, sendGifMessage, getSecureCloudProfileForClient } from '../services/matrixService';
-import { startGroupCall, joinGroupCall, getDisplayMedia, enumerateDevices } from '../services/matrixService';
+import MessageInput from './MessageInput';
+import { mxcToHttp, sendReaction, sendTypingIndicator, editMessage, sendMessage, deleteMessage, sendImageMessage, sendReadReceipt, sendFileMessage, setDisplayName, setAvatar, createRoom, inviteUser, forwardMessage, paginateRoomHistory, sendAudioMessage, setPinnedMessages, sendPollStart, sendPollResponse, translateText, sendStickerMessage, sendGifMessage, getSecureCloudProfileForClient } from '@matrix-messenger/core';
+import { startGroupCall, joinGroupCall, getDisplayMedia, enumerateDevices } from '@matrix-messenger/core';
 import {
     getScheduledMessages,
     addScheduledMessage,
@@ -15,8 +15,8 @@ import {
     recordScheduledMessageError,
     parseScheduledMessagesFromEvent,
     SCHEDULED_MESSAGES_EVENT_TYPE,
-} from '../services/schedulerService';
-import { checkPermission, sendNotification, setupNotificationListeners } from '../services/notificationService';
+} from '@matrix-messenger/core';
+import { checkPermission, sendNotification, setupNotificationListeners } from '@matrix-messenger/core';
 import WelcomeView from './WelcomeView';
 import SettingsModal from './SettingsModal';
 import CreateRoomModal from './CreateRoomModal';
@@ -33,26 +33,31 @@ import CallView from './CallView';
 import GroupCallView from './GroupCallView';
 import CallParticipantsPanel from './CallParticipantsPanel';
 import SearchModal from './SearchModal';
-import { SearchResultItem } from '../services/searchService';
+import { SearchResultItem } from '@matrix-messenger/core';
 // FIX: The `matrix-js-sdk` exports event names as enums. Import them to use with the event emitter.
 // FIX: Import event enums to use with the event emitter instead of string literals, which are not assignable.
 // FIX: `CallErrorCode` is not an exported member of `matrix-js-sdk`. It has been removed.
 import { NotificationCountType, EventType, MsgType, ClientEvent, RoomEvent, UserEvent, RelationType, CallEvent } from 'matrix-js-sdk';
 import { startSecureCloudSession, acknowledgeSuspiciousEvents } from '../services/secureCloudService';
 import type { SuspiciousEventNotice, SecureCloudSession } from '../services/secureCloudService';
-import { parseMatrixEvent as parseMatrixEventUtil } from '../utils/parseMatrixEvent';
-import { useChats } from '../hooks/useChats';
+import { useAccountStore } from '../services/accountManager';
 
 interface ChatPageProps {
-    client: MatrixClient;
-    onLogout: () => void;
-    savedMessagesRoomId: string;
+    client?: MatrixClient;
+    onLogout?: () => void;
+    savedMessagesRoomId?: string;
 }
 
 const DRAFT_STORAGE_KEY = 'matrix-message-drafts';
 const DRAFT_ACCOUNT_DATA_EVENT = 'econix.message_drafts';
 
-const ChatPage: React.FC<ChatPageProps> = ({ client, onLogout, savedMessagesRoomId }) => {
+const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, savedMessagesRoomId: savedRoomIdProp }) => {
+    const activeRuntime = useAccountStore(state => (state.activeKey ? state.accounts[state.activeKey] : null));
+    const removeAccount = useAccountStore(state => state.removeAccount);
+    const client = (providedClient ?? activeRuntime?.client)!;
+    const savedMessagesRoomId = savedRoomIdProp ?? activeRuntime?.savedMessagesRoomId ?? '';
+    const logout = onLogout ?? (() => { void removeAccount(); });
+    const [rooms, setRooms] = useState<UIRoom[]>([]);
     const [selectedRoomId, setSelectedRoomId] = useState<string | null>(null);
     const [messages, setMessages] = useState<Message[]>([]);
     const [isSending, setIsSending] = useState(false);
@@ -630,6 +635,80 @@ const handleSetChatBackground = (bgUrl: string) => {
     }, [client, parseMatrixEvent]);
 
     useEffect(() => {
+        const loadRooms = () => {
+            const matrixRooms = client.getRooms();
+            const sortedRooms = matrixRooms
+                .filter(room => room.getJoinedMemberCount() > 0) // Show all rooms including self-chats
+                .sort((a, b) => {
+                    const lastEventA = a.timeline[a.timeline.length - 1];
+                    const lastEventB = b.timeline[b.timeline.length - 1];
+                    return (lastEventB?.getTs() || 0) - (lastEventA?.getTs() || 0);
+                });
+
+            let savedMessagesRoom: UIRoom | null = null;
+            
+            const roomData: UIRoom[] = sortedRooms.map(room => {
+                const lastEvent = room.timeline[room.timeline.length - 1];
+                const pinnedEvent = room.currentState.getStateEvents(EventType.RoomPinnedEvents, '');
+                const topicEvent = room.currentState.getStateEvents(EventType.RoomTopic, '');
+                const topicContent = topicEvent?.getContent?.();
+                const topic = typeof topicContent?.topic === 'string' ? topicContent.topic : undefined;
+                const canonicalAliasEvent = room.currentState.getStateEvents(EventType.RoomCanonicalAlias, '');
+                const canonicalAliasContent = canonicalAliasEvent?.getContent?.();
+                const canonicalAlias = typeof canonicalAliasContent?.alias === 'string'
+                    ? canonicalAliasContent.alias
+                    : (Array.isArray(canonicalAliasContent?.alt_aliases) && canonicalAliasContent.alt_aliases.length > 0
+                        ? canonicalAliasContent.alt_aliases[0]
+                        : undefined);
+                const roomType = room.getType() || null;
+                const isSpace = roomType === 'm.space';
+                const childEvents = room.currentState.getStateEvents(EventType.SpaceChild) as MatrixEvent[] | undefined;
+                const spaceChildIds = (Array.isArray(childEvents) ? childEvents : [])
+                    .map(ev => ev.getStateKey())
+                    .filter((id): id is string => !!id);
+                const parentEvents = room.currentState.getStateEvents(EventType.SpaceParent) as MatrixEvent[] | undefined;
+                const spaceParentIds = (Array.isArray(parentEvents) ? parentEvents : [])
+                    .map(ev => ev.getStateKey())
+                    .filter((id): id is string => !!id);
+                const uiRoom: UIRoom = {
+                    roomId: room.roomId,
+                    name: room.name,
+                    topic,
+                    avatarUrl: mxcToHttp(client, room.getMxcAvatarUrl()),
+                    lastMessage: lastEvent ? parseMatrixEvent(lastEvent) : null,
+                    unreadCount: room.getUnreadNotificationCount(NotificationCountType.Total),
+                    pinnedEvents: pinnedEvent?.getContent().pinned || [],
+                    isEncrypted: client.isRoomEncrypted(room.roomId),
+                    isDirectMessageRoom: room.getJoinedMemberCount() === 2,
+                    roomType,
+                    isSpace,
+                    spaceChildIds,
+                    spaceParentIds,
+                    canonicalAlias: canonicalAlias ?? null,
+                };
+
+                if (room.roomId === savedMessagesRoomId) {
+                    savedMessagesRoom = {
+                        ...uiRoom,
+                        name: 'Saved Messages',
+                        isSavedMessages: true,
+                    };
+                }
+                
+                return uiRoom;
+
+            }).filter(r => r.roomId !== savedMessagesRoomId);
+
+            if (savedMessagesRoom) {
+                setRooms([savedMessagesRoom, ...roomData]);
+            } else {
+                setRooms(roomData);
+            }
+        };
+
+        loadRooms();
+        setIsLoading(false);
+
         const onSync = (state: string) => {
             if (state === 'ERROR' || state === 'STOPPED') {
                 setIsOffline(true);
@@ -1341,8 +1420,8 @@ if (isOffline) {
                 allRooms={allRooms}
                 selectedRoomId={selectedRoomId}
                 onSelectRoom={handleSelectRoom}
-                isLoading={isRoomsLoading}
-                onLogout={onLogout}
+                isLoading={isLoading}
+                onLogout={logout}
                 client={client}
                 onOpenSettings={() => setIsSettingsOpen(true)}
                 onOpenCreateRoom={() => setIsCreateRoomOpen(true)}

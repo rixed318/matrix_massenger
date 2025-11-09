@@ -67,10 +67,11 @@ describe('LoginPage', () => {
     });
 
     expect(resolveMock).toHaveBeenCalledWith('https://matrix.org');
-    const [resolvedUrl, username, password] = loginMock.mock.calls[0];
-    expect(resolvedUrl).toBe('https://resolved.example');
-    expect(username).toBe('alice');
-    expect(password).toBe('secret');
+    const call = loginMock.mock.calls[0];
+    expect(call?.[0]).toBe('https://resolved.example');
+    expect(call?.[1]).toBe('alice');
+    expect(call?.[2]).toBe('secret');
+    expect(call?.[3]).toBeUndefined();
   });
 
   it('submits registration form and calls register handler', async () => {

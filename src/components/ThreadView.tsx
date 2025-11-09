@@ -1,5 +1,5 @@
 import React, { useRef, useEffect } from 'react';
-import { ActiveThread, MatrixClient, MatrixRoom, MatrixUser } from '../types';
+import { ActiveThread, MatrixClient, MatrixRoom, MatrixUser } from '@matrix-messenger/core';
 import ChatMessage from './ChatMessage';
 import MessageInput from './MessageInput';
 

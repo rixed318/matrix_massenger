@@ -1,4 +1,4 @@
-import { Sticker } from '../types';
+import { Sticker } from '@matrix-messenger/core';
 
 // For this example, we'll use some locally available SVGs.
 // In a real app, these would likely be hosted on a CDN or even on the Matrix homeserver.

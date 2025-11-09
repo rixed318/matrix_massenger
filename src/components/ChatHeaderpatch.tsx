@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import type { MatrixClient } from 'matrix-js-sdk';
-import { getRoomSelfDestructConfig, setRoomSelfDestructConfig, requestSelfVerification, startSas, bindVerificationListeners, type VerificationUIState } from '../services/e2eeService';
+import { getRoomSelfDestructConfig, setRoomSelfDestructConfig, requestSelfVerification, startSas, bindVerificationListeners, type VerificationUIState } from '@matrix-messenger/core';
 
 type Props = {
   client: MatrixClient;

@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { MatrixClient, Room } from '../types';
-import { searchMessages, SearchMessagesResponse, SearchResultItem } from '../services/searchService';
+import { MatrixClient, Room } from '@matrix-messenger/core';
+import { searchMessages, SearchMessagesResponse, SearchResultItem } from '@matrix-messenger/core';
 
 interface SearchModalProps {
     isOpen: boolean;

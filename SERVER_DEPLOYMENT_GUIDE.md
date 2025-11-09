@@ -160,6 +160,67 @@ sudo netstat -tlnp | grep 8008
 sudo journalctl -u matrix-synapse -n 100
 ```
 
+## Публикация десктопных приложений
+
+Matrix Messenger использует Tauri, поэтому подготовка релизов для Windows, macOS и Linux выполняется одинаковыми шагами с небольшими платформенными нюансами.
+
+### Общая подготовка
+
+1. Убедитесь, что `npm run build` собрал фронтенд, а `tauri.conf.json` содержит актуальный `version`.
+2. Настройте источник автообновлений: в `src-tauri/tauri.conf.json` обновите поле `app.updater.endpoints` на ваш CDN или GitHub Releases и сохраните публичный ключ (`pubkey`).
+3. Сгенерируйте ключ подписи Tauri (`tauri signer generate`) и сохраните путь в переменной `TAURI_PRIVATE_KEY` перед сборкой.
+4. Выполните `npm run tauri build` — будут собраны дистрибутивы для текущей ОС.
+
+### Windows
+
+- Для публикации в Microsoft Store создайте `.appx` через `npm run tauri build -- --target msix`. Не забудьте указать `certificateThumbprint` в `tauri.conf.json`.
+- Для самостоятельной публикации распространяйте `.msi`/`.exe` из папки `src-tauri/target/release/bundle`. Подписывайте их через `signtool` и добавляйте публичный ключ автообновлений в `tauri.conf.json`.
+- Настройте канал обновлений — загрузите файл `latest.json` и установочные пакеты на HTTPS-хостинг.
+
+### macOS
+
+- Соберите `.dmg` и `.app` пакеты (появятся в `bundle/macos`).
+- Подпишите приложение через `codesign` и notarize через `xcrun notarytool`. Укажите bundle ID `com.matrix.messenger.dev` либо свой в `tauri.conf.json`.
+- Для публикации в Mac App Store используйте `--target app` и подготовьте `.pkg`, затем загрузите через Transporter.
+- Разместите файл обновлений `latest-macos.json` и соответствующие `.dmg` на CDN.
+
+### Linux
+
+- В результате сборки вы получите `.AppImage`, `.deb`, `.rpm` и архивы.
+- Подпишите пакеты (например, `gpg --detach-sign matrix-messenger_0.1.0_amd64.deb`).
+- Опубликуйте артефакты на сайте/репозитории; обновите `latest-linux.json` для автообновлений.
+- Для дистрибуции через Snapcraft используйте `tauri build --target snap` и загрузите снап в Snap Store.
+
+## Публикация мобильного приложения
+
+Expo-проект находится в папке `mobile/` и использует общие сервисы из `packages/core`.
+
+### Подготовка
+
+1. Установите Expo CLI (`npm install -g expo-cli`) и выполните `npm install` в корне репозитория.
+2. Убедитесь, что `mobile/app.config.ts` содержит актуальные идентификаторы пакетов и ссылку на ваш Matrix homeserver.
+3. Авторизуйтесь в Expo (`npx expo login`).
+
+### Android (Google Play)
+
+1. Выполните `cd mobile && npx expo prebuild --platform android` для генерации нативного проекта.
+2. Запустите `npx expo run:android --variant release` или используйте EAS Build (`eas build -p android`).
+3. Полученный `.aab` подпишите (если сборка локальная) и загрузите в Google Play Console.
+4. Настройте over-the-air обновления через `eas update` или отключите их, если полагаетесь на автодеплой через магазин.
+
+### iOS (App Store)
+
+1. Выполните `cd mobile && npx expo prebuild --platform ios`.
+2. Соберите архив Xcode (`npx expo run:ios --scheme matrixmessenger --configuration Release`) либо используйте `eas build -p ios`.
+3. Подпишите приложение с помощью сертификатов Apple Developer и загрузите через Transporter/App Store Connect.
+4. Добавьте push capability для нотификаций и настройте App Groups, если планируется share-расширение.
+
+### OTA-обновления Expo
+
+- Укажите `updates.url` в `app.config.ts` на ваш EAS проект.
+- Запускайте `eas update --branch production --message "Описание обновления"`, чтобы доставить обновление без публикации в магазинах.
+- Следите за совместимостью с Tauri core: общие API находятся в `packages/core`, изменения требуют синхронизации версий десктопного и мобильного клиента.
+
 ### Проблемы с федерацией
 
 **Проблема**: Не могу общаться с пользователями других серверов

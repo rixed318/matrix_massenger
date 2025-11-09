@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Folder, Room as UIRoom } from '../types';
+import { Folder, Room as UIRoom } from '@matrix-messenger/core';
 import Avatar from './Avatar';
 
 interface ManageFoldersModalProps {

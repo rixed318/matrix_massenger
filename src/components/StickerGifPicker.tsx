@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Sticker, Gif } from '../types';
+import { Sticker, Gif } from '@matrix-messenger/core';
 import { STICKER_PACK } from '../assets/stickers';
-import { getTrendingGifs, searchGifs } from '../services/gifService';
+import { getTrendingGifs, searchGifs } from '@matrix-messenger/core';
 
 interface StickerGifPickerProps {
     onClose: () => void;
