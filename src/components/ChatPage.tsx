@@ -5,7 +5,7 @@ import RoomList from './RoomList';
 import MessageView from './MessageView';
 import ChatHeader from './ChatHeader';
 import MessageInput from './MessageInput';
-import { mxcToHttp, sendReaction, sendTypingIndicator, editMessage, sendMessage, deleteMessage, sendImageMessage, sendReadReceipt, sendFileMessage, setDisplayName, setAvatar, createRoom, inviteUser, forwardMessage, paginateRoomHistory, sendAudioMessage, setPinnedMessages, sendPollStart, sendPollResponse, translateText, sendStickerMessage, sendGifMessage, getSecureCloudProfileForClient } from '@matrix-messenger/core';
+import { mxcToHttp, sendReaction, sendTypingIndicator, editMessage, sendMessage, deleteMessage, sendImageMessage, sendReadReceipt, sendFileMessage, setDisplayName, setAvatar, createRoom, inviteUser, forwardMessage, paginateRoomHistory, sendAudioMessage, setPinnedMessages, sendPollStart, sendPollResponse, translateText, sendStickerMessage, sendGifMessage, getSecureCloudProfileForClient, getRoomMediaSummary, paginateRoomMedia } from '@matrix-messenger/core';
 import { startGroupCall, joinGroupCall, getDisplayMedia, enumerateDevices } from '@matrix-messenger/core';
 import {
     getScheduledMessages,
@@ -35,6 +35,8 @@ import CallParticipantsPanel from './CallParticipantsPanel';
 import SearchModal from './SearchModal';
 import { SearchResultItem } from '@matrix-messenger/core';
 import type { DraftContent, SendKeyBehavior, DraftAttachment } from '../types';
+import SharedMediaPanel from './SharedMediaPanel';
+import type { RoomMediaSummary, SharedMediaCategory, RoomMediaItem } from '@matrix-messenger/core';
 // FIX: The `matrix-js-sdk` exports event names as enums. Import them to use with the event emitter.
 // FIX: Import event enums to use with the event emitter instead of string literals, which are not assignable.
 // FIX: `CallErrorCode` is not an exported member of `matrix-js-sdk`. It has been removed.
@@ -111,6 +113,10 @@ const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, s
     const [secureCloudAlerts, setSecureCloudAlerts] = useState<Record<string, SuspiciousEventNotice[]>>({});
     const [secureCloudError, setSecureCloudError] = useState<string | null>(null);
     const [isSecureCloudActive, setIsSecureCloudActive] = useState(false);
+    const [isSharedMediaOpen, setIsSharedMediaOpen] = useState(false);
+    const [sharedMediaData, setSharedMediaData] = useState<RoomMediaSummary | null>(null);
+    const [isSharedMediaLoading, setIsSharedMediaLoading] = useState(false);
+    const [isSharedMediaPaginating, setIsSharedMediaPaginating] = useState(false);
     const normalizeAttachments = (attachments: unknown): DraftAttachment[] => {
         if (!Array.isArray(attachments)) return [];
         return attachments.flatMap(item => {
@@ -196,6 +202,7 @@ const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, s
     const oldScrollHeightRef = useRef<number>(0);
     const focusEventIdRef = useRef<string | null>(null);
     const secureSessionRef = useRef<SecureCloudSession | null>(null);
+    const sharedMediaEventIdsRef = useRef<Set<string>>(new Set());
 
     useEffect(() => {
         try {
@@ -1073,6 +1080,34 @@ const handleSetChatBackground = (bgUrl: string) => {
         };
     }, [client, selectedRoomId]);
 
+    useEffect(() => {
+        setIsSharedMediaOpen(false);
+        setSharedMediaData(null);
+        sharedMediaEventIdsRef.current = new Set();
+
+        if (!selectedRoomId) {
+            setIsSharedMediaLoading(false);
+            return;
+        }
+
+        const room = client.getRoom(selectedRoomId);
+        if (!room) {
+            setIsSharedMediaLoading(false);
+            return;
+        }
+
+        setIsSharedMediaLoading(true);
+        try {
+            const summary = getRoomMediaSummary(client, room);
+            setSharedMediaData(summary);
+            sharedMediaEventIdsRef.current = new Set(summary.eventIds);
+        } catch (error) {
+            console.error('Failed to load shared media summary', error);
+        } finally {
+            setIsSharedMediaLoading(false);
+        }
+    }, [client, selectedRoomId]);
+
     const handleDraftChange = useCallback((roomId: string, value: DraftContent) => {
         setDrafts(prev => {
             const currentValue = prev[roomId];
@@ -1091,6 +1126,85 @@ const handleSetChatBackground = (bgUrl: string) => {
         if (!selectedRoomId) return;
         handleDraftChange(selectedRoomId, value);
     }, [handleDraftChange, selectedRoomId]);
+
+    const handleOpenSharedMedia = useCallback(() => {
+        if (!selectedRoomId) {
+            return;
+        }
+        setIsSharedMediaOpen(true);
+    }, [selectedRoomId]);
+
+    const handleLoadMoreMedia = useCallback(async () => {
+        if (!selectedRoomId || isSharedMediaPaginating) {
+            return;
+        }
+        const room = client.getRoom(selectedRoomId);
+        if (!room) {
+            return;
+        }
+
+        setIsSharedMediaPaginating(true);
+        try {
+            const page = await paginateRoomMedia(client, room, {
+                knownEventIds: sharedMediaEventIdsRef.current,
+                limit: 40,
+            });
+
+            setSharedMediaData(prev => {
+                if (!prev) {
+                    if (page.newEventIds.length === 0 && !page.hasMore) {
+                        return prev;
+                    }
+                    sharedMediaEventIdsRef.current = new Set(page.newEventIds);
+                    return {
+                        itemsByCategory: page.itemsByCategory,
+                        countsByCategory: page.countsByCategory,
+                        hasMore: page.hasMore,
+                        eventIds: page.newEventIds,
+                    };
+                }
+
+                if (page.newEventIds.length === 0) {
+                    return { ...prev, hasMore: page.hasMore };
+                }
+
+                const mergedBuckets: Record<SharedMediaCategory, RoomMediaItem[]> = {
+                    media: [...prev.itemsByCategory.media],
+                    files: [...prev.itemsByCategory.files],
+                    links: [...prev.itemsByCategory.links],
+                    voice: [...prev.itemsByCategory.voice],
+                };
+
+                (Object.keys(page.itemsByCategory) as SharedMediaCategory[]).forEach(category => {
+                    if (page.itemsByCategory[category].length) {
+                        mergedBuckets[category] = [...mergedBuckets[category], ...page.itemsByCategory[category]]
+                            .sort((a, b) => b.timestamp - a.timestamp);
+                    }
+                });
+
+                const mergedCounts = {
+                    media: prev.countsByCategory.media + page.countsByCategory.media,
+                    files: prev.countsByCategory.files + page.countsByCategory.files,
+                    links: prev.countsByCategory.links + page.countsByCategory.links,
+                    voice: prev.countsByCategory.voice + page.countsByCategory.voice,
+                };
+
+                const mergedEventIds = [...prev.eventIds, ...page.newEventIds];
+                sharedMediaEventIdsRef.current = new Set(mergedEventIds);
+
+                return {
+                    itemsByCategory: mergedBuckets,
+                    countsByCategory: mergedCounts,
+                    hasMore: page.hasMore,
+                    eventIds: mergedEventIds,
+                };
+            });
+        } catch (error) {
+            console.error('Failed to paginate shared media', error);
+        } finally {
+            setIsSharedMediaPaginating(false);
+        }
+    }, [client, isSharedMediaPaginating, selectedRoomId]);
 
     const handleSendMessage = async (content: { body: string; formattedBody?: string }, threadRootId?: string) => {
         const trimmedBody = content.body.trim();
@@ -1522,6 +1636,9 @@ const handleSetChatBackground = (bgUrl: string) => {
         ? allScheduledMessages.filter(m => m.roomId === selectedRoomId && m.status !== 'sent')
         : [];
     const activeRoomAlerts = selectedRoomId ? (secureCloudAlerts[selectedRoomId] ?? []) : [];
+    const sharedMediaCount = sharedMediaData
+        ? Object.values(sharedMediaData.countsByCategory).reduce((acc, value) => acc + value, 0)
+        : 0;
 
     return (
         <div className="flex h-screen">
@@ -1564,6 +1681,8 @@ const handleSetChatBackground = (bgUrl: string) => {
                             isDirectMessageRoom={selectedRoom.isDirectMessageRoom}
                             onPlaceCall={handlePlaceCall}
                             onOpenSearch={() => setIsSearchOpen(true)}
+                            onOpenSharedMedia={handleOpenSharedMedia}
+                            sharedMediaCount={sharedMediaCount}
                             connectionStatus={isOffline ? 'offline' : 'online'}
                         />
                         {isSecureCloudActive && (
@@ -1833,6 +1952,14 @@ const handleSetChatBackground = (bgUrl: string) => {
                     onSelectResult={handleJumpToSearchResult}
                 />
             )}
+            <SharedMediaPanel
+                isOpen={isSharedMediaOpen}
+                onClose={() => setIsSharedMediaOpen(false)}
+                data={sharedMediaData}
+                isLoading={isSharedMediaLoading}
+                isPaginating={isSharedMediaPaginating}
+                onLoadMore={sharedMediaData?.hasMore ? handleLoadMoreMedia : undefined}
+            />
             {activeCall && <CallView call={activeCall} onHangup={() => handleHangupCall(false)} client={client} />}
             {incomingCall && <IncomingCallModal call={incomingCall} onAccept={handleAnswerCall} onDecline={() => handleHangupCall(true)} client={client} />}
         </div>
