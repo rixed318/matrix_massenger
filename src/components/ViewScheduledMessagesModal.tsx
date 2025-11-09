@@ -10,6 +10,37 @@ interface ViewScheduledMessagesModalProps {
     onSendNow: (id: string) => void;
 }
 
+const formatFileSize = (size: number): string => {
+    if (!Number.isFinite(size) || size <= 0) {
+        return '—';
+    }
+    if (size >= 1024 * 1024) {
+        return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+    }
+    if (size >= 1024) {
+        return `${(size / 1024).toFixed(1)} KB`;
+    }
+    return `${size} B`;
+};
+
+const formatDuration = (duration?: number): string | null => {
+    if (typeof duration !== 'number' || Number.isNaN(duration) || duration <= 0) {
+        return null;
+    }
+    const seconds = duration > 1000 ? Math.round(duration / 1000) : Math.round(duration);
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins}:${secs.toString().padStart(2, '0')}`;
+};
+
+const resolveAttachmentPreview = (attachment: ScheduledMessage['content']['attachments'][number]): string | null => {
+    return attachment.thumbnailUrl
+        ?? attachment.dataUrl
+        ?? attachment.tempUrl
+        ?? attachment.url
+        ?? null;
+};
+
 const ViewScheduledMessagesModal: React.FC<ViewScheduledMessagesModalProps> = ({
     isOpen,
     onClose,
@@ -46,7 +77,55 @@ const ViewScheduledMessagesModal: React.FC<ViewScheduledMessagesModalProps> = ({
 
                             return (
                                 <div key={message.id} className="p-3 bg-gray-900/50 rounded-md space-y-2">
-                                    <p className="text-white break-words whitespace-pre-wrap">{message.content}</p>
+                                    <p className="text-white break-words whitespace-pre-wrap">
+                                        {message.content.plain?.trim()
+                                            || (message.content.attachments.length > 0
+                                                ? 'Attachments only'
+                                                : 'No text content')}
+                                    </p>
+                                    {message.content.attachments.length > 0 && (
+                                        <div className="space-y-2">
+                                            {message.content.attachments.map(attachment => {
+                                                const preview = resolveAttachmentPreview(attachment);
+                                                const isVisual = attachment.kind === 'image' || attachment.kind === 'gif' || attachment.kind === 'sticker';
+                                                const duration = formatDuration(attachment.duration);
+                                                return (
+                                                    <div
+                                                        key={attachment.id}
+                                                        className="flex items-center gap-3 p-3 bg-gray-900/40 border border-gray-700/60 rounded-md"
+                                                    >
+                                                        {isVisual ? (
+                                                            preview ? (
+                                                                <img
+                                                                    src={preview}
+                                                                    alt={attachment.name}
+                                                                    className="w-14 h-14 rounded-md object-cover border border-gray-700"
+                                                                />
+                                                            ) : (
+                                                                <div className="w-14 h-14 rounded-md bg-gray-800 border border-gray-700 flex items-center justify-center text-xs text-gray-400">
+                                                                    No preview
+                                                                </div>
+                                                            )
+                                                        ) : (
+                                                            <div className="w-12 h-12 rounded-md bg-gray-800 border border-gray-700 flex items-center justify-center text-gray-300">
+                                                                <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" viewBox="0 0 20 20" fill="currentColor">
+                                                                    <path d="M4 3a2 2 0 00-2 2v10a2 2 0 002 2h6.586A2 2 0 0012 16.586l3.586-3.586A2 2 0 0016 11.414V5a2 2 0 00-2-2H4zm6 11V9l4 4h-4z" />
+                                                                </svg>
+                                                            </div>
+                                                        )}
+                                                        <div className="flex-1 min-w-0">
+                                                            <p className="text-sm text-white truncate" title={attachment.name}>{attachment.name}</p>
+                                                            <p className="text-xs text-gray-400">
+                                                                {formatFileSize(attachment.size)}
+                                                                {attachment.mimeType ? ` • ${attachment.mimeType}` : ''}
+                                                                {duration ? ` • ${duration}` : ''}
+                                                            </p>
+                                                        </div>
+                                                    </div>
+                                                );
+                                            })}
+                                        </div>
+                                    )}
                                     <div className="flex flex-wrap items-center gap-2 text-xs">
                                         <span
                                             className={`px-2 py-0.5 rounded-full ${

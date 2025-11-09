@@ -1,4 +1,4 @@
-import { MatrixClient, MatrixEvent, ScheduledMessage } from '../types';
+import { MatrixClient, MatrixEvent, ScheduledMessage, DraftAttachment, DraftContent, DraftAttachmentKind } from '../types';
 
 export const SCHEDULED_MESSAGES_EVENT_TYPE = 'com.matrix_messenger.scheduled';
 
@@ -8,11 +8,179 @@ interface AccountDataPayload {
 
 const EMPTY_PAYLOAD: AccountDataPayload = { messages: [] };
 
+const ATTACHMENT_KINDS: DraftAttachmentKind[] = ['file', 'image', 'audio', 'voice', 'sticker', 'gif'];
+
+const isAttachmentKind = (value: unknown): value is DraftAttachmentKind =>
+    typeof value === 'string' && ATTACHMENT_KINDS.includes(value as DraftAttachmentKind);
+
+const coerceNumber = (value: unknown): number | undefined => {
+    if (typeof value === 'number' && !Number.isNaN(value)) {
+        return value;
+    }
+    if (typeof value === 'string') {
+        const parsed = Number(value);
+        if (!Number.isNaN(parsed)) {
+            return parsed;
+        }
+    }
+    return undefined;
+};
+
+const coerceString = (value: unknown): string | undefined =>
+    typeof value === 'string' && value.length > 0 ? value : undefined;
+
+const coerceWaveform = (value: unknown): number[] | undefined => {
+    if (!Array.isArray(value)) {
+        return undefined;
+    }
+    const normalized = value
+        .map(entry => (typeof entry === 'number' ? entry : Number(entry)))
+        .filter(entry => typeof entry === 'number' && !Number.isNaN(entry));
+    return normalized.length > 0 ? normalized : undefined;
+};
+
+const guessAttachmentKind = (raw: any, mimeType: string): DraftAttachmentKind => {
+    const explicitKind = isAttachmentKind(raw?.kind) ? raw.kind : undefined;
+    if (explicitKind) {
+        return explicitKind;
+    }
+
+    const explicitMsgtype = coerceString(raw?.msgtype)?.toLowerCase();
+    if (explicitMsgtype === 'm.sticker') return 'sticker';
+    if (explicitMsgtype === 'm.image') return 'image';
+    if (explicitMsgtype === 'm.audio') return 'audio';
+
+    if (mimeType.startsWith('image/')) return 'image';
+    if (mimeType.startsWith('audio/')) return 'audio';
+    return 'file';
+};
+
+const normalizeAttachment = (raw: any, index: number): DraftAttachment | null => {
+    if (!raw || typeof raw !== 'object') {
+        return null;
+    }
+
+    const id = coerceString(raw.id) ?? `attachment_${Date.now()}_${index}`;
+    const name = coerceString(raw.name) ?? coerceString(raw.body) ?? 'attachment';
+    const size = coerceNumber(raw.size) ?? coerceNumber(raw.metadata?.size) ?? 0;
+    const mimeType = coerceString(raw.mimeType)
+        ?? coerceString(raw.info?.mimetype)
+        ?? coerceString(raw.metadata?.mimeType)
+        ?? 'application/octet-stream';
+
+    const attachment: DraftAttachment = {
+        id,
+        name,
+        size,
+        mimeType,
+        kind: guessAttachmentKind(raw, mimeType),
+    };
+
+    const dataUrl = coerceString(raw.dataUrl);
+    if (dataUrl) attachment.dataUrl = dataUrl;
+
+    const tempUrl = coerceString(raw.tempUrl) ?? coerceString(raw.blobUrl);
+    if (tempUrl) attachment.tempUrl = tempUrl;
+
+    const url = coerceString(raw.url);
+    if (url) attachment.url = url;
+
+    const thumbnailUrl = coerceString(raw.thumbnailUrl) ?? coerceString(raw.previewUrl);
+    if (thumbnailUrl) attachment.thumbnailUrl = thumbnailUrl;
+
+    const width = coerceNumber(raw.width) ?? coerceNumber(raw.info?.w);
+    if (typeof width === 'number') attachment.width = width;
+
+    const height = coerceNumber(raw.height) ?? coerceNumber(raw.info?.h);
+    if (typeof height === 'number') attachment.height = height;
+
+    const duration = coerceNumber(raw.duration) ?? coerceNumber(raw.info?.duration);
+    if (typeof duration === 'number') attachment.duration = duration;
+
+    const waveform = coerceWaveform(raw.waveform);
+    if (waveform) attachment.waveform = waveform;
+
+    const body = coerceString(raw.body);
+    if (body) attachment.body = body;
+
+    const msgtype = coerceString(raw.msgtype);
+    if (msgtype) attachment.msgtype = msgtype;
+
+    return attachment;
+};
+
+const normalizeDraftContent = (raw: unknown): DraftContent => {
+    if (typeof raw === 'string') {
+        return {
+            plain: raw,
+            formatted: undefined,
+            attachments: [],
+            msgtype: 'm.text',
+        };
+    }
+
+    if (raw && typeof raw === 'object') {
+        const record = raw as Record<string, unknown>;
+        const plain = coerceString(record.plain)
+            ?? coerceString(record.body)
+            ?? coerceString(record.content)
+            ?? '';
+        const formatted = coerceString(record.formatted)
+            ?? coerceString(record.formatted_body)
+            ?? undefined;
+        const msgtype = coerceString(record.msgtype) ?? undefined;
+
+        const attachmentsRaw = Array.isArray(record.attachments) ? record.attachments : [];
+        const attachments: DraftAttachment[] = attachmentsRaw
+            .map((item, index) => normalizeAttachment(item, index))
+            .filter((item): item is DraftAttachment => Boolean(item));
+
+        return {
+            plain,
+            formatted,
+            attachments,
+            msgtype,
+        };
+    }
+
+    return { plain: '', formatted: undefined, attachments: [], msgtype: undefined };
+};
+
+const serializeAttachment = (attachment: DraftAttachment): Record<string, unknown> => {
+    const payload: Record<string, unknown> = {
+        id: attachment.id,
+        name: attachment.name,
+        size: attachment.size,
+        mimeType: attachment.mimeType,
+        kind: attachment.kind,
+    };
+
+    if (attachment.dataUrl) payload.dataUrl = attachment.dataUrl;
+    if (attachment.tempUrl) payload.tempUrl = attachment.tempUrl;
+    if (attachment.url) payload.url = attachment.url;
+    if (attachment.thumbnailUrl) payload.thumbnailUrl = attachment.thumbnailUrl;
+    if (typeof attachment.width === 'number') payload.width = attachment.width;
+    if (typeof attachment.height === 'number') payload.height = attachment.height;
+    if (typeof attachment.duration === 'number') payload.duration = attachment.duration;
+    if (attachment.waveform && attachment.waveform.length > 0) payload.waveform = attachment.waveform;
+    if (attachment.body) payload.body = attachment.body;
+    if (attachment.msgtype) payload.msgtype = attachment.msgtype;
+
+    return payload;
+};
+
+const serializeDraftContent = (content: DraftContent): Record<string, unknown> => ({
+    plain: content.plain,
+    ...(content.formatted ? { formatted: content.formatted } : {}),
+    ...(content.msgtype ? { msgtype: content.msgtype } : {}),
+    attachments: content.attachments.map(serializeAttachment),
+});
+
 const normalizeScheduledMessage = (raw: any): ScheduledMessage => {
     const message: ScheduledMessage = {
         id: typeof raw?.id === 'string' ? raw.id : String(raw?.id ?? `scheduled_${Date.now()}`),
         roomId: typeof raw?.roomId === 'string' ? raw.roomId : '',
-        content: typeof raw?.content === 'string' ? raw.content : '',
+        content: normalizeDraftContent(raw?.content),
         sendAt: typeof raw?.sendAt === 'number' ? raw.sendAt : Number(raw?.sendAt ?? Date.now()),
         sendAtUtc: typeof raw?.sendAtUtc === 'number' ? raw.sendAtUtc : undefined,
         timezoneOffset: typeof raw?.timezoneOffset === 'number' ? raw.timezoneOffset : undefined,
@@ -41,7 +209,7 @@ const normalizeScheduledMessage = (raw: any): ScheduledMessage => {
 const serializeScheduledMessage = (message: ScheduledMessage) => ({
     id: message.id,
     roomId: message.roomId,
-    content: message.content,
+    content: serializeDraftContent(message.content),
     sendAt: message.sendAt,
     sendAtUtc: message.sendAtUtc,
     timezoneOffset: message.timezoneOffset,
@@ -95,7 +263,7 @@ export const getScheduledMessages = async (client: MatrixClient): Promise<Schedu
 export const addScheduledMessage = async (
     client: MatrixClient,
     roomId: string,
-    content: string,
+    content: DraftContent,
     sendAt: number,
 ): Promise<ScheduledMessage> => {
     const existing = readAccountData(client).messages;
@@ -104,7 +272,7 @@ export const addScheduledMessage = async (
     const newMessage: ScheduledMessage = {
         id: `scheduled_${Date.now()}`,
         roomId,
-        content,
+        content: normalizeDraftContent(content),
         sendAt,
         sendAtUtc: sendAt,
         timezoneOffset: sendAtDate.getTimezoneOffset(),

@@ -382,6 +382,7 @@ const MessageInput: React.FC<MessageInputProps> = ({
             const reader = new FileReader();
             reader.onload = () => {
                 const dataUrl = reader.result as string;
+                const isImage = file.type.startsWith('image/');
                 setAttachments(prev => ([
                     ...prev,
                     {
@@ -390,7 +391,8 @@ const MessageInput: React.FC<MessageInputProps> = ({
                         size: file.size,
                         mimeType: file.type,
                         dataUrl,
-                        kind: 'file',
+                        kind: isImage ? 'image' : 'file',
+                        msgtype: isImage ? 'm.image' : 'm.file',
                     },
                 ]));
             };

@@ -138,10 +138,37 @@ export interface Folder {
   roomIds: string[];
 }
 
+export type DraftAttachmentKind = 'file' | 'image' | 'audio' | 'voice' | 'sticker' | 'gif';
+
+export interface DraftAttachment {
+    id: string;
+    name: string;
+    size: number;
+    mimeType: string;
+    dataUrl?: string;
+    tempUrl?: string;
+    url?: string;
+    thumbnailUrl?: string;
+    width?: number;
+    height?: number;
+    duration?: number;
+    waveform?: number[];
+    body?: string;
+    msgtype?: string;
+    kind: DraftAttachmentKind;
+}
+
+export interface DraftContent {
+    plain: string;
+    formatted?: string;
+    attachments: DraftAttachment[];
+    msgtype?: string;
+}
+
 export interface ScheduledMessage {
   id: string;
   roomId: string;
-  content: string;
+  content: DraftContent;
   sendAt: number; // timestamp
   /**
    * Absolute UTC timestamp representation of the scheduled moment. This is stored for
@@ -178,18 +205,3 @@ export interface Gif {
 }
 
 export type SendKeyBehavior = 'enter' | 'ctrlEnter' | 'altEnter';
-
-export interface DraftAttachment {
-    id: string;
-    name: string;
-    size: number;
-    mimeType: string;
-    dataUrl: string;
-    kind: 'file';
-}
-
-export interface DraftContent {
-    plain: string;
-    formatted?: string;
-    attachments: DraftAttachment[];
-}
