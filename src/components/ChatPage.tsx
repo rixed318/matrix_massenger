@@ -5,7 +5,7 @@ import RoomList from './RoomList';
 import MessageView from './MessageView';
 import ChatHeader from './ChatHeader';
 import MessageInput from './MessageInput';
-import { mxcToHttp, sendReaction, sendTypingIndicator, editMessage, sendMessage, deleteMessage, sendImageMessage, sendReadReceipt, sendFileMessage, setDisplayName, setAvatar, createRoom, inviteUser, forwardMessage, paginateRoomHistory, sendAudioMessage, setPinnedMessages, sendPollStart, sendPollResponse, translateText, sendStickerMessage, sendGifMessage, getSecureCloudProfileForClient, getRoomNotificationMode, setRoomNotificationMode as updateRoomPushRule } from '@matrix-messenger/core';
+import { mxcToHttp, sendReaction, sendTypingIndicator, editMessage, sendMessage, deleteMessage, sendImageMessage, sendReadReceipt, sendFileMessage, setDisplayName, setAvatar, createRoom, inviteUser, forwardMessage, paginateRoomHistory, sendAudioMessage, setPinnedMessages, sendPollStart, sendPollResponse, translateText, sendStickerMessage, sendGifMessage, getSecureCloudProfileForClient, getRoomNotificationMode, setRoomNotificationMode as updateRoomPushRule, RoomCreationOptions } from '@matrix-messenger/core';
 import { startGroupCall, joinGroupCall, getDisplayMedia, enumerateDevices } from '@matrix-messenger/core';
 import {
     getScheduledMessages,
@@ -1586,13 +1586,15 @@ const handleSetChatBackground = (bgUrl: string) => {
         }
     };
 
-    const handleCreateRoom = async (options: { name: string, topic?: string, isPublic: boolean, isEncrypted: boolean }) => {
+    const handleCreateRoom = async (options: RoomCreationOptions) => {
         try {
             const newRoomId = await createRoom(client, options);
             setIsCreateRoomOpen(false);
             await handleSelectRoom(newRoomId);
+            return newRoomId;
         } catch(error) {
             console.error("Failed to create room from component:", error);
+            throw error;
         }
     };
 

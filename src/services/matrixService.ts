@@ -1,4 +1,4 @@
-import { MatrixClient, MatrixEvent, MatrixRoom, MatrixUser, Sticker, Gif } from '../types';
+import { MatrixClient, MatrixEvent, MatrixRoom, MatrixUser, Sticker, Gif, RoomCreationOptions } from '../types';
 import type { SecureCloudProfile } from './secureCloudService';
 import { normaliseSecureCloudProfile } from './secureCloudService';
 // FIX: `RoomCreateOptions` is not an exported member of `matrix-js-sdk`. Replaced with the correct type `ICreateRoomOpts`.
@@ -2020,31 +2020,106 @@ export const setAvatar = async (client: MatrixClient, file: File): Promise<void>
     }
 };
 
-export const createRoom = async (client: MatrixClient, options: { name: string, topic?: string, isPublic: boolean, isEncrypted: boolean }): Promise<string> => {
+const SLOW_MODE_EVENT_TYPE = 'org.matrix.msc3946.room.slow_mode';
+
+export const createRoom = async (client: MatrixClient, options: RoomCreationOptions): Promise<string> => {
     try {
-        // FIX: Replaced `RoomCreateOptions` with the correct type `ICreateRoomOpts`.
+        const slowModeSeconds = typeof options.slowModeSeconds === 'number'
+            ? Math.max(0, Math.floor(options.slowModeSeconds))
+            : undefined;
+
         const createOptions: ICreateRoomOpts = {
             name: options.name,
             topic: options.topic,
-            // FIX: Use Visibility enum instead of string literals for type safety.
             visibility: options.isPublic ? Visibility.Public : Visibility.Private,
+            preset: options.isPublic
+                ? Preset.PublicChat
+                : options.isEncrypted
+                    ? Preset.TrustedPrivateChat
+                    : Preset.PrivateChat,
         };
-        if (options.isEncrypted) {
-            createOptions.initial_state = [
-                {
-                    // FIX: This is a typing issue in the matrix-js-sdk where `m.room.encryption` is not
-                    // considered a valid key of `TimelineEvents`. Using @ts-ignore is a safe workaround
-                    // to bypass this strict compiler check for state events.
-                    // @ts-ignore
-                    type: EventType.RoomEncryption,
-                    state_key: "",
-                    content: {
-                        algorithm: "m.megolm.v1.aes-sha2",
-                    },
-                },
-            ];
+
+        if (options.roomAliasName) {
+            createOptions.room_alias_name = options.roomAliasName;
         }
+
+        const creationContent: Record<string, unknown> = {};
+        if (options.disableFederation) {
+            creationContent['m.federate'] = false;
+        }
+        if (Object.keys(creationContent).length > 0) {
+            createOptions.creation_content = creationContent;
+        }
+
+        if (options.mode === 'channel') {
+            createOptions.power_level_content_override = {
+                users_default: 0,
+                events_default: 0,
+                state_default: 50,
+                notifications: { room: 50 },
+                events: {
+                    [EventType.RoomMessage]: 50,
+                    'm.room.encrypted': 50,
+                    [EventType.Reaction]: 50,
+                    [EventType.RoomRedaction]: 50,
+                    'm.sticker': 50,
+                },
+            } as any;
+        }
+
+        const initialState: NonNullable<ICreateRoomOpts['initial_state']> = [];
+
+        if (options.isEncrypted) {
+            initialState.push({
+                // @ts-ignore - matrix-js-sdk typings do not expose m.room.encryption as a valid state key
+                type: EventType.RoomEncryption,
+                state_key: '',
+                content: {
+                    algorithm: 'm.megolm.v1.aes-sha2',
+                },
+            });
+        }
+
+        const joinRule = options.requireInvite || !options.isPublic ? 'invite' : 'public';
+        initialState.push({
+            type: EventType.RoomJoinRules,
+            state_key: '',
+            content: { join_rule: joinRule },
+        } as any);
+
+        if (options.historyVisibility) {
+            initialState.push({
+                type: EventType.RoomHistoryVisibility,
+                state_key: '',
+                content: { history_visibility: options.historyVisibility },
+            } as any);
+        }
+
+        if (slowModeSeconds && slowModeSeconds > 0) {
+            initialState.push({
+                type: SLOW_MODE_EVENT_TYPE as unknown as EventType,
+                state_key: '',
+                content: {
+                    enabled: true,
+                    seconds: slowModeSeconds,
+                },
+            } as any);
+        }
+
+        if (initialState.length > 0) {
+            createOptions.initial_state = initialState;
+        }
+
         const { room_id } = await client.createRoom(createOptions);
+
+        if (options.initialPost) {
+            try {
+                await client.sendTextMessage(room_id, options.initialPost);
+            } catch (error) {
+                console.error('Failed to send initial announcement:', error);
+            }
+        }
+
         return room_id;
     } catch(error) {
         console.error("Failed to create room:", error);

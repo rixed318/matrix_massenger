@@ -116,3 +116,4 @@ export interface PluginLogger {
   warn(...args: unknown[]): void;
   error(...args: unknown[]): void;
 }
+
