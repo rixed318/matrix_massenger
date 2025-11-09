@@ -1,6 +1,17 @@
 import { MatrixClient, MatrixEvent, MatrixRoom, MatrixUser, Sticker, Gif, RoomCreationOptions } from '../types';
 import type { SecureCloudProfile } from './secureCloudService';
 import { normaliseSecureCloudProfile } from './secureCloudService';
+import GroupCallCoordinator, { GroupCallParticipant as CoordinatorParticipant } from './webrtc/groupCallCoordinator';
+import {
+    GROUP_CALL_CONTROL_EVENT_TYPE,
+    GROUP_CALL_PARTICIPANTS_EVENT_TYPE,
+    GROUP_CALL_SIGNAL_EVENT_TYPE,
+    GROUP_CALL_STATE_EVENT_TYPE,
+    GroupCallParticipantsContent,
+    GroupCallRole,
+    GroupCallStateEventContent,
+    SerializedGroupCallParticipant,
+} from './webrtc/groupCallConstants';
 // FIX: `RoomCreateOptions` is not an exported member of `matrix-js-sdk`. Replaced with the correct type `ICreateRoomOpts`.
 // FIX: Import Visibility enum to correctly type room creation options.
 import {
@@ -2780,35 +2791,159 @@ export const translateText = async (text: string): Promise<string> => {
 };
 
 // ========= Group Calls & Screen Share helpers =========
-// Simple bridge to external SFU (Jitsi/LiveKit) and MSC3401-compatible notice
-export type SfuKind = 'jitsi' | 'livekit' | 'other';
+// Simple bridge to external SFU (Jitsi/LiveKit) or cascaded peer-connections
+export type SfuKind = 'jitsi' | 'livekit' | 'other' | 'cascade';
+
+const groupCallCoordinators = new Map<string, GroupCallCoordinator>();
+const makeGroupCallKey = (roomId: string, sessionId: string) => `${roomId}::${sessionId}`;
+
+const randomGroupSessionId = () => `call_${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
+
+const buildParticipantRecord = (
+  userId: string,
+  displayName: string,
+  avatarUrl?: string | null,
+  role: GroupCallRole = 'host',
+): SerializedGroupCallParticipant => ({
+  userId,
+  displayName,
+  avatarUrl,
+  role,
+  isMuted: false,
+  isVideoMuted: false,
+  isScreensharing: false,
+  lastActive: Date.now(),
+});
+
+export type GroupCallParticipant = CoordinatorParticipant;
 
 export interface StartGroupCallOptions {
   sfuBaseUrl?: string;        // e.g. https://call.example.com
-  sfuKind?: SfuKind;          // 'jitsi' | 'livekit'
+  sfuKind?: SfuKind;          // 'jitsi' | 'livekit' | 'cascade'
   topic?: string;             // optional display topic
   openIn?: 'webview' | 'browser';
+  sessionId?: string;
+  role?: GroupCallRole;
+}
+
+export interface StartGroupCallResult {
+  url: string;
+  sessionId: string;
+  state: GroupCallStateEventContent;
+}
+
+export async function createGroupCallCoordinator(
+  client: MatrixClient,
+  roomId: string,
+  sessionId: string,
+  localMember: { userId: string; displayName: string; avatarUrl?: string | null; role?: GroupCallRole },
+  options?: { constraints?: MediaStreamConstraints; iceServers?: RTCIceServer[] },
+): Promise<GroupCallCoordinator> {
+  const key = makeGroupCallKey(roomId, sessionId);
+  const existing = groupCallCoordinators.get(key);
+  if (existing) return existing;
+  const coordinator = await GroupCallCoordinator.create({
+    client,
+    roomId,
+    sessionId,
+    localMember: { ...localMember },
+    constraints: options?.constraints,
+    iceServers: options?.iceServers,
+  });
+  groupCallCoordinators.set(key, coordinator);
+  coordinator.on('disposed', () => {
+    groupCallCoordinators.delete(key);
+  });
+  return coordinator;
+}
+
+export function getGroupCallCoordinator(roomId: string, sessionId: string): GroupCallCoordinator | undefined {
+  return groupCallCoordinators.get(makeGroupCallKey(roomId, sessionId));
+}
+
+export async function leaveGroupCallCoordinator(roomId: string, sessionId: string): Promise<void> {
+  const key = makeGroupCallKey(roomId, sessionId);
+  const coordinator = groupCallCoordinators.get(key);
+  if (!coordinator) return;
+  await coordinator.leave();
+  groupCallCoordinators.delete(key);
+}
+
+export function getGroupCallParticipantsFromState(
+  client: MatrixClient,
+  roomId: string,
+  sessionId: string,
+): SerializedGroupCallParticipant[] {
+  const room = client.getRoom(roomId);
+  if (!room) return [];
+  try {
+    const event = room.currentState?.getStateEvents(
+      GROUP_CALL_PARTICIPANTS_EVENT_TYPE as unknown as EventType,
+      sessionId,
+    ) as unknown as { getContent?: () => GroupCallParticipantsContent } | undefined;
+    const content = event?.getContent?.();
+    if (!content || !Array.isArray(content.participants)) {
+      return [];
+    }
+    return content.participants;
+  } catch (error) {
+    console.warn('Failed to read group call participants', error);
+    return [];
+  }
 }
 
 /**
  * Create a group call URL and announce it into the room.
- * Sends m.notice with {"org.matrix.call.group": { url, kind }}.
- * Falls back to `${sfuBaseUrl}/room/<roomId>?user=<userId>`.
+ * Also synchronises the initial state for Matrix based participant discovery.
  */
-export async function startGroupCall(client: MatrixClient, roomId: string, opts: StartGroupCallOptions = {}): Promise<{ url: string }> {
+export async function startGroupCall(client: MatrixClient, roomId: string, opts: StartGroupCallOptions = {}): Promise<StartGroupCallResult> {
   const userId = client.getUserId() || 'unknown';
+  const sessionId = opts.sessionId || randomGroupSessionId();
   const sfuBase = opts.sfuBaseUrl || (typeof import.meta !== 'undefined' ? (import.meta as any).env?.VITE_SFU_BASE_URL : undefined);
-  if (!sfuBase) {
-    throw new Error('SFU base URL is not configured. Set VITE_SFU_BASE_URL or pass opts.sfuBaseUrl');
-  }
-  const url = `${sfuBase.replace(/\/+$/, '')}/room/${encodeURIComponent(roomId)}?user=${encodeURIComponent(userId)}`;
+  const callKind: SfuKind = opts.sfuKind || (sfuBase ? 'other' : 'cascade');
+  const url = sfuBase
+    ? `${sfuBase.replace(/\/+$/, '')}/room/${encodeURIComponent(roomId)}?user=${encodeURIComponent(userId)}&session=${encodeURIComponent(sessionId)}`
+    : `matrix:group-call/${encodeURIComponent(roomId)}/${sessionId}`;
+
+  const userProfile = client.getUser(userId);
+  const displayName = userProfile?.displayName || userId;
+  const avatarUrl = userProfile?.avatarUrl ?? null;
+  const participant = buildParticipantRecord(userId, displayName, avatarUrl, opts.role ?? 'host');
+
   const content: any = {
     msgtype: 'm.notice',
     body: opts.topic ? `Group call: ${opts.topic}` : 'Group call started',
-    'org.matrix.call.group': { url, kind: opts.sfuKind || 'other' },
+    'org.matrix.call.group': { url, kind: callKind, session_id: sessionId },
   };
-  await client.sendEvent(roomId, 'm.room.message', content);
-  return { url };
+  try {
+    await client.sendEvent(roomId, EventType.RoomMessage, content);
+  } catch (error) {
+    console.warn('Failed to send group call announcement', error);
+  }
+
+  const state: GroupCallStateEventContent = {
+    sessionId,
+    startedBy: userId,
+    startedAt: Date.now(),
+    kind: callKind,
+    url,
+    topic: opts.topic ?? null,
+    participants: [participant],
+    coWatch: { active: false },
+  };
+
+  try {
+    await client.sendStateEvent(roomId, GROUP_CALL_STATE_EVENT_TYPE as unknown as EventType, state, sessionId);
+    await client.sendStateEvent(roomId, GROUP_CALL_PARTICIPANTS_EVENT_TYPE as unknown as EventType, {
+      sessionId,
+      participants: state.participants,
+      updatedAt: Date.now(),
+    }, sessionId);
+  } catch (error) {
+    console.error('Failed to publish group call state', error);
+  }
+
+  return { url, sessionId, state };
 }
 
 /**

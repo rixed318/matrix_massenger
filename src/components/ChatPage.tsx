@@ -6,7 +6,6 @@ import MessageView from './MessageView';
 import ChatHeader from './ChatHeader';
 import MessageInput from './MessageInput';
 import { mxcToHttp, sendReaction, sendTypingIndicator, editMessage, sendMessage, deleteMessage, sendImageMessage, sendReadReceipt, sendFileMessage, setDisplayName, setAvatar, createRoom, inviteUser, forwardMessage, paginateRoomHistory, sendAudioMessage, setPinnedMessages, sendPollStart, sendPollResponse, translateText, sendStickerMessage, sendGifMessage, getSecureCloudProfileForClient, getRoomNotificationMode, setRoomNotificationMode as updateRoomPushRule, RoomCreationOptions } from '@matrix-messenger/core';
-import { startGroupCall, joinGroupCall, getDisplayMedia, enumerateDevices } from '@matrix-messenger/core';
 import {
     getScheduledMessages,
     addScheduledMessage,
@@ -30,8 +29,6 @@ import ScheduleMessageModal from './ScheduleMessageModal';
 import ViewScheduledMessagesModal from './ViewScheduledMessagesModal';
 import IncomingCallModal from './IncomingCallModal';
 import CallView from './CallView';
-import GroupCallView from './GroupCallView';
-import CallParticipantsPanel from './CallParticipantsPanel';
 import SearchModal from './SearchModal';
 import { SearchResultItem } from '@matrix-messenger/core';
 import type { DraftContent, SendKeyBehavior, DraftAttachment, DraftAttachmentKind } from '../types';
@@ -56,7 +53,14 @@ import {
     cancelOutboxItem,
     retryOutboxItem,
     OutboxPayload,
+    startGroupCall,
+    createGroupCallCoordinator,
+    leaveGroupCallCoordinator,
+    GroupCallParticipant,
 } from '../services/matrixService';
+import GroupCallCoordinator from '../services/webrtc/groupCallCoordinator';
+import { GROUP_CALL_STATE_EVENT_TYPE } from '../services/webrtc/groupCallConstants';
+import type { CallLayout } from './CallView';
 import { useAccountStore } from '../services/accountManager';
 
 interface ChatPageProps {
@@ -112,12 +116,26 @@ const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, s
     // Group call state
     const [activeGroupCall, setActiveGroupCall] = useState<{
         roomId: string;
+        sessionId: string;
         url: string;
-        participants: { id: string; name: string; isMuted?: boolean; isVideoMuted?: boolean; isScreenSharing?: boolean; avatarUrl?: string | null; }[];
-        layout: 'grid' | 'spotlight';
+        layout: CallLayout;
         isScreensharing: boolean;
+        isMuted: boolean;
+        isVideoMuted: boolean;
+        coWatchActive: boolean;
     } | null>(null);
+    const [groupCallCoordinator, setGroupCallCoordinator] = useState<GroupCallCoordinator | null>(null);
+    const [groupParticipants, setGroupParticipants] = useState<GroupCallParticipant[]>([]);
     const [showParticipantsPanel, setShowParticipantsPanel] = useState(false);
+    const [spotlightParticipantId, setSpotlightParticipantId] = useState<string | null>(null);
+    const previousParticipantIdsRef = useRef<Set<string>>(new Set());
+    const [groupCallPermissionError, setGroupCallPermissionError] = useState<string | null>(null);
+
+    useEffect(() => {
+        if (!groupCallPermissionError) return;
+        const timer = window.setTimeout(() => setGroupCallPermissionError(null), 5000);
+        return () => window.clearTimeout(timer);
+    }, [groupCallPermissionError]);
     const [incomingCall, setIncomingCall] = useState<MatrixCall | null>(null);
     const [translatedMessages, setTranslatedMessages] = useState<Record<string, { text: string; isLoading: boolean }>>({});
     const [chatBackground, setChatBackground] = useState<string>('');
@@ -644,47 +662,197 @@ const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, s
         };
     }, [client]);
 
-
+    const { canStartGroupCall, groupCallDisabledReason } = useMemo(() => {
+        if (!selectedRoomId) {
+            return { canStartGroupCall: false, groupCallDisabledReason: 'Выберите комнату' };
+        }
+        const room = client.getRoom(selectedRoomId);
+        if (!room) {
+            return { canStartGroupCall: false, groupCallDisabledReason: 'Комната недоступна' };
+        }
+        try {
+            const maySend = room.currentState?.maySendStateEvent?.(GROUP_CALL_STATE_EVENT_TYPE as any, client.getUserId() || '');
+            return { canStartGroupCall: Boolean(maySend), groupCallDisabledReason: maySend ? null : 'Недостаточно прав для запуска группового звонка' };
+        } catch (error) {
+            console.warn('Failed to evaluate group call permissions', error);
+            return { canStartGroupCall: true, groupCallDisabledReason: null };
+        }
+    }, [client, selectedRoomId]);
 
 // ===== Group call handlers =====
 const handleStartGroupCall = useCallback(async () => {
     if (!selectedRoomId) return;
-    try {
-        const { url } = await startGroupCall(client, selectedRoomId, { sfuKind: 'other' });
-        setActiveGroupCall({ roomId: selectedRoomId, url, participants: [], layout: 'grid', isScreensharing: false });
-        await joinGroupCall(selectedRoomId, url, 'Group Call');
-    } catch (e) {
-        console.error('Failed to start group call', e);
+    if (!canStartGroupCall) {
+        setGroupCallPermissionError(groupCallDisabledReason || 'Недостаточно прав для запуска группового звонка');
+        return;
     }
-}, [client, selectedRoomId]);
+    try {
+        const roomName = client.getRoom(selectedRoomId)?.name;
+        const result = await startGroupCall(client, selectedRoomId, { sfuKind: 'cascade', topic: roomName });
+        const localUserId = client.getUserId() || 'unknown';
+        const localUser = client.getUser(localUserId);
+        const coordinator = await createGroupCallCoordinator(client, selectedRoomId, result.sessionId, {
+            userId: localUserId,
+            displayName: localUser?.displayName || localUserId,
+            avatarUrl: localUser?.avatarUrl ?? null,
+            role: 'host',
+        }, { constraints: { audio: true, video: true } });
+        setGroupCallCoordinator(coordinator);
+        setGroupParticipants(coordinator.getParticipants());
+        const localParticipant = coordinator.getParticipants().find(p => p.userId === localUserId);
+        setActiveGroupCall({
+            roomId: selectedRoomId,
+            sessionId: result.sessionId,
+            url: result.url,
+            layout: 'grid',
+            isScreensharing: Boolean(localParticipant?.isScreensharing),
+            isMuted: Boolean(localParticipant?.isMuted),
+            isVideoMuted: Boolean(localParticipant?.isVideoMuted),
+            coWatchActive: false,
+        });
+        setShowParticipantsPanel(true);
+        if (notificationsEnabled) {
+            sendNotification('Групповой звонок', roomName ? `Комната: ${roomName}` : 'Вы начали групповой звонок', { roomId: selectedRoomId });
+        }
+    } catch (error) {
+        console.error('Failed to start group call', error);
+    }
+}, [selectedRoomId, canStartGroupCall, groupCallDisabledReason, client, notificationsEnabled]);
 
 const handleToggleScreenShare = useCallback(async () => {
-    if (!activeGroupCall) return;
+    if (!groupCallCoordinator) return;
     try {
-        // Let the embedded SFU page handle capture via postMessage; we still call getDisplayMedia to trigger permissions if needed.
-        try { await getDisplayMedia({ video: true, audio: false }); } catch (_) {}
-        setActiveGroupCall(prev => prev ? { ...prev, isScreensharing: !prev.isScreensharing } : prev);
-        window.postMessage({ type: 'toggle-screen-share' }, '*');
-    } catch (e) {
-        console.error('Screen share failed', e);
+        await groupCallCoordinator.toggleScreenshare();
+    } catch (error) {
+        console.error('Screen share failed', error);
     }
-}, [activeGroupCall]);
+}, [groupCallCoordinator]);
+
+const handleGroupMuteToggle = useCallback(() => {
+    void groupCallCoordinator?.toggleMute();
+}, [groupCallCoordinator]);
+
+const handleGroupVideoToggle = useCallback(() => {
+    void groupCallCoordinator?.toggleVideo();
+}, [groupCallCoordinator]);
+
+const handleToggleCoWatch = useCallback(() => {
+    void groupCallCoordinator?.toggleCoWatch();
+}, [groupCallCoordinator]);
 
 const handleCloseGroupCall = useCallback(() => {
+    if (activeGroupCall) {
+        void leaveGroupCallCoordinator(activeGroupCall.roomId, activeGroupCall.sessionId);
+    }
     setActiveGroupCall(null);
+    setGroupCallCoordinator(null);
+    setGroupParticipants([]);
     setShowParticipantsPanel(false);
+    previousParticipantIdsRef.current.clear();
+    setSpotlightParticipantId(null);
+}, [activeGroupCall]);
+
+const handleLayoutChange = useCallback((nextLayout: CallLayout) => {
+    setActiveGroupCall(prev => (prev ? { ...prev, layout: nextLayout } : prev));
 }, []);
 
-const handleParticipantsUpdate = useCallback((list: any[]) => {
-    setActiveGroupCall(prev => prev ? { ...prev, participants: list as any } : prev);
-}, []);
+const handleMuteParticipant = useCallback((participantId: string) => {
+    if (!groupCallCoordinator) return;
+    groupCallCoordinator.setParticipantMuted(participantId, true);
+}, [groupCallCoordinator]);
 
-const handleLayoutChange = useCallback((layout: 'grid'|'spotlight') => {
-    setActiveGroupCall(prev => prev ? { ...prev, layout } : prev);
+const handleVideoParticipantToggle = useCallback((participantId: string) => {
+    if (!groupCallCoordinator) return;
+    groupCallCoordinator.setParticipantVideoMuted(participantId, true);
+}, [groupCallCoordinator]);
+
+const handleRemoveParticipant = useCallback((participantId: string) => {
+    if (!groupCallCoordinator) return;
+    void groupCallCoordinator.kickParticipant(participantId);
+}, [groupCallCoordinator]);
+
+const handlePromotePresenter = useCallback((participantId: string) => {
+    if (!groupCallCoordinator) return;
+    groupCallCoordinator.promoteParticipant(participantId);
+}, [groupCallCoordinator]);
+
+const handleSpotlightParticipant = useCallback((participantId: string) => {
+    setSpotlightParticipantId(participantId);
+    setActiveGroupCall(prev => (prev ? { ...prev, layout: 'spotlight' } : prev));
 }, []);
 // ===== end group call handlers =====
 
-    
+    useEffect(() => {
+        if (!groupCallCoordinator) return;
+        const offParticipants = groupCallCoordinator.on('participants-changed', list => {
+            setGroupParticipants(list);
+            const localId = client.getUserId();
+            const localParticipant = localId ? list.find(p => p.userId === localId) : undefined;
+            setActiveGroupCall(prev => (prev && prev.sessionId === groupCallCoordinator.sessionId)
+                ? {
+                    ...prev,
+                    isMuted: Boolean(localParticipant?.isMuted),
+                    isVideoMuted: Boolean(localParticipant?.isVideoMuted),
+                    isScreensharing: Boolean(localParticipant?.isScreensharing),
+                }
+                : prev);
+            if (notificationsEnabled) {
+                const previous = previousParticipantIdsRef.current;
+                const next = new Set<string>();
+                list.forEach(participant => {
+                    next.add(participant.userId);
+                    if (!previous.has(participant.userId) && participant.userId !== localId) {
+                        sendNotification('Новый участник звонка', participant.displayName ?? participant.userId, { roomId: activeGroupCall?.roomId });
+                    }
+                });
+                previousParticipantIdsRef.current = next;
+            } else {
+                previousParticipantIdsRef.current = new Set(list.map(p => p.userId));
+            }
+        });
+        const offScreenshare = groupCallCoordinator.on('screenshare-changed', active => {
+            setActiveGroupCall(prev => (prev && prev.sessionId === groupCallCoordinator.sessionId) ? { ...prev, isScreensharing: active } : prev);
+        });
+        const offCoWatch = groupCallCoordinator.on('co-watch-changed', state => {
+            setActiveGroupCall(prev => (prev && prev.sessionId === groupCallCoordinator.sessionId) ? { ...prev, coWatchActive: Boolean(state?.active) } : prev);
+        });
+        return () => {
+            offParticipants?.();
+            offScreenshare?.();
+            offCoWatch?.();
+        };
+    }, [groupCallCoordinator, client, notificationsEnabled, activeGroupCall?.roomId, activeGroupCall?.sessionId]);
+
+    useEffect(() => {
+        if (!activeGroupCall) return;
+        previousParticipantIdsRef.current = new Set(groupParticipants.map(p => p.userId));
+    }, [activeGroupCall, groupParticipants]);
+
+    useEffect(() => {
+        return () => {
+            if (activeGroupCall) {
+                void leaveGroupCallCoordinator(activeGroupCall.roomId, activeGroupCall.sessionId);
+            }
+        };
+    }, [activeGroupCall]);
+
+
+    const participantViews = useMemo(() => groupParticipants.map(participant => ({
+        id: participant.userId,
+        name: participant.displayName ?? participant.userId,
+        isMuted: participant.isMuted,
+        isVideoMuted: participant.isVideoMuted,
+        isScreenSharing: participant.isScreensharing,
+        isCoWatching: participant.isCoWatching,
+        avatarUrl: participant.avatarUrl ?? null,
+        role: participant.role ?? 'participant',
+        isLocal: participant.userId === (client.getUserId() || ''),
+        lastActive: participant.lastActive,
+        stream: participant.stream ?? null,
+        screenshareStream: participant.screenshareStream ?? null,
+        dominant: Boolean(spotlightParticipantId && participant.userId === spotlightParticipantId),
+    })), [groupParticipants, client, spotlightParticipantId]);
+
     const handleSetChatBackground = (bgUrl: string) => {
         setChatBackground(bgUrl);
         localStorage.setItem('matrix-chat-bg', bgUrl);
@@ -1986,6 +2154,13 @@ const handleLayoutChange = useCallback((layout: 'grid'|'spotlight') => {
                             onOpenViewScheduled={() => setIsViewScheduledModalOpen(true)}
                             isDirectMessageRoom={selectedRoom.isDirectMessageRoom}
                             onPlaceCall={handlePlaceCall}
+                            onStartGroupCall={handleStartGroupCall}
+                            canStartGroupCall={canStartGroupCall}
+                            groupCallDisabledReason={groupCallDisabledReason || undefined}
+                            onToggleScreenShare={activeGroupCall ? handleToggleScreenShare : undefined}
+                            onOpenParticipants={activeGroupCall ? () => setShowParticipantsPanel(true) : undefined}
+                            participantsCount={activeGroupCall ? participantViews.length : undefined}
+                            isScreensharing={Boolean(activeGroupCall?.isScreensharing)}
                             onOpenSearch={() => setIsSearchOpen(true)}
                             onOpenSharedMedia={handleOpenSharedMedia}
                             sharedMediaCount={sharedMediaCount}
@@ -2311,8 +2486,48 @@ const handleLayoutChange = useCallback((layout: 'grid'|'spotlight') => {
                 isPaginating={isSharedMediaPaginating}
                 onLoadMore={sharedMediaData?.hasMore ? handleLoadMoreMedia : undefined}
             />
+            {activeGroupCall && (
+                <CallView
+                    call={null}
+                    client={client}
+                    onHangup={handleCloseGroupCall}
+                    participants={participantViews}
+                    layout={activeGroupCall.layout}
+                    onLayoutChange={handleLayoutChange}
+                    showParticipantsPanel={showParticipantsPanel}
+                    onToggleParticipantsPanel={() => setShowParticipantsPanel(prev => !prev)}
+                    onToggleScreenshare={handleToggleScreenShare}
+                    onToggleLocalMute={handleGroupMuteToggle}
+                    onToggleLocalVideo={handleGroupVideoToggle}
+                    isScreensharing={activeGroupCall.isScreensharing}
+                    isMuted={activeGroupCall.isMuted}
+                    isVideoMuted={activeGroupCall.isVideoMuted}
+                    onToggleCoWatch={handleToggleCoWatch}
+                    coWatchActive={activeGroupCall.coWatchActive}
+                    headerTitle={client.getRoom(activeGroupCall.roomId)?.name || undefined}
+                    onMuteParticipant={handleMuteParticipant}
+                    onVideoParticipantToggle={handleVideoParticipantToggle}
+                    onRemoveParticipant={handleRemoveParticipant}
+                    onPromotePresenter={handlePromotePresenter}
+                    onSpotlightParticipant={handleSpotlightParticipant}
+                    localUserId={client.getUserId() || undefined}
+                    canModerateParticipants={canStartGroupCall}
+                />
+            )}
             {activeCall && <CallView call={activeCall} onHangup={() => handleHangupCall(false)} client={client} />}
             {incomingCall && <IncomingCallModal call={incomingCall} onAccept={handleAnswerCall} onDecline={() => handleHangupCall(true)} client={client} />}
+            {groupCallPermissionError && (
+                <div className="fixed bottom-6 right-6 bg-red-600 text-white px-4 py-2 rounded-lg shadow-lg z-50 flex items-center gap-3">
+                    <span>{groupCallPermissionError}</span>
+                    <button
+                        type="button"
+                        className="text-sm font-semibold uppercase tracking-wide"
+                        onClick={() => setGroupCallPermissionError(null)}
+                    >
+                        Закрыть
+                    </button>
+                </div>
+            )}
         </div>
     );
 };
