@@ -25,6 +25,8 @@ export default {
         'mention-text': 'var(--color-mention-text)',
         'mention-self-bg': 'var(--color-mention-self-bg)',
         'mention-self-text': 'var(--color-mention-self-text)',
+        'chip-selected': 'var(--color-chip-selected)',
+        'status-offline': 'var(--color-status-offline)',
       }
     },
   },
