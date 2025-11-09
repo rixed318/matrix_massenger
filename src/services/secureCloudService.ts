@@ -1,7 +1,39 @@
 import { RoomEvent, EventType } from 'matrix-js-sdk';
 import type { MatrixClient, MatrixEvent, MatrixRoom } from '../types';
+import { getLocalMlDetectors } from './secureCloudDetectors/localMl';
 
 export type SecureCloudMode = 'disabled' | 'managed' | 'self-hosted';
+
+export interface SecureCloudDetectorResult {
+    riskScore: number;
+    reasons?: string[];
+    keywords?: string[];
+    summary?: string;
+}
+
+export interface SecureCloudDetectorStatus {
+    state: 'idle' | 'loading' | 'ready' | 'error';
+    detail?: string;
+}
+
+export interface SecureCloudDetector {
+    id: string;
+    displayName: string;
+    description?: string;
+    required?: boolean;
+    score: (
+        event: MatrixEvent,
+        room: MatrixRoom,
+        profile: SecureCloudProfile,
+    ) => Promise<SecureCloudDetectorResult | null> | SecureCloudDetectorResult | null;
+    getStatus?: () => Promise<SecureCloudDetectorStatus> | SecureCloudDetectorStatus;
+}
+
+export interface SecureCloudDetectorState {
+    detector: SecureCloudDetector;
+    enabled: boolean;
+    config?: Record<string, unknown>;
+}
 
 export interface SecureCloudProfile {
     mode: SecureCloudMode;
@@ -12,6 +44,7 @@ export interface SecureCloudProfile {
     enableAnalytics?: boolean;
     riskThreshold?: number;
     allowedEventTypes?: string[];
+    detectors?: SecureCloudDetectorState[];
 }
 
 export interface SuspiciousEventNotice {
@@ -52,6 +85,66 @@ const KEYWORD_PATTERNS = [
     'giveaway',
 ];
 
+const summariseMessageBody = (body: string): string => {
+    return body.length > 160 ? `${body.substring(0, 157)}...` : body;
+};
+
+const readEventBody = (event: MatrixEvent): { body: string; msgtype: string } => {
+    const content = (event.getContent?.() as Record<string, unknown>) || {};
+    const body = typeof content['body'] === 'string' ? content['body'] : '';
+    const msgtype = typeof content['msgtype'] === 'string' ? content['msgtype'] : event.getType();
+    return { body, msgtype };
+};
+
+const builtinDetectors: SecureCloudDetector[] = [
+    {
+        id: 'basic',
+        displayName: 'Базовые эвристики',
+        description: 'Поиск ключевых слов и признаков фишинга в сообщениях.',
+        required: true,
+        score: (event) => {
+            const { body, msgtype } = readEventBody(event);
+            const lowerBody = body.toLowerCase();
+            const keywords = KEYWORD_PATTERNS.filter(pattern => lowerBody.includes(pattern));
+            const reasons: string[] = [];
+            let riskScore = 0;
+
+            if (keywords.length > 0) {
+                riskScore += 0.45 + Math.min(0.2, keywords.length * 0.05);
+                reasons.push('keyword_match');
+            }
+
+            if (msgtype && msgtype !== 'm.text') {
+                riskScore += 0.1;
+                reasons.push('non_text_message');
+            }
+
+            const hasUrl = lowerBody.match(/https?:\/\/[^\s]+/g);
+            if (hasUrl) {
+                riskScore += 0.2;
+                reasons.push('contains_url');
+            }
+
+            if (body.length > 500) {
+                riskScore += 0.05;
+                reasons.push('long_body');
+            }
+
+            const cappedScore = Math.min(1, riskScore);
+            if (cappedScore <= 0) {
+                return null;
+            }
+
+            return {
+                riskScore: cappedScore,
+                reasons,
+                keywords,
+                summary: summariseMessageBody(body),
+            } satisfies SecureCloudDetectorResult;
+        },
+    },
+];
+
 const suspiciousEvents = new WeakMap<MatrixClient, Map<string, SuspiciousEventNotice[]>>();
 
 const ensureStore = (client: MatrixClient): Map<string, SuspiciousEventNotice[]> => {
@@ -67,56 +160,142 @@ const normaliseBaseUrl = (baseUrl: string): string => {
     return baseUrl.replace(/\/+$/, '');
 };
 
-const evaluateEventRisk = (event: MatrixEvent, room: MatrixRoom, profile: SecureCloudProfile): SuspiciousEventNotice | null => {
-    const content = (event.getContent?.() as Record<string, unknown>) || {};
-    const body = typeof content['body'] === 'string' ? content['body'] : '';
-    const msgtype = typeof content['msgtype'] === 'string' ? content['msgtype'] : event.getType();
+const mergeDetectors = (profile: SecureCloudProfile): SecureCloudDetectorState[] => {
+    const states = new Map<string, SecureCloudDetectorState>();
 
-    const lowerBody = body.toLowerCase();
-    const keywords = KEYWORD_PATTERNS.filter(pattern => lowerBody.includes(pattern));
+    const register = (state: SecureCloudDetectorState): void => {
+        const detector = state.detector;
+        if (!detector) {
+            return;
+        }
+        const required = Boolean(detector.required);
+        const enabled = required ? true : state.enabled !== false;
+        states.set(detector.id, { ...state, detector, enabled });
+    };
+
+    for (const detector of builtinDetectors) {
+        register({ detector, enabled: true });
+    }
+
+    for (const state of profile.detectors ?? []) {
+        if (!state?.detector) {
+            continue;
+        }
+        register(state);
+    }
+
+    for (const detector of getLocalMlDetectors()) {
+        const existing = states.get(detector.id);
+        if (existing) {
+            register({ ...existing, detector, enabled: existing.enabled });
+        } else {
+            register({ detector, enabled: false });
+        }
+    }
+
+    return Array.from(states.values());
+};
+
+export const resolveSecureCloudDetectors = (profile: SecureCloudProfile): SecureCloudDetectorState[] => {
+    return mergeDetectors(profile);
+};
+
+export const normaliseSecureCloudProfile = (profile: SecureCloudProfile): SecureCloudProfile => {
+    return {
+        ...profile,
+        detectors: mergeDetectors(profile),
+    };
+};
+
+interface DetectorExecutionError {
+    detectorId: string;
+    error: Error;
+}
+
+const evaluateEventRisk = async (
+    event: MatrixEvent,
+    room: MatrixRoom,
+    profile: SecureCloudProfile,
+): Promise<{ notice: SuspiciousEventNotice | null; errors: DetectorExecutionError[] }> => {
+    const detectors = resolveSecureCloudDetectors(profile);
+    const errors: DetectorExecutionError[] = [];
+    const keywords = new Set<string>();
     const reasons: string[] = [];
-    let riskScore = 0;
+    let aggregatedScore = 0;
+    let summaryFromDetectors: string | undefined;
 
-    if (keywords.length > 0) {
-        riskScore += 0.45 + Math.min(0.2, keywords.length * 0.05);
-        reasons.push('keyword_match');
-    }
+    const { body } = readEventBody(event);
 
-    if (msgtype && msgtype !== 'm.text') {
-        riskScore += 0.1;
-        reasons.push('non_text_message');
-    }
+    for (const state of detectors) {
+        const detector = state.detector;
+        if (!detector) {
+            continue;
+        }
+        const required = Boolean(detector.required);
+        if (!state.enabled && !required) {
+            continue;
+        }
 
-    const urlRegex = /(https?:\/\/[^\s]+)/gi;
-    if (urlRegex.test(lowerBody)) {
-        riskScore += 0.2;
-        reasons.push('contains_url');
-    }
+        try {
+            const result = await detector.score(event, room, profile);
+            if (!result) {
+                continue;
+            }
 
-    if (body.length > 500) {
-        riskScore += 0.05;
-        reasons.push('long_body');
+            const contribution = Math.min(1, Math.max(0, result.riskScore));
+            if (contribution <= 0) {
+                continue;
+            }
+
+            aggregatedScore += contribution;
+
+            if (Array.isArray(result.reasons) && result.reasons.length > 0) {
+                for (const reason of result.reasons) {
+                    reasons.push(`${detector.id}:${reason}`);
+                }
+            } else {
+                reasons.push(detector.id);
+            }
+
+            if (Array.isArray(result.keywords)) {
+                for (const keyword of result.keywords) {
+                    if (keyword) {
+                        keywords.add(keyword);
+                    }
+                }
+            }
+
+            if (!summaryFromDetectors && result.summary) {
+                summaryFromDetectors = result.summary;
+            }
+        } catch (error) {
+            const err = error instanceof Error ? error : new Error('Secure Cloud detector failure');
+            errors.push({ detectorId: detector.id, error: err });
+        }
     }
 
     const threshold = typeof profile.riskThreshold === 'number' ? profile.riskThreshold : 0.6;
-    const cappedScore = Math.min(1, riskScore);
+    const cappedScore = Math.min(1, aggregatedScore);
 
     if (cappedScore < threshold) {
-        return null;
+        return { notice: null, errors };
     }
 
-    const summary = body.length > 160 ? `${body.substring(0, 157)}...` : body;
+    const summary = summaryFromDetectors ?? summariseMessageBody(body);
 
     return {
-        eventId: event.getId?.() ?? 'unknown',
-        roomId: room.roomId,
-        roomName: room.name ?? room.roomId,
-        sender: event.getSender?.() ?? 'unknown',
-        timestamp: event.getTs?.() ?? Date.now(),
-        riskScore: Number(cappedScore.toFixed(2)),
-        reasons,
-        summary,
-        keywords,
+        notice: {
+            eventId: event.getId?.() ?? 'unknown',
+            roomId: room.roomId,
+            roomName: room.name ?? room.roomId,
+            sender: event.getSender?.() ?? 'unknown',
+            timestamp: event.getTs?.() ?? Date.now(),
+            riskScore: Number(cappedScore.toFixed(2)),
+            reasons,
+            summary,
+            keywords: Array.from(keywords),
+        },
+        errors,
     };
 };
 
@@ -189,12 +368,13 @@ export const startSecureCloudSession = (
     initialProfile: SecureCloudProfile,
     callbacks: SecureCloudCallbacks = {},
 ): SecureCloudSession => {
-    let profile = initialProfile;
+    let profile = normaliseSecureCloudProfile(initialProfile);
     const processedEvents = new Set<string>();
 
     const store = ensureStore(client);
 
     const handler = async (event: MatrixEvent, room: MatrixRoom | undefined) => {
+        profile = normaliseSecureCloudProfile(profile);
         if (!profile || profile.mode === 'disabled') {
             return;
         }
@@ -210,7 +390,14 @@ export const startSecureCloudSession = (
             return;
         }
 
-        const notice = evaluateEventRisk(event, room, profile);
+        const { notice, errors: detectorErrors } = await evaluateEventRisk(event, room, profile);
+
+        for (const detectorError of detectorErrors) {
+            const { detectorId, error } = detectorError;
+            const message = `Secure Cloud detector ${detectorId} failed: ${error.message}`;
+            callbacks.onError?.(new Error(message));
+        }
+
         if (!notice) {
             if (eventId) {
                 processedEvents.add(eventId);
@@ -246,7 +433,7 @@ export const startSecureCloudSession = (
             client.removeListener(RoomEvent.Timeline, handler);
         },
         updateProfile: (nextProfile: SecureCloudProfile) => {
-            profile = nextProfile;
+            profile = normaliseSecureCloudProfile(nextProfile);
         },
     };
 };
