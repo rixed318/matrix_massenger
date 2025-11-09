@@ -19,6 +19,11 @@ const RoomListItem: React.FC<RoomListItemProps> = ({ room, isSelected, onSelect 
         ? formatDistanceToNow(new Date(lastMessage.timestamp), { addSuffix: true })
         : '';
 
+    const hasRecentAttachment = !!lastMessage && (
+        lastMessage.isSticker
+        || ['m.image', 'm.video', 'm.audio', 'm.file', 'm.location'].includes(lastMessage.content.msgtype)
+    );
+
     const renderMetaText = () => {
         if (isSpace) {
             const parts: string[] = [];
@@ -92,7 +97,12 @@ const RoomListItem: React.FC<RoomListItemProps> = ({ room, isSelected, onSelect 
                     <p className="text-xs text-text-secondary flex-shrink-0">{timestamp}</p>
                 </div>
                 <div className="flex justify-between items-start">
-                    <p className="text-sm text-text-secondary truncate">{renderMetaText()}</p>
+                    <p className="text-sm text-text-secondary truncate flex items-center gap-2">
+                        <span className="truncate">{renderMetaText()}</span>
+                        {hasRecentAttachment && (
+                            <span className="px-1.5 py-0.5 rounded-full bg-accent/10 text-[10px] uppercase tracking-wide text-accent font-semibold">Shared</span>
+                        )}
+                    </p>
                     {room.unreadCount > 0 && (
                         <span className="bg-accent text-text-inverted text-xs font-bold rounded-full h-5 w-5 flex items-center justify-center flex-shrink-0 ml-2">
                             {room.unreadCount}

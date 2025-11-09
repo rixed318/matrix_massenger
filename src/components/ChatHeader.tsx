@@ -201,6 +201,20 @@ const ChatHeader: React.FC<ChatHeaderProps> = ({
                     >
                         🔍
                     </button>
+                    {onOpenSharedMedia && (
+                        <button
+                            onClick={onOpenSharedMedia}
+                            className="p-2 rounded-full hover:bg-bg-tertiary relative"
+                            title="Shared media"
+                        >
+                            📎
+                            {sharedMediaCount > 0 && (
+                                <span className="absolute -top-1 -right-1 bg-accent text-text-inverted text-xs font-bold rounded-full h-4 min-w-[16px] px-1 flex items-center justify-center">
+                                    {sharedMediaCount}
+                                </span>
+                            )}
+                        </button>
+                    )}
                     {scheduledMessageCount > 0 && (
                         <button
                             onClick={onOpenViewScheduled}
