@@ -28,7 +28,26 @@ describe('SharedMediaPanel', () => {
     const baseSummary: RoomMediaSummary = {
         itemsByCategory: {
             media: [
-                createItem({ eventId: 'm1', body: 'Holiday photo', url: 'https://example.org/image.jpg', category: 'media', eventType: 'm.image' }),
+                createItem({
+                    eventId: 'm1',
+                    body: 'Holiday photo',
+                    url: 'https://example.org/image.jpg',
+                    category: 'media',
+                    eventType: 'm.image',
+                    timestamp: new Date('2024-01-15T10:00:00Z').getTime(),
+                    senderId: '@user:example.org',
+                    senderName: 'User',
+                }),
+                createItem({
+                    eventId: 'm2',
+                    body: 'Winter party',
+                    url: 'https://example.org/party.jpg',
+                    category: 'media',
+                    eventType: 'm.image',
+                    timestamp: new Date('2023-12-20T10:00:00Z').getTime(),
+                    senderId: '@other:example.org',
+                    senderName: 'Colleague',
+                }),
             ],
             files: [
                 createItem({ eventId: 'f1', body: 'Budget.xlsx', url: 'https://example.org/file', size: 2048, category: 'files', eventType: 'm.file' }),
@@ -40,13 +59,13 @@ describe('SharedMediaPanel', () => {
                 createItem({ eventId: 'v1', body: 'Voice memo', url: 'https://example.org/audio.ogg', category: 'voice', eventType: 'm.audio', isVoiceMessage: true }),
             ],
         },
-        countsByCategory: { media: 1, files: 1, links: 1, voice: 1 },
+        countsByCategory: { media: 2, files: 1, links: 1, voice: 1 },
         hasMore: true,
-        eventIds: ['m1', 'f1', 'l1', 'v1'],
+        eventIds: ['m1', 'm2', 'f1', 'l1', 'v1'],
     };
 
-    it('renders media categories and matches snapshot', () => {
-        const { asFragment } = render(
+    it('renders media categories and filter controls', () => {
+        render(
             <SharedMediaPanel
                 isOpen
                 onClose={() => {}}
@@ -54,6 +73,7 @@ describe('SharedMediaPanel', () => {
                 isLoading={false}
                 isPaginating={false}
                 onLoadMore={() => {}}
+                currentUserId="@user:example.org"
             />,
         );
 
@@ -62,7 +82,8 @@ describe('SharedMediaPanel', () => {
         expect(screen.getByText('Файлы')).toBeInTheDocument();
         expect(screen.getByText('Ссылки')).toBeInTheDocument();
         expect(screen.getByText('Голосовые')).toBeInTheDocument();
-        expect(asFragment()).toMatchSnapshot();
+        expect(screen.getByPlaceholderText('Поиск по названию, ссылке или отправителю')).toBeInTheDocument();
+        expect(screen.getByText('Таймлайн')).toBeInTheDocument();
     });
 
     it('switches tabs and triggers load more', () => {
@@ -75,6 +96,7 @@ describe('SharedMediaPanel', () => {
                 isLoading={false}
                 isPaginating={false}
                 onLoadMore={onLoadMore}
+                currentUserId="@user:example.org"
             />,
         );
 
@@ -84,5 +106,74 @@ describe('SharedMediaPanel', () => {
         const loadMoreButton = screen.getByRole('button', { name: 'Загрузить ещё' });
         fireEvent.click(loadMoreButton);
         expect(onLoadMore).toHaveBeenCalledTimes(1);
+    });
+
+    it('applies search filter and shows empty state', async () => {
+        render(
+            <SharedMediaPanel
+                isOpen
+                onClose={() => {}}
+                data={baseSummary}
+                isLoading={false}
+                isPaginating={false}
+                onLoadMore={() => {}}
+                currentUserId="@user:example.org"
+            />,
+        );
+
+        const searchInput = screen.getByPlaceholderText('Поиск по названию, ссылке или отправителю');
+        fireEvent.change(searchInput, { target: { value: 'несуществующий запрос' } });
+
+        const emptyMessage = await screen.findByText('Ничего не найдено.');
+        expect(emptyMessage).toBeInTheDocument();
+        expect(screen.queryByRole('button', { name: 'Загрузить ещё' })).not.toBeInTheDocument();
+    });
+
+    it('filters to only my items when quick tag enabled', async () => {
+        const summary: RoomMediaSummary = {
+            ...baseSummary,
+            itemsByCategory: {
+                ...baseSummary.itemsByCategory,
+                media: [
+                    createItem({
+                        eventId: 'mine',
+                        body: 'My photo',
+                        category: 'media',
+                        eventType: 'm.image',
+                        senderId: '@user:example.org',
+                        senderName: 'User',
+                        timestamp: new Date('2024-02-02T10:00:00Z').getTime(),
+                    }),
+                    createItem({
+                        eventId: 'other',
+                        body: 'Other photo',
+                        category: 'media',
+                        eventType: 'm.image',
+                        senderId: '@other:example.org',
+                        senderName: 'Colleague',
+                        timestamp: new Date('2024-02-03T10:00:00Z').getTime(),
+                    }),
+                ],
+            },
+            countsByCategory: { ...baseSummary.countsByCategory, media: 2 },
+        };
+
+        render(
+            <SharedMediaPanel
+                isOpen
+                onClose={() => {}}
+                data={summary}
+                isLoading={false}
+                isPaginating={false}
+                onLoadMore={() => {}}
+                currentUserId="@user:example.org"
+            />,
+        );
+
+        const quickTag = screen.getByRole('button', { name: 'Только мои' });
+        fireEvent.click(quickTag);
+
+        expect(await screen.findByText('My photo')).toBeInTheDocument();
+        expect(screen.queryByText('Other photo')).not.toBeInTheDocument();
     });
 });
