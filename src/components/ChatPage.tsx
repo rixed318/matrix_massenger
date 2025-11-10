@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 // FIX: Import MatrixRoom to correctly type room objects from the SDK.
-import { Room as UIRoom, Message, MatrixEvent, Reaction, ReplyInfo, MatrixClient, MatrixRoom, ActiveThread, MatrixUser, Poll, PollResult, Folder, ScheduledMessage, MatrixCall, LinkPreviewData, Sticker, Gif, RoomNotificationMode } from '@matrix-messenger/core';
+import { Room as UIRoom, Message, MatrixEvent, Reaction, ReplyInfo, MatrixClient, MatrixRoom, ActiveThread, MatrixUser, Poll, PollResult, Folder, ScheduledMessage, ScheduledMessageScheduleUpdate, ScheduledMessageUpdatePayload, MatrixCall, LinkPreviewData, Sticker, Gif, RoomNotificationMode } from '@matrix-messenger/core';
 import RoomList from './RoomList';
 import MessageView from './MessageView';
 import ChatHeader from './ChatHeader';
@@ -11,6 +11,8 @@ import {
     getScheduledMessages,
     addScheduledMessage,
     deleteScheduledMessage,
+    updateScheduledMessage,
+    bulkUpdateScheduledMessages,
     markScheduledMessageSent,
     recordScheduledMessageError,
     parseScheduledMessagesFromEvent,
@@ -2240,13 +2242,17 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
         setIsScheduleModalOpen(true);
     };
 
-    const handleConfirmSchedule = async (sendAt: number) => {
+    const handleConfirmSchedule = async (selection: { sendAtUtc: number; timezoneOffset: number; timezoneId: string; localTimestamp: number }) => {
         if (selectedRoomId && contentToSchedule) {
             const preparedContent = prepareScheduledContent(contentToSchedule);
             const hasContent = preparedContent.plain.trim().length > 0 || preparedContent.attachments.length > 0 || !!preparedContent.msgtype;
             if (hasContent) {
                 try {
-                    await addScheduledMessage(client, selectedRoomId, preparedContent, sendAt);
+                    await addScheduledMessage(client, selectedRoomId, preparedContent, selection.sendAtUtc, {
+                        timezoneOffset: selection.timezoneOffset,
+                        timezoneId: selection.timezoneId,
+                        localTimestamp: selection.localTimestamp,
+                    });
                     setAllScheduledMessages(await getScheduledMessages(client));
                 } catch (error) {
                     console.error('Failed to schedule message', error);
@@ -2286,6 +2292,56 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
             }
         }
     };
+
+    const handleUpdateScheduled = useCallback(async (id: string, update: ScheduledMessageUpdatePayload) => {
+        try {
+            await updateScheduledMessage(client, id, update);
+            setAllScheduledMessages(await getScheduledMessages(client));
+        } catch (error) {
+            console.error(`Failed to update scheduled message ${id}`, error);
+            throw error;
+        }
+    }, [client]);
+
+    const handleBulkReschedule = useCallback(async (ids: string[], schedule: ScheduledMessageScheduleUpdate) => {
+        try {
+            await bulkUpdateScheduledMessages(client, ids.map(id => ({ id, schedule })));
+            setAllScheduledMessages(await getScheduledMessages(client));
+        } catch (error) {
+            console.error('Failed to bulk update scheduled messages', error);
+            throw error;
+        }
+    }, [client]);
+
+    const handleBulkSendScheduled = useCallback(async (ids: string[]) => {
+        try {
+            const latestMessages = await getScheduledMessages(client);
+            const selected = latestMessages.filter(message => ids.includes(message.id));
+            const errors: string[] = [];
+
+            for (const message of selected) {
+                try {
+                    await dispatchScheduledMessage(message);
+                    await markScheduledMessageSent(client, message.id);
+                } catch (error) {
+                    console.error(`Failed to send scheduled message ${message.id} immediately:`, error);
+                    errors.push(message.id);
+                    await recordScheduledMessageError(client, message.id, error);
+                }
+            }
+
+            setAllScheduledMessages(await getScheduledMessages(client));
+
+            if (errors.length > 0) {
+                throw new Error(`Не удалось отправить ${errors.length} из ${selected.length} сообщений`);
+            }
+        } catch (error) {
+            if (error instanceof Error) {
+                throw error;
+            }
+            throw new Error('Не удалось выполнить массовую отправку');
+        }
+    }, [client, dispatchScheduledMessage]);
 
     const handlePlaceCall = (type: 'voice' | 'video') => {
         if (!selectedRoomId || activeCall) return;
@@ -2685,7 +2741,7 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
                 />
             )}
             
-             {isScheduleModalOpen && (
+            {isScheduleModalOpen && (
                 <ScheduleMessageModal
                     isOpen={isScheduleModalOpen}
                     onClose={() => setIsScheduleModalOpen(false)}
@@ -2693,7 +2749,7 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
                     messageContent={contentToSchedule}
                 />
             )}
-            
+
             {isViewScheduledModalOpen && (
                 <ViewScheduledMessagesModal
                     isOpen={isViewScheduledModalOpen}
@@ -2701,6 +2757,9 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
                     messages={scheduledForThisRoom}
                     onDelete={handleDeleteScheduled}
                     onSendNow={handleSendScheduledNow}
+                    onUpdate={handleUpdateScheduled}
+                    onBulkReschedule={handleBulkReschedule}
+                    onBulkSend={handleBulkSendScheduled}
                 />
             )}
 
