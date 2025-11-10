@@ -1353,6 +1353,28 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
 
         const nextHiddenRoomIds: string[] = [];
 
+        const scheduledCountByRoom = allScheduledMessages.reduce<Record<string, number>>((acc, message) => {
+            if (!message || typeof message.roomId !== 'string') {
+                return acc;
+            }
+            if (message.status === 'sent') {
+                return acc;
+            }
+            acc[message.roomId] = (acc[message.roomId] ?? 0) + 1;
+            return acc;
+        }, {});
+
+        const secureAlertCounts = Object.entries(secureCloudAlerts).reduce<Record<string, number>>(
+            (acc, [roomId, alerts]) => {
+                if (!Array.isArray(alerts) || alerts.length === 0) {
+                    return acc;
+                }
+                acc[roomId] = alerts.length;
+                return acc;
+            },
+            {},
+        );
+
         const roomData: UIRoom[] = sortedRooms.map(room => {
             const lastEvent = room.timeline[room.timeline.length - 1];
             const pinnedEvent = room.currentState.getStateEvents(EventType.RoomPinnedEvents, '');
@@ -1383,6 +1405,11 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
             if (hidden) {
                 nextHiddenRoomIds.push(room.roomId);
             }
+            const mentionCount = room.getUnreadNotificationCount(NotificationCountType.Highlight);
+            const scheduledCount = scheduledCountByRoom[room.roomId] ?? 0;
+            const secureAlerts = secureAlertCounts[room.roomId] ?? 0;
+            const isServiceRoom = roomType === 'm.server_notice';
+
             const uiRoom: UIRoom = {
                 roomId: room.roomId,
                 name: room.name,
@@ -1400,6 +1427,10 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
                 canonicalAlias: canonicalAlias ?? null,
                 isHidden: hidden,
                 selfDestructSeconds: ttlSeconds,
+                mentionCount,
+                scheduledMessageCount: scheduledCount,
+                secureAlertCount: secureAlerts,
+                isServiceRoom,
             };
 
             if (room.roomId === savedMessagesRoomId) {
@@ -1416,6 +1447,9 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
                     name: '🔒 Hidden chat',
                     lastMessage: null,
                     unreadCount: 0,
+                    mentionCount: 0,
+                    scheduledMessageCount: 0,
+                    secureAlertCount: 0,
                 };
             }
 
@@ -1431,7 +1465,15 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
 
         setIsRoomsLoading(false);
         setHiddenRoomIds(nextHiddenRoomIds);
-    }, [client, savedMessagesRoomId, parseMatrixEvent, appLockState.enabled, appLockState.unlocked]);
+    }, [
+        client,
+        savedMessagesRoomId,
+        parseMatrixEvent,
+        appLockState.enabled,
+        appLockState.unlocked,
+        allScheduledMessages,
+        secureCloudAlerts,
+    ]);
 
     useEffect(() => {
         loadRooms();

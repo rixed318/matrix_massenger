@@ -76,6 +76,10 @@ export interface Room {
   slowModeSeconds?: number | null;
   isHidden?: boolean;
   selfDestructSeconds?: number | null;
+  mentionCount?: number;
+  scheduledMessageCount?: number;
+  secureAlertCount?: number;
+  isServiceRoom?: boolean;
 }
 
 export interface LinkPreviewData {
