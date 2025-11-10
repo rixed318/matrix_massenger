@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useAccountStore } from '../services/accountManager';
 
 interface MiniAppHostProps {
     appId: string;
@@ -36,7 +37,9 @@ const MiniAppHost: React.FC<MiniAppHostProps> = ({
     onClose,
 }) => {
     const iframeRef = useRef<HTMLIFrameElement>(null);
-    const [isReady, setIsReady] = useState(false);
+    const containerRef = useRef<HTMLDivElement>(null);
+    const [hasLoaded, setHasLoaded] = useState(false);
+    const [isMiniAppReady, setIsMiniAppReady] = useState(false);
     const [tauriSupported, setTauriSupported] = useState(false);
     const [popoutError, setPopoutError] = useState<string | null>(null);
 
@@ -49,6 +52,106 @@ const MiniAppHost: React.FC<MiniAppHostProps> = ({
         }
         return { height };
     }, [height]);
+
+    const activeUserId = useAccountStore(
+        useCallback(state => {
+            const key = state.activeKey;
+            return key ? state.accounts[key]?.creds.user_id ?? null : null;
+        }, []),
+    );
+
+    const language = useMemo(() => {
+        if (typeof navigator === 'undefined') {
+            return 'en';
+        }
+        return navigator.language || navigator.languages?.[0] || 'en';
+    }, []);
+
+    const resolveTheme = useCallback(() => {
+        if (typeof document === 'undefined') {
+            return '';
+        }
+        return document.documentElement.className || '';
+    }, []);
+
+    const [currentTheme, setCurrentTheme] = useState(resolveTheme);
+
+    useEffect(() => {
+        if (typeof MutationObserver === 'undefined' || typeof document === 'undefined') {
+            return undefined;
+        }
+        const observer = new MutationObserver(() => {
+            setCurrentTheme(resolveTheme());
+        });
+        observer.observe(document.documentElement, { attributes: true, attributeFilter: ['class'] });
+        return () => observer.disconnect();
+    }, [resolveTheme]);
+
+    const [viewport, setViewport] = useState<{ width: number; height: number }>({ width: 0, height: 0 });
+
+    const allowedOrigins = useMemo(() => {
+        if (typeof window === 'undefined') {
+            return [] as string[];
+        }
+        try {
+            const parsed = new URL(url, window.location.href);
+            if (parsed.protocol === 'data:' || parsed.protocol === 'about:' || parsed.protocol === 'blob:') {
+                return ['null'];
+            }
+            return [parsed.origin];
+        } catch (error) {
+            console.warn('Unable to resolve mini-app origin', error);
+            return [] as string[];
+        }
+    }, [url]);
+
+    const targetOrigin = useMemo(() => (allowedOrigins[0] ? allowedOrigins[0] : '*'), [allowedOrigins]);
+
+    const postMiniAppMessage = useCallback(
+        (type: string, payload?: unknown) => {
+            const frame = iframeRef.current;
+            if (!frame?.contentWindow) {
+                return;
+            }
+            frame.contentWindow.postMessage(
+                {
+                    appId,
+                    type,
+                    payload,
+                },
+                targetOrigin,
+            );
+        },
+        [appId, targetOrigin],
+    );
+
+    const readViewport = useCallback(() => {
+        const element = containerRef.current;
+        if (!element) {
+            return { width: 0, height: 0 };
+        }
+        const rect = element.getBoundingClientRect();
+        return {
+            width: Math.round(rect.width),
+            height: Math.round(rect.height),
+        };
+    }, []);
+
+    const sendInitialContext = useCallback(() => {
+        const currentViewport = readViewport();
+        postMiniAppMessage('web_app_init', {
+            theme: currentTheme,
+            language,
+            viewport: currentViewport,
+            userId: activeUserId,
+        });
+    }, [activeUserId, currentTheme, language, postMiniAppMessage, readViewport]);
+
+    const sendThemeUpdate = useCallback(() => {
+        postMiniAppMessage('web_app_theme_changed', {
+            theme: currentTheme,
+        });
+    }, [currentTheme, postMiniAppMessage]);
 
     const sandboxAttribute = useMemo(() => {
         if (sandbox === false) {
@@ -90,27 +193,173 @@ const MiniAppHost: React.FC<MiniAppHostProps> = ({
     }, []);
 
     useEffect(() => {
-        if (!onMessage) {
+        const element = containerRef.current;
+        if (!element) {
             return undefined;
         }
-        const handler = (event: MessageEvent) => {
-            if (!iframeRef.current) {
-                return;
-            }
-            if (event.source !== iframeRef.current.contentWindow) {
-                return;
-            }
-            onMessage(event);
+
+        const updateViewport = () => {
+            const rect = element.getBoundingClientRect();
+            setViewport({ width: Math.round(rect.width), height: Math.round(rect.height) });
         };
-        window.addEventListener('message', handler);
-        return () => window.removeEventListener('message', handler);
-    }, [onMessage]);
+
+        if (typeof ResizeObserver === 'undefined') {
+            updateViewport();
+            if (typeof window !== 'undefined') {
+                window.addEventListener('resize', updateViewport);
+                return () => window.removeEventListener('resize', updateViewport);
+            }
+            return undefined;
+        }
+
+        const observer = new ResizeObserver(entries => {
+            const entry = entries[0];
+            if (!entry) {
+                return;
+            }
+            const { width, height: entryHeight } = entry.contentRect;
+            setViewport(previous => {
+                const height = entryHeight;
+                if (Math.round(previous.width) === Math.round(width) && Math.round(previous.height) === Math.round(height)) {
+                    return previous;
+                }
+                return {
+                    width: Math.round(width),
+                    height: Math.round(height),
+                };
+            });
+        });
+
+        observer.observe(element);
+        updateViewport();
+        return () => observer.disconnect();
+    }, [height]);
+
+    useEffect(() => {
+        if (!hasLoaded) {
+            return;
+        }
+        sendInitialContext();
+    }, [hasLoaded, sendInitialContext]);
+
+    useEffect(() => {
+        if (!hasLoaded) {
+            return;
+        }
+        sendThemeUpdate();
+    }, [currentTheme, hasLoaded, sendThemeUpdate]);
+
+    useEffect(() => {
+        if (!hasLoaded || viewport.width === 0 || viewport.height === 0) {
+            return;
+        }
+        postMiniAppMessage('viewport_changed', viewport);
+    }, [hasLoaded, postMiniAppMessage, viewport]);
+
+    useEffect(() => {
+        const handleMessage = (event: MessageEvent) => {
+            const frame = iframeRef.current;
+            if (!frame?.contentWindow || event.source !== frame.contentWindow) {
+                return;
+            }
+            if (allowedOrigins.length > 0 && !allowedOrigins.includes(event.origin)) {
+                return;
+            }
+
+            const rawData = event.data;
+            let type: string | undefined;
+            let payload: any;
+
+            if (typeof rawData === 'string') {
+                try {
+                    const parsed = JSON.parse(rawData);
+                    type = parsed?.type ?? parsed?.eventType;
+                    payload = parsed?.payload ?? parsed?.data;
+                } catch (error) {
+                    console.warn('Failed to parse message from mini-app', error);
+                    return;
+                }
+            } else if (typeof rawData === 'object' && rawData !== null) {
+                type = (rawData as any).type ?? (rawData as any).eventType;
+                payload = (rawData as any).payload ?? (rawData as any).data;
+            }
+
+            switch (type) {
+                case 'web_app_ready':
+                    setIsMiniAppReady(true);
+                    onReady?.();
+                    postMiniAppMessage('viewport_changed', readViewport());
+                    break;
+                case 'web_app_request_theme':
+                    sendThemeUpdate();
+                    break;
+                case 'web_app_expand':
+                    postMiniAppMessage('web_app_expanded', readViewport());
+                    break;
+                case 'web_app_close':
+                    onClose?.();
+                    break;
+                case 'web_app_open_link': {
+                    const targetUrl: string | undefined = payload?.url;
+                    if (!targetUrl) {
+                        break;
+                    }
+                    const promptMessage: string = payload?.confirmText
+                        ?? 'Открыть внешнюю ссылку в новом окне?';
+                    const shouldOpen = window.confirm(promptMessage);
+                    if (shouldOpen) {
+                        window.open(targetUrl, '_blank', 'noopener');
+                    }
+                    break;
+                }
+                case 'web_app_open_popup': {
+                    const title: string | undefined = payload?.title;
+                    const message: string = payload?.message ?? '';
+                    const buttons: Array<{ id?: string; text?: string }> = Array.isArray(payload?.buttons)
+                        ? payload.buttons
+                        : [];
+
+                    let selectedButtonId: string | null = null;
+                    if (buttons.length <= 1) {
+                        const button = buttons[0];
+                        const displayText = title ? `${title}\n\n${message}` : message;
+                        window.alert(displayText);
+                        selectedButtonId = button?.id ?? null;
+                    } else {
+                        const primary = buttons[0];
+                        const secondary = buttons[1];
+                        const displayText = title ? `${title}\n\n${message}` : message;
+                        const confirmed = window.confirm(displayText);
+                        const chosen = confirmed ? primary : secondary;
+                        selectedButtonId = chosen?.id ?? null;
+                    }
+
+                    postMiniAppMessage('web_app_popup_closed', {
+                        buttonId: selectedButtonId,
+                    });
+                    break;
+                }
+                default:
+                    break;
+            }
+
+            onMessage?.(event);
+        };
+
+        window.addEventListener('message', handleMessage);
+        return () => window.removeEventListener('message', handleMessage);
+    }, [allowedOrigins, onClose, onMessage, onReady, postMiniAppMessage, readViewport, sendThemeUpdate]);
+
+    useEffect(() => {
+        setIsMiniAppReady(false);
+        setHasLoaded(false);
+    }, [url]);
 
     const handleLoad = useCallback(() => {
-        setIsReady(true);
+        setHasLoaded(true);
+        setIsMiniAppReady(false);
         setPopoutError(null);
-        onReady?.();
-    }, [onReady]);
+    }, []);
 
     const openInDesktopWindow = useCallback(async () => {
         if (!tauriSupported || !allowPopout) {
@@ -174,8 +423,12 @@ const MiniAppHost: React.FC<MiniAppHostProps> = ({
                 </div>
             </header>
 
-            <div className="relative flex-1 min-h-[320px]" style={containerStyle}>
-                {!isReady && (
+            <div
+                ref={containerRef}
+                className={`relative flex-1 ${height === undefined ? 'min-h-[320px]' : ''}`.trim()}
+                style={containerStyle}
+            >
+                {!isMiniAppReady && (
                     <div className="absolute inset-0 flex items-center justify-center text-sm text-text-secondary bg-bg-primary/60 z-10">
                         Loading mini-app…
                     </div>
@@ -188,7 +441,7 @@ const MiniAppHost: React.FC<MiniAppHostProps> = ({
                     allow={allow}
                     onLoad={handleLoad}
                     className={`w-full h-full border-none rounded-b-lg bg-white transition-opacity duration-200 ${
-                        isReady ? 'opacity-100' : 'opacity-0'
+                        isMiniAppReady ? 'opacity-100' : 'opacity-0'
                     } ${frameClassName}`}
                 />
             </div>
