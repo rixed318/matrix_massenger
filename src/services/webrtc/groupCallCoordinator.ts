@@ -9,6 +9,7 @@ import {
     GroupCallParticipantsContent,
     GroupCallRole,
     GroupCallStateEventContent,
+    GroupCallStageState,
     SerializedGroupCallParticipant,
 } from './groupCallConstants';
 
@@ -43,6 +44,7 @@ interface EventMap {
     'participants-changed': GroupCallParticipant[];
     'co-watch-changed': GroupCallStateEventContent['coWatch'];
     'screenshare-changed': boolean;
+    'stage-changed': GroupCallStageState;
     'error': Error;
     'disposed': void;
 }
@@ -94,6 +96,19 @@ export class GroupCallCoordinator {
     private localStream: MediaStream | null = null;
     private screenStream: MediaStream | null = null;
     private coWatchState: GroupCallStateEventContent['coWatch'] = { active: false };
+    private handRaiseQueue: string[] = [];
+    private stageState: GroupCallStageState = {
+        speakers: [],
+        listeners: [],
+        handRaiseQueue: [],
+        updatedAt: Date.now(),
+    };
+    private stateMetadata: { startedBy: string; startedAt: number; kind: string; url: string } = {
+        startedBy: '',
+        startedAt: 0,
+        kind: 'cascade',
+        url: '',
+    };
     private participants = new Map<string, InternalParticipant>();
     private peers = new Map<string, RTCPeerConnection>();
     private dataChannels = new Map<string, RTCDataChannel>();
@@ -109,6 +124,12 @@ export class GroupCallCoordinator {
         this.sessionId = options.sessionId;
         this.localMember = options.localMember;
         this.iceServers = options.iceServers;
+        this.stateMetadata = {
+            startedBy: options.localMember.userId,
+            startedAt: Date.now(),
+            kind: 'cascade',
+            url: '',
+        };
     }
 
     static async create(options: GroupCallCoordinatorOptions): Promise<GroupCallCoordinator> {
@@ -139,6 +160,7 @@ export class GroupCallCoordinator {
             lastActive: Date.now(),
         });
 
+        this.updateStageState(true);
         this.attachClientListener();
         await this.syncParticipantsState();
         await this.announceJoin();
@@ -285,6 +307,113 @@ export class GroupCallCoordinator {
         return pc;
     }
 
+    private ensureParticipantRecord(userId: string): InternalParticipant {
+        let participant = this.participants.get(userId);
+        if (!participant) {
+            participant = {
+                userId,
+                displayName: userId,
+                isMuted: true,
+                isVideoMuted: true,
+                isScreensharing: false,
+            } as InternalParticipant;
+            this.participants.set(userId, participant);
+        }
+        return participant;
+    }
+
+    private computeStageState(): GroupCallStageState {
+        const speakers: string[] = [];
+        const listeners: string[] = [];
+        const queueSet = new Set(this.handRaiseQueue);
+
+        this.participants.forEach(participant => {
+            const role = participant.role ?? 'participant';
+            if (role === 'listener') {
+                listeners.push(participant.userId);
+            } else if (role === 'requesting_speak') {
+                if (!queueSet.has(participant.userId)) {
+                    this.handRaiseQueue.push(participant.userId);
+                    queueSet.add(participant.userId);
+                }
+            } else {
+                speakers.push(participant.userId);
+            }
+        });
+
+        this.handRaiseQueue = this.handRaiseQueue.filter(userId => {
+            const participant = this.participants.get(userId);
+            return participant?.role === 'requesting_speak';
+        });
+
+        return {
+            speakers,
+            listeners,
+            handRaiseQueue: [...this.handRaiseQueue],
+            updatedAt: Date.now(),
+        };
+    }
+
+    private updateStageState(emit = false): GroupCallStageState {
+        const stage = this.computeStageState();
+        this.stageState = stage;
+        if (emit) {
+            this.emitter.emit('stage-changed', stage);
+        }
+        return stage;
+    }
+
+    private broadcastStageUpdate(stage?: GroupCallStageState) {
+        const payload = stage ?? this.stageState;
+        this.broadcastControl({ type: 'stage-update', payload });
+    }
+
+    private applyStageState(stage: Partial<GroupCallStageState> | null | undefined) {
+        if (!stage) return;
+        if (Array.isArray(stage.handRaiseQueue)) {
+            this.handRaiseQueue = stage.handRaiseQueue.filter(userId => this.participants.has(userId));
+        }
+        if (Array.isArray(stage.listeners)) {
+            stage.listeners.forEach(userId => {
+                const participant = this.ensureParticipantRecord(userId);
+                if (!['host', 'moderator', 'presenter'].includes(participant.role ?? '')) {
+                    participant.role = 'listener';
+                    participant.handRaisedAt = null;
+                }
+                this.participants.set(userId, participant);
+            });
+        }
+        if (Array.isArray(stage.handRaiseQueue)) {
+            stage.handRaiseQueue.forEach((userId, index) => {
+                const participant = this.ensureParticipantRecord(userId);
+                if (!['host', 'moderator'].includes(participant.role ?? '')) {
+                    participant.role = 'requesting_speak';
+                }
+                participant.handRaisedAt = participant.handRaisedAt ?? Date.now() + index;
+                this.participants.set(userId, participant);
+            });
+        }
+        if (Array.isArray(stage.speakers)) {
+            stage.speakers.forEach(userId => {
+                const participant = this.ensureParticipantRecord(userId);
+                if (participant.role === 'listener' || participant.role === 'requesting_speak') {
+                    participant.role = 'participant';
+                    participant.handRaisedAt = null;
+                }
+                this.participants.set(userId, participant);
+            });
+        }
+        this.stageState = {
+            speakers: Array.isArray(stage.speakers) ? [...stage.speakers] : this.stageState.speakers,
+            listeners: Array.isArray(stage.listeners) ? [...stage.listeners] : this.stageState.listeners,
+            handRaiseQueue: Array.isArray(stage.handRaiseQueue)
+                ? stage.handRaiseQueue.filter(userId => this.participants.has(userId))
+                : [...this.handRaiseQueue],
+            updatedAt: stage.updatedAt ?? Date.now(),
+        };
+        this.emitter.emit('stage-changed', this.stageState);
+    }
+
     private setupDataChannel(remoteUserId: string, channel: RTCDataChannel) {
         this.dataChannels.set(remoteUserId, channel);
         channel.onmessage = (event) => {
@@ -330,6 +459,46 @@ export class GroupCallCoordinator {
             if (participant) {
                 participant.isScreensharing = Boolean(message.payload?.active);
                 this.participants.set(remoteUserId, participant);
+                this.emitter.emit('participants-changed', this.getParticipants());
+            }
+        } else if (message.type === 'stage-update') {
+            this.applyStageState(message.payload as GroupCallStageState);
+            this.emitter.emit('participants-changed', this.getParticipants());
+        } else if (message.type === 'hand-raise') {
+            const target: string | undefined = message.payload?.userId;
+            if (typeof target === 'string') {
+                const participant = this.ensureParticipantRecord(target);
+                participant.role = 'requesting_speak';
+                participant.handRaisedAt = Date.now();
+                if (!this.handRaiseQueue.includes(target)) {
+                    this.handRaiseQueue.push(target);
+                }
+                this.participants.set(target, participant);
+                this.updateStageState(true);
+                this.emitter.emit('participants-changed', this.getParticipants());
+            }
+        } else if (message.type === 'hand-lower') {
+            const target: string | undefined = message.payload?.userId;
+            if (typeof target === 'string') {
+                const participant = this.ensureParticipantRecord(target);
+                if (!['host', 'moderator'].includes(participant.role ?? '')) {
+                    participant.role = 'listener';
+                }
+                participant.handRaisedAt = null;
+                this.participants.set(target, participant);
+                this.handRaiseQueue = this.handRaiseQueue.filter(id => id !== target);
+                this.updateStageState(true);
+                this.emitter.emit('participants-changed', this.getParticipants());
+            }
+        } else if (message.type === 'stage-invite') {
+            const target: string | undefined = message.payload?.target;
+            if (typeof target === 'string') {
+                const participant = this.ensureParticipantRecord(target);
+                participant.role = message.payload?.role ?? 'participant';
+                participant.handRaisedAt = null;
+                this.handRaiseQueue = this.handRaiseQueue.filter(id => id !== target);
+                this.participants.set(target, participant);
+                this.updateStageState(true);
                 this.emitter.emit('participants-changed', this.getParticipants());
             }
         }
@@ -381,31 +550,35 @@ export class GroupCallCoordinator {
     private handleRemoteJoin(remoteUserId: string, payload: any) {
         const displayName = payload?.displayName || remoteUserId;
         const avatarUrl = payload?.avatarUrl ?? null;
-        const role: GroupCallRole = payload?.role ?? 'participant';
-        const existing = this.participants.get(remoteUserId);
-        if (!existing) {
-            this.participants.set(remoteUserId, {
-                userId: remoteUserId,
-                displayName,
-                avatarUrl,
-                role,
-                isMuted: true,
-                isVideoMuted: true,
-                isScreensharing: false,
-            });
+        const role: GroupCallRole = payload?.role ?? 'listener';
+        const participant = this.ensureParticipantRecord(remoteUserId);
+        participant.displayName = displayName;
+        participant.avatarUrl = avatarUrl;
+        participant.role = role;
+        if (role === 'requesting_speak') {
+            participant.handRaisedAt = participant.handRaisedAt ?? Date.now();
+            if (!this.handRaiseQueue.includes(remoteUserId)) {
+                this.handRaiseQueue.push(remoteUserId);
+            }
+        } else {
+            participant.handRaisedAt = null;
+            this.handRaiseQueue = this.handRaiseQueue.filter(id => id !== remoteUserId);
         }
+        this.participants.set(remoteUserId, participant);
         this.emitter.emit('participants-changed', this.getParticipants());
 
         if (this.shouldInitiateFor(remoteUserId)) {
             void this.startNegotiation(remoteUserId);
         }
         this.scheduleParticipantsSync();
+        this.updateStageState(true);
     }
 
     private handleRemoteLeave(remoteUserId: string) {
         const participant = this.participants.get(remoteUserId);
         if (participant) {
             this.participants.delete(remoteUserId);
+            this.handRaiseQueue = this.handRaiseQueue.filter(id => id !== remoteUserId);
             this.emitter.emit('participants-changed', this.getParticipants());
         }
         const pc = this.peers.get(remoteUserId);
@@ -414,6 +587,7 @@ export class GroupCallCoordinator {
             this.peers.delete(remoteUserId);
         }
         this.dataChannels.delete(remoteUserId);
+        this.updateStageState(true);
     }
 
     private async startNegotiation(remoteUserId: string) {
@@ -484,13 +658,28 @@ export class GroupCallCoordinator {
                 existing.displayName = entry.displayName ?? existing.displayName;
                 existing.avatarUrl = entry.avatarUrl ?? existing.avatarUrl;
                 existing.lastActive = entry.lastActive ?? existing.lastActive;
+                existing.handRaisedAt = entry.handRaisedAt ?? existing.handRaisedAt;
+                this.participants.set(entry.userId, existing);
             } else {
                 this.participants.set(entry.userId, {
                     ...entry,
                 });
             }
+            const participant = this.participants.get(entry.userId);
+            if (!participant) return;
+            if (participant.role === 'requesting_speak') {
+                participant.handRaisedAt = participant.handRaisedAt ?? entry.handRaisedAt ?? Date.now();
+                if (!this.handRaiseQueue.includes(participant.userId)) {
+                    this.handRaiseQueue.push(participant.userId);
+                }
+            } else {
+                participant.handRaisedAt = null;
+                this.handRaiseQueue = this.handRaiseQueue.filter(id => id !== participant.userId);
+            }
+            this.participants.set(participant.userId, participant);
         });
         this.emitter.emit('participants-changed', this.getParticipants());
+        this.updateStageState(true);
     }
 
     private handleControlEvent(event: MatrixEvent) {
@@ -503,9 +692,18 @@ export class GroupCallCoordinator {
     private handleStateEvent(event: MatrixEvent) {
         const content = event.getContent() as GroupCallStateEventContent;
         if (!content || content.sessionId !== this.sessionId) return;
+        this.stateMetadata = {
+            startedBy: content.startedBy ?? this.stateMetadata.startedBy,
+            startedAt: content.startedAt ?? this.stateMetadata.startedAt,
+            kind: content.kind ?? this.stateMetadata.kind,
+            url: content.url ?? this.stateMetadata.url,
+        };
         if (content.coWatch) {
             this.coWatchState = content.coWatch;
             this.emitter.emit('co-watch-changed', this.coWatchState);
+        }
+        if (content.stage) {
+            this.applyStageState(content.stage);
         }
     }
 
@@ -532,7 +730,9 @@ export class GroupCallCoordinator {
             isCoWatching: participant.isCoWatching,
             role: participant.role,
             lastActive: participant.lastActive,
+            handRaisedAt: participant.handRaisedAt ?? null,
         }));
+        const stage = this.updateStageState(true);
         try {
             await this.client.sendStateEvent(this.roomId, GROUP_CALL_PARTICIPANTS_EVENT_TYPE as any, {
                 sessionId: this.sessionId,
@@ -542,6 +742,26 @@ export class GroupCallCoordinator {
         } catch (error) {
             console.error('Failed to sync participants', error);
         }
+        try {
+            await this.client.sendStateEvent(
+                this.roomId,
+                GROUP_CALL_STATE_EVENT_TYPE as any,
+                {
+                    sessionId: this.sessionId,
+                    startedBy: this.stateMetadata.startedBy,
+                    startedAt: this.stateMetadata.startedAt || Date.now(),
+                    kind: this.stateMetadata.kind,
+                    url: this.stateMetadata.url,
+                    participants,
+                    coWatch: this.coWatchState,
+                    stage,
+                } as GroupCallStateEventContent,
+                this.sessionId,
+            );
+        } catch (error) {
+            console.error('Failed to sync stage state', error);
+        }
+        this.broadcastStageUpdate(stage);
     }
 
     getLocalStream(): MediaStream | null {
@@ -658,9 +878,99 @@ export class GroupCallCoordinator {
             url: '',
             participants: [],
             coWatch: this.coWatchState,
+            stage: this.stageState,
         } as GroupCallStateEventContent, this.sessionId);
         this.broadcastControl({ type: 'cowatch-toggle', payload: this.coWatchState });
         this.emitter.emit('co-watch-changed', this.coWatchState);
+    }
+
+    getStageState(): GroupCallStageState {
+        return {
+            speakers: [...this.stageState.speakers],
+            listeners: [...this.stageState.listeners],
+            handRaiseQueue: [...this.handRaiseQueue],
+            updatedAt: this.stageState.updatedAt,
+        };
+    }
+
+    getHandRaiseQueue(): string[] {
+        return [...this.handRaiseQueue];
+    }
+
+    raiseHand() {
+        const userId = this.localMember.userId;
+        const participant = this.ensureParticipantRecord(userId);
+        if (['host', 'moderator', 'presenter', 'participant'].includes(participant.role ?? 'participant')) {
+            return;
+        }
+        if (participant.role === 'requesting_speak') {
+            this.lowerHand(userId);
+            return;
+        }
+        participant.role = 'requesting_speak';
+        participant.handRaisedAt = Date.now();
+        this.participants.set(userId, participant);
+        if (!this.handRaiseQueue.includes(userId)) {
+            this.handRaiseQueue.push(userId);
+        }
+        const stage = this.updateStageState(true);
+        this.scheduleParticipantsSync();
+        this.broadcastControl({ type: 'hand-raise', payload: { userId } });
+        this.broadcastStageUpdate(stage);
+        this.emitter.emit('participants-changed', this.getParticipants());
+    }
+
+    lowerHand(participantId: string = this.localMember.userId) {
+        const participant = this.participants.get(participantId);
+        if (!participant) return;
+        if (participant.role === 'requesting_speak' || participant.role === 'listener') {
+            if (!['host', 'moderator'].includes(participant.role ?? '')) {
+                participant.role = 'listener';
+            }
+            participant.handRaisedAt = null;
+            this.participants.set(participantId, participant);
+        }
+        const queueBefore = this.handRaiseQueue.length;
+        this.handRaiseQueue = this.handRaiseQueue.filter(id => id !== participantId);
+        const stage = this.updateStageState(true);
+        this.scheduleParticipantsSync();
+        if (participantId === this.localMember.userId || queueBefore !== this.handRaiseQueue.length) {
+            this.broadcastControl({ type: 'hand-lower', payload: { userId: participantId } });
+        }
+        this.broadcastStageUpdate(stage);
+        this.emitter.emit('participants-changed', this.getParticipants());
+    }
+
+    bringParticipantToStage(participantId: string, promotedRole: GroupCallRole = 'participant') {
+        const participant = this.ensureParticipantRecord(participantId);
+        if (['host', 'moderator'].includes(participant.role ?? '') && promotedRole === 'listener') {
+            return;
+        }
+        participant.role = promotedRole;
+        participant.handRaisedAt = null;
+        this.participants.set(participantId, participant);
+        this.handRaiseQueue = this.handRaiseQueue.filter(id => id !== participantId);
+        const stage = this.updateStageState(true);
+        this.scheduleParticipantsSync();
+        this.broadcastControl({ type: 'stage-invite', payload: { target: participantId, role: promotedRole } });
+        this.broadcastStageUpdate(stage);
+        this.emitter.emit('participants-changed', this.getParticipants());
+    }
+
+    moveParticipantToAudience(participantId: string) {
+        const participant = this.ensureParticipantRecord(participantId);
+        if (['host', 'moderator'].includes(participant.role ?? '')) {
+            return;
+        }
+        participant.role = 'listener';
+        participant.handRaisedAt = null;
+        this.participants.set(participantId, participant);
+        this.handRaiseQueue = this.handRaiseQueue.filter(id => id !== participantId);
+        const stage = this.updateStageState(true);
+        this.scheduleParticipantsSync();
+        this.broadcastControl({ type: 'hand-lower', payload: { userId: participantId } });
+        this.broadcastStageUpdate(stage);
+        this.emitter.emit('participants-changed', this.getParticipants());
     }
 
     setParticipantMuted(participantId: string, muted: boolean) {
@@ -692,23 +1002,21 @@ export class GroupCallCoordinator {
     }
 
     promoteParticipant(participantId: string) {
-        const participant = this.participants.get(participantId);
-        if (!participant) return;
-        participant.role = 'presenter';
-        this.participants.set(participantId, participant);
-        this.scheduleParticipantsSync();
-        this.emitter.emit('participants-changed', this.getParticipants());
+        this.bringParticipantToStage(participantId, 'presenter');
     }
 
     async kickParticipant(participantId: string) {
         const participant = this.participants.get(participantId);
         if (!participant) return;
         this.participants.delete(participantId);
+        this.handRaiseQueue = this.handRaiseQueue.filter(id => id !== participantId);
         const pc = this.peers.get(participantId);
         pc?.close();
         this.peers.delete(participantId);
         this.dataChannels.delete(participantId);
         this.scheduleParticipantsSync();
+        this.updateStageState(true);
+        this.broadcastStageUpdate();
         this.emitter.emit('participants-changed', this.getParticipants());
         await this.sendSignal(participantId, 'leave', { by: this.localMember.userId, reason: 'kick' });
     }
@@ -735,6 +1043,13 @@ export class GroupCallCoordinator {
         this.peers.forEach(pc => pc.close());
         this.peers.clear();
         this.dataChannels.clear();
+        this.handRaiseQueue = [];
+        this.stageState = {
+            speakers: [],
+            listeners: [],
+            handRaiseQueue: [],
+            updatedAt: Date.now(),
+        };
         this.emitter.emit('disposed', undefined);
     }
 }

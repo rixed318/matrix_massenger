@@ -41,6 +41,18 @@ const defaultPushGatewayUrl = resolveStringEnv('VITE_MATRIX_PUSH_GATEWAY')
   ?? resolveStringEnv('VITE_MATRIX_PUSH_GATEWAY_URL');
 const defaultProfileTag = resolveStringEnv('VITE_MATRIX_PUSH_PROFILE_TAG');
 
+const postToServiceWorker = (type: string, payload: Record<string, unknown>) => {
+  if (!isBrowser) {
+    return;
+  }
+  try {
+    const controller = navigator.serviceWorker?.controller;
+    controller?.postMessage({ type, payload });
+  } catch (error) {
+    console.warn('Failed to post message to service worker', error);
+  }
+};
+
 export interface StoredPushSubscription {
   endpoint: string;
   auth: string;
