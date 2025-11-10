@@ -86,11 +86,20 @@ export interface SecureCloudRetentionBucket {
     maxDurationMs: number | null;
 }
 
+export interface SecureCloudRoomAlertStats {
+    roomId: string;
+    roomName: string;
+    total: number;
+    open: number;
+    lastAlertTimestamp: number | null;
+}
+
 export interface SecureCloudAggregatedStats {
     totalFlagged: number;
     openNotices: number;
     flags: Record<string, number>;
     actions: Record<string, number>;
+    rooms: SecureCloudRoomAlertStats[];
     retention: {
         count: number;
         averageMs: number | null;
@@ -110,6 +119,12 @@ export interface SecureCloudLogExportOptions {
     roomId?: string;
     format?: SecureCloudLogFormat;
     includeHeaders?: boolean;
+    fromTimestamp?: number;
+    toTimestamp?: number;
+}
+
+export interface SecureCloudAggregatedExportOptions {
+    format?: SecureCloudLogFormat;
 }
 
 const KEYWORD_PATTERNS = [
@@ -212,11 +227,20 @@ interface AggregatedRetentionInternal {
     policyDays: number | null;
 }
 
+interface AggregatedRoomStatsInternal {
+    roomId: string;
+    roomName: string;
+    total: number;
+    open: number;
+    lastAlertTimestamp: number | null;
+}
+
 interface AggregatedStatsInternal {
     totalFlagged: number;
     openNotices: number;
     flags: Map<string, number>;
     actions: Map<string, number>;
+    rooms: Map<string, AggregatedRoomStatsInternal>;
     retention: AggregatedRetentionInternal;
     updatedAt: number;
 }
@@ -241,6 +265,7 @@ const createEmptyStats = (): AggregatedStatsInternal => ({
     openNotices: 0,
     flags: new Map<string, number>(),
     actions: new Map<string, number>(),
+    rooms: new Map<string, AggregatedRoomStatsInternal>(),
     retention: createEmptyRetention(),
     updatedAt: Date.now(),
 });
@@ -262,11 +287,26 @@ const buildSnapshot = (stats: AggregatedStatsInternal): SecureCloudAggregatedSta
     const averageMs = stats.retention.count > 0
         ? Math.round(stats.retention.totalDurationMs / stats.retention.count)
         : null;
+    const rooms: SecureCloudRoomAlertStats[] = Array.from(stats.rooms.values())
+        .map(room => ({
+            roomId: room.roomId,
+            roomName: room.roomName,
+            total: room.total,
+            open: room.open,
+            lastAlertTimestamp: room.lastAlertTimestamp,
+        }))
+        .sort((a, b) => {
+            if (b.total !== a.total) {
+                return b.total - a.total;
+            }
+            return a.roomName.localeCompare(b.roomName);
+        });
     return {
         totalFlagged: stats.totalFlagged,
         openNotices: stats.openNotices,
         flags: mapToRecord(stats.flags),
         actions: mapToRecord(stats.actions),
+        rooms,
         retention: {
             count: stats.retention.count,
             averageMs,
@@ -337,6 +377,24 @@ const recordFlaggedEventStats = (client: MatrixClient, notice: SuspiciousEventNo
     store.stats.totalFlagged += 1;
     store.stats.openNotices += 1;
     store.stats.actions.set('flagged', (store.stats.actions.get('flagged') ?? 0) + 1);
+    const roomId = notice.roomId;
+    if (roomId) {
+        const existing = store.stats.rooms.get(roomId) ?? {
+            roomId,
+            roomName: notice.roomName ?? roomId,
+            total: 0,
+            open: 0,
+            lastAlertTimestamp: null,
+        } satisfies AggregatedRoomStatsInternal;
+        existing.roomName = notice.roomName ?? existing.roomName ?? roomId;
+        existing.total += 1;
+        existing.open = Math.max(0, existing.open + 1);
+        const ts = typeof notice.timestamp === 'number' ? notice.timestamp : Date.now();
+        existing.lastAlertTimestamp = existing.lastAlertTimestamp === null
+            ? ts
+            : Math.max(existing.lastAlertTimestamp, ts);
+        store.stats.rooms.set(roomId, existing);
+    }
     const reasons = Array.isArray(notice.reasons) && notice.reasons.length > 0 ? notice.reasons : ['unspecified'];
     for (const reason of reasons) {
         const key = normaliseReasonKey(reason);
@@ -361,6 +419,13 @@ const recordNoticeResolutionStats = (
     store.stats.actions.set(action, (store.stats.actions.get(action) ?? 0) + notices.length);
     const now = Date.now();
     for (const notice of notices) {
+        if (notice.roomId) {
+            const room = store.stats.rooms.get(notice.roomId);
+            if (room) {
+                room.open = Math.max(0, room.open - 1);
+                room.roomName = notice.roomName ?? room.roomName ?? notice.roomId;
+            }
+        }
         const duration = now - notice.timestamp;
         applyRetentionSample(store.stats, duration);
     }
@@ -474,9 +539,31 @@ export const exportSuspiciousEventsLog = (
     client: MatrixClient,
     options: SecureCloudLogExportOptions = {},
 ): string => {
-    const { roomId, format = 'json', includeHeaders = true } = options;
+    const {
+        roomId,
+        format = 'json',
+        includeHeaders = true,
+        fromTimestamp,
+        toTimestamp,
+    } = options;
     const notices = getSuspiciousEvents(client, roomId);
-    const records = notices.map(notice => ({
+    const fromTs = typeof fromTimestamp === 'number' && Number.isFinite(fromTimestamp)
+        ? fromTimestamp
+        : null;
+    const toTs = typeof toTimestamp === 'number' && Number.isFinite(toTimestamp)
+        ? toTimestamp
+        : null;
+    const filtered = notices.filter(notice => {
+        const ts = typeof notice.timestamp === 'number' ? notice.timestamp : 0;
+        if (fromTs !== null && ts < fromTs) {
+            return false;
+        }
+        if (toTs !== null && ts > toTs) {
+            return false;
+        }
+        return true;
+    });
+    const records = filtered.map(notice => ({
         event_id: notice.eventId,
         room_id: notice.roomId,
         room_name: notice.roomName ?? '',
@@ -519,8 +606,66 @@ export const exportSuspiciousEventsLog = (
         payload = JSON.stringify(records, null, 2);
     }
 
-    recordExportedEventsStats(client, notices.length);
+    recordExportedEventsStats(client, records.length);
     return payload;
+};
+
+export const exportSecureCloudAggregatedStats = (
+    client: MatrixClient,
+    options: SecureCloudAggregatedExportOptions = {},
+): string => {
+    const { format = 'json' } = options;
+    const snapshot = getSecureCloudAggregatedStats(client);
+
+    if (format === 'csv') {
+        const rows: string[][] = [];
+        rows.push(['section', 'key', 'label', 'value', 'extra']);
+        rows.push(['summary', 'total_flagged', 'Всего флагов', String(snapshot.totalFlagged), '']);
+        rows.push(['summary', 'open_notices', 'Открытые инциденты', String(snapshot.openNotices), '']);
+        rows.push([
+            'summary',
+            'retention_average_ms',
+            'Средний срок хранения (мс)',
+            snapshot.retention.averageMs != null ? String(snapshot.retention.averageMs) : '',
+            '',
+        ]);
+        rows.push([
+            'summary',
+            'retention_policy_days',
+            'Политика хранения (дни)',
+            snapshot.retention.policyDays != null ? String(snapshot.retention.policyDays) : '',
+            '',
+        ]);
+
+        for (const room of snapshot.rooms) {
+            rows.push([
+                'rooms',
+                room.roomId,
+                room.roomName,
+                String(room.total),
+                `open:${room.open}${room.lastAlertTimestamp ? `;last:${room.lastAlertTimestamp}` : ''}`,
+            ]);
+        }
+
+        for (const [reason, count] of Object.entries(snapshot.flags)) {
+            rows.push(['reasons', reason, reason, String(count), '']);
+        }
+
+        for (const [action, count] of Object.entries(snapshot.actions)) {
+            rows.push(['actions', action, action, String(count), '']);
+        }
+
+        for (const bucket of SECURE_CLOUD_RETENTION_BUCKETS) {
+            const value = snapshot.retention.buckets[bucket.id] ?? 0;
+            rows.push(['retention', bucket.id, bucket.label, String(value), '']);
+        }
+
+        return rows
+            .map(row => row.map(value => escapeCsvCell(value ?? '')).join(','))
+            .join('\n');
+    }
+
+    return JSON.stringify(snapshot, null, 2);
 };
 
 const ensureStore = (client: MatrixClient): Map<string, SuspiciousEventNotice[]> => {

@@ -20,6 +20,18 @@ vi.mock('../../src/components/StickerGifPicker', () => ({
     default: () => null,
 }));
 
+vi.mock('../../src/components/LocationPickerDialog', () => ({
+    __esModule: true,
+    default: ({ isOpen, onConfirm, onClose }: any) => (
+        isOpen ? (
+            <div>
+                <button onClick={() => onConfirm({ latitude: 1, longitude: 2, zoom: 15 })}>confirm-location</button>
+                <button onClick={onClose}>close-location</button>
+            </div>
+        ) : null
+    ),
+}));
+
 const clientStub = {
     getUserId: () => '@user:example',
     getUser: () => ({ displayName: 'Tester', avatarUrl: null }),
@@ -32,6 +44,7 @@ const baseProps = {
     onSendAudio: vi.fn(),
     onSendSticker: vi.fn(),
     onSendGif: vi.fn(),
+    onSendLocation: vi.fn(),
     onOpenCreatePoll: vi.fn(),
     onSchedule: vi.fn(),
     isSending: false,
@@ -110,5 +123,13 @@ describe('MessageInput', () => {
         fireEvent.keyDown(textarea, { key: 'Escape', code: 'Escape' });
 
         expect(onCancelReply).toHaveBeenCalled();
+    });
+
+    it('sends location when confirmed from dialog', () => {
+        const onSendLocation = vi.fn();
+        render(<MessageInput {...baseProps} onSendLocation={onSendLocation} />);
+        fireEvent.click(screen.getByLabelText('Поделиться локацией'));
+        fireEvent.click(screen.getByText('confirm-location'));
+        expect(onSendLocation).toHaveBeenCalledWith(expect.objectContaining({ latitude: 1, longitude: 2 }));
     });
 });

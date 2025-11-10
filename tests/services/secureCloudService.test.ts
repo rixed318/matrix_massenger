@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { readFileSync } from 'fs';
 import { resolve as resolvePath } from 'path';
 import { EventEmitter } from 'events';
@@ -7,10 +7,14 @@ import type { MatrixClient, MatrixEvent, MatrixRoom } from '../../src/types';
 import {
     startSecureCloudSession,
     normaliseSecureCloudProfile,
+    exportSuspiciousEventsLog,
+    exportSecureCloudAggregatedStats,
+    type SecureCloudAggregatedStats,
     type SecureCloudProfile,
     type SuspiciousEventNotice,
     type SecureCloudDetector,
 } from '../../src/services/secureCloudService';
+import * as secureCloudServiceModule from '../../src/services/secureCloudService';
 
 class MockMatrixClient extends EventEmitter {
     public override on(eventName: string | symbol, listener: (...args: any[]) => void): this {
@@ -41,6 +45,10 @@ const createRoom = (roomId: string): MatrixRoom => {
     } as Partial<MatrixRoom>;
     return roomLike as MatrixRoom;
 };
+
+afterEach(() => {
+    vi.restoreAllMocks();
+});
 
 describe('startSecureCloudSession detector aggregation', () => {
     let client: MatrixClient;
@@ -210,3 +218,97 @@ describe('startSecureCloudSession detector aggregation', () => {
     });
 });
 
+
+describe('exportSuspiciousEventsLog filters', () => {
+    it('applies room and time range filters', () => {
+        const client = {} as MatrixClient;
+        const now = Date.now();
+        const notices = [
+            {
+                eventId: 'evt-1',
+                roomId: '!alpha:example.org',
+                roomName: 'Alpha',
+                sender: '@alice:example.org',
+                timestamp: now - 1_000,
+                riskScore: 0.9,
+                reasons: ['det:test'],
+                keywords: ['alert'],
+                summary: 'Alert 1',
+            },
+            {
+                eventId: 'evt-2',
+                roomId: '!beta:example.org',
+                roomName: 'Beta',
+                sender: '@bob:example.org',
+                timestamp: now - 60_000,
+                riskScore: 0.5,
+                reasons: ['det:test'],
+                keywords: [],
+                summary: 'Alert 2',
+            },
+        ] as any;
+
+        vi.spyOn(secureCloudServiceModule, 'getSuspiciousEvents').mockReturnValue(notices);
+
+        const filteredJson = exportSuspiciousEventsLog(client, {
+            format: 'json',
+            roomId: '!alpha:example.org',
+            fromTimestamp: now - 5_000,
+            toTimestamp: now - 100,
+        });
+        const parsed = JSON.parse(filteredJson) as Array<Record<string, unknown>>;
+        expect(parsed).toHaveLength(1);
+        expect(parsed[0]?.room_id).toBe('!alpha:example.org');
+
+        const filteredCsv = exportSuspiciousEventsLog(client, {
+            format: 'csv',
+            fromTimestamp: now - 120_000,
+            toTimestamp: now,
+        });
+        const csvLines = filteredCsv.trim().split('\n');
+        expect(csvLines[0]).toContain('event_id');
+        expect(csvLines).toHaveLength(3);
+    });
+});
+
+describe('exportSecureCloudAggregatedStats', () => {
+    it('serialises aggregated snapshot to csv and json', () => {
+        const client = {} as MatrixClient;
+        const snapshot: SecureCloudAggregatedStats = {
+            totalFlagged: 5,
+            openNotices: 2,
+            flags: { 'det:reason': 3 },
+            actions: { flagged: 5, acknowledged: 1 },
+            rooms: [
+                {
+                    roomId: '!alpha:example.org',
+                    roomName: 'Alpha',
+                    total: 4,
+                    open: 1,
+                    lastAlertTimestamp: 1700000000000,
+                },
+            ],
+            retention: {
+                count: 3,
+                averageMs: 1_200_000,
+                minMs: 600_000,
+                maxMs: 1_800_000,
+                buckets: { under_1h: 1, under_24h: 2 } as Record<string, number>,
+                policyDays: 7,
+            },
+            updatedAt: 1700000000000,
+        };
+
+        vi.spyOn(secureCloudServiceModule, 'getSecureCloudAggregatedStats').mockReturnValue(snapshot);
+
+        const csv = exportSecureCloudAggregatedStats(client, { format: 'csv' });
+        expect(csv).toContain('rooms');
+        expect(csv).toContain('Alpha');
+        expect(csv).toContain('open:1');
+
+        const json = exportSecureCloudAggregatedStats(client, { format: 'json' });
+        const parsed = JSON.parse(json) as SecureCloudAggregatedStats;
+        expect(parsed.rooms[0]?.roomId).toBe('!alpha:example.org');
+        expect(parsed.flags['det:reason']).toBe(3);
+    });
+});

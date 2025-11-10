@@ -1,7 +1,8 @@
-import { MatrixClient, MatrixEvent, MatrixRoom, MatrixUser, Sticker, Gif, RoomCreationOptions, VideoMessageMetadata } from '../types';
+import { MatrixClient, MatrixEvent, MatrixRoom, MatrixUser, Sticker, Gif, RoomCreationOptions, VideoMessageMetadata, LocationContentPayload } from '../types';
 import type { SecureCloudProfile } from './secureCloudService';
 import { normaliseSecureCloudProfile } from './secureCloudService';
 import GroupCallCoordinator, { GroupCallParticipant as CoordinatorParticipant } from './webrtc/groupCallCoordinator';
+import { buildGeoUri, buildStaticMapUrl, buildExternalNavigationUrl, MAP_ZOOM_DEFAULT, STATIC_MAP_HEIGHT, STATIC_MAP_WIDTH, sanitizeZoom } from '../utils/location';
 import {
     GROUP_CALL_CONTROL_EVENT_TYPE,
     GROUP_CALL_PARTICIPANTS_EVENT_TYPE,
@@ -3486,6 +3487,72 @@ export const sendFileMessage = async (client: MatrixClient, roomId: string, file
 
     try {
         return await sendDirect();
+    } catch (error) {
+        if (shouldQueueFromError(error)) {
+            return queueOutbox();
+        }
+        throw error;
+    }
+};
+
+export const sendLocationMessage = async (
+    client: MatrixClient,
+    roomId: string,
+    payload: LocationContentPayload,
+): Promise<{ event_id: string }> => {
+    if (!Number.isFinite(payload.latitude) || !Number.isFinite(payload.longitude)) {
+        throw new Error('Invalid coordinates for location message');
+    }
+
+    const latitude = payload.latitude;
+    const longitude = payload.longitude;
+    const zoom = sanitizeZoom(payload.zoom ?? MAP_ZOOM_DEFAULT);
+    const geoUri = buildGeoUri(latitude, longitude, payload.accuracy);
+    const description = (payload.description ?? '').trim() || `📍 ${latitude.toFixed(5)}, ${longitude.toFixed(5)}`;
+    const thumbnailUrl = buildStaticMapUrl(latitude, longitude, zoom, STATIC_MAP_WIDTH, STATIC_MAP_HEIGHT);
+    const externalUrl = buildExternalNavigationUrl(latitude, longitude, zoom);
+
+    const content: Record<string, any> = {
+        body: description,
+        msgtype: MsgType.Location,
+        geo_uri: geoUri,
+        'm.location': {
+            uri: geoUri,
+            description,
+        },
+        info: {
+            thumbnail_url: thumbnailUrl,
+            thumbnail_info: {
+                mimetype: 'image/png',
+                w: STATIC_MAP_WIDTH,
+                h: STATIC_MAP_HEIGHT,
+            },
+        },
+        external_url: externalUrl,
+        'com.matrix_messenger.map_zoom': zoom,
+    };
+
+    if (typeof payload.accuracy === 'number' && Number.isFinite(payload.accuracy) && payload.accuracy > 0) {
+        content['m.location'].accuracy = Math.round(payload.accuracy);
+    }
+
+    await applySelfDestructContent(client, roomId, content);
+
+    const sendDirect = async () => client.sendEvent(roomId, EventType.RoomMessage, content as any);
+    const queueOutbox = async () => {
+        const localId = await enqueueOutbox(roomId, EventType.RoomMessage, content);
+        clearNextMessageTTL(roomId);
+        return { event_id: localId };
+    };
+
+    if (isOffline()) {
+        return queueOutbox();
+    }
+
+    try {
+        const result = await sendDirect();
+        clearNextMessageTTL(roomId);
+        return result;
     } catch (error) {
         if (shouldQueueFromError(error)) {
             return queueOutbox();
