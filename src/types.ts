@@ -104,6 +104,24 @@ export interface Message {
         size?: number;
         duration?: number;
         'xyz.amorgan.is_gif'?: boolean;
+        thumbnail_url?: string;
+        thumbnail_file?: {
+            url?: string;
+            mimetype?: string;
+            size?: number;
+            v?: string;
+            key_ops?: string[];
+            kty?: string;
+            key?: string;
+            iv?: string;
+            hashes?: Record<string, string>;
+        };
+        thumbnail_info?: {
+            mimetype?: string;
+            size?: number;
+            w?: number;
+            h?: number;
+        };
     }
     'm.mentions'?: {
         user_ids?: string[];
@@ -131,6 +149,7 @@ export interface Message {
     expiresAt: number;
     ttlMs?: number;
   } | null;
+  localThumbnailUrl?: string;
 }
 
 export interface ActiveThread {
@@ -144,7 +163,7 @@ export interface Folder {
   roomIds: string[];
 }
 
-export type DraftAttachmentKind = 'file' | 'image' | 'audio' | 'voice' | 'sticker' | 'gif';
+export type DraftAttachmentKind = 'file' | 'image' | 'audio' | 'voice' | 'sticker' | 'gif' | 'video';
 
 export interface DraftAttachment {
     id: string;
@@ -162,6 +181,17 @@ export interface DraftAttachment {
     body?: string;
     msgtype?: string;
     kind: DraftAttachmentKind;
+}
+
+export interface VideoMessageMetadata {
+    durationMs: number;
+    width: number;
+    height: number;
+    mimeType: string;
+    thumbnail: Blob;
+    thumbnailMimeType: string;
+    thumbnailWidth: number;
+    thumbnailHeight: number;
 }
 
 export interface DraftContent {
