@@ -6,6 +6,7 @@ import type {
   RedactEventInput,
   AccountMetadata,
 } from '@matrix-messenger/sdk';
+import type { ConfigureAnimatedReactionsPayload } from '../types/animatedReactions';
 
 export const SANDBOX_MESSAGE = {
   INIT: 'sandbox:init',
@@ -36,6 +37,8 @@ export interface SandboxActionPayloads {
   sendTextMessage: SendTextMessageInput;
   sendEvent: SendEventInput;
   redactEvent: RedactEventInput;
+  configureAnimatedReactions: ConfigureAnimatedReactionsPayload;
+  getAnimatedReactionsPreference: Record<string, never>;
 }
 
 export type SandboxActionRequest = {

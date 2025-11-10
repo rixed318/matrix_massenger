@@ -19,7 +19,7 @@ import {
   type UniversalQuickFilterSummary,
   isUniversalQuickFilterId,
 } from '../utils/chatSelectors';
-import { SCHEDULED_MESSAGES_EVENT_TYPE, parseScheduledMessagesFromEvent } from './schedulerService';
+import { SCHEDULED_MESSAGES_EVENT_TYPE, parseScheduledMessagesFromEvent, getCachedScheduledMessages } from './schedulerService';
 import { getSuspiciousEvents } from './secureCloudService';
 
 const RESTORE_ERROR_MESSAGE = 'Не удалось восстановить сессии. Авторизуйтесь заново.';
@@ -131,7 +131,9 @@ export const createAccountStore = () => {
       const { accounts, activeQuickFilterId: currentFilter } = get();
       const descriptors: UnifiedAccountDescriptor[] = Object.values(accounts).map(runtime => {
         const scheduledEvent = runtime.client.getAccountData(SCHEDULED_MESSAGES_EVENT_TYPE);
-        const scheduledMessages = parseScheduledMessagesFromEvent(scheduledEvent ?? null);
+        const scheduledMessages = scheduledEvent
+          ? parseScheduledMessagesFromEvent(scheduledEvent).messages
+          : getCachedScheduledMessages(runtime.client);
         const scheduledCountByRoom = scheduledMessages.reduce<Record<string, number>>((acc, message) => {
           if (!message || typeof message.roomId !== 'string' || message.roomId.length === 0) {
             return acc;

@@ -21,6 +21,8 @@ interface SettingsModalProps {
     isPresenceHidden: boolean;
     onSetPresenceHidden: (hidden: boolean) => void;
     presenceRestricted: boolean;
+    animatedReactionsEnabled: boolean;
+    onSetAnimatedReactionsEnabled: (enabled: boolean) => void;
 }
 
 const ThemeSwatch: React.FC<{ name: string; colors: { primary: string; secondary: string; accent: string; }; isActive: boolean; onClick: () => void; }> = ({ name, colors, isActive, onClick }) => (
@@ -50,7 +52,7 @@ const BACKGROUNDS = [
 ];
 
 
-const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, onSave, client, notificationsEnabled, onSetNotificationsEnabled, chatBackground, onSetChatBackground, onResetChatBackground, sendKeyBehavior, onSetSendKeyBehavior, isPresenceHidden, onSetPresenceHidden, presenceRestricted }) => {
+const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, onSave, client, notificationsEnabled, onSetNotificationsEnabled, chatBackground, onSetChatBackground, onResetChatBackground, sendKeyBehavior, onSetSendKeyBehavior, isPresenceHidden, onSetPresenceHidden, presenceRestricted, animatedReactionsEnabled, onSetAnimatedReactionsEnabled }) => {
     const user = client.getUser(client.getUserId());
     const [displayName, setDisplayName] = useState(user?.displayName || '');
     const [avatarFile, setAvatarFile] = useState<File | null>(null);
@@ -219,6 +221,26 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, onSave, 
                             >
                                 Reset
                             </button>
+                        </div>
+                    </div>
+
+                    <div className="pt-6 border-t border-border-primary">
+                        <h3 className="text-lg font-semibold text-text-primary mb-3">Reactions</h3>
+                        <div className="flex items-center justify-between">
+                            <div>
+                                <p className="text-sm font-medium text-text-primary">Animated reactions</p>
+                                <p className="text-xs text-text-secondary">Play playful animations whenever reactions are added.</p>
+                            </div>
+                            <label className="relative inline-flex items-center cursor-pointer">
+                                <input
+                                    type="checkbox"
+                                    className="sr-only peer"
+                                    checked={animatedReactionsEnabled}
+                                    onChange={(event) => onSetAnimatedReactionsEnabled(event.target.checked)}
+                                />
+                                <div className="w-11 h-6 bg-bg-tertiary peer-focus:outline-none rounded-full peer peer-checked:bg-accent transition-colors"></div>
+                                <div className="absolute top-1 left-1 w-4 h-4 bg-white rounded-full transition-transform peer-checked:translate-x-5"></div>
+                            </label>
                         </div>
                     </div>
 
