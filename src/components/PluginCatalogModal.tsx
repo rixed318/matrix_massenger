@@ -135,6 +135,8 @@ const PluginCatalogModal: React.FC<PluginCatalogModalProps> = ({ isOpen, onClose
             const isEnabled = Boolean(state?.enabled);
             const permissions = manifest.permissions ?? [];
             const events = manifest.requiredEvents ?? [];
+            const surfaces = manifest.surfaces ?? [];
+            const capabilities = manifest.capabilities ?? [];
 
             return (
               <div key={manifest.id} className="border border-border-primary rounded-lg p-4 space-y-3">
@@ -155,17 +157,52 @@ const PluginCatalogModal: React.FC<PluginCatalogModalProps> = ({ isOpen, onClose
                 {manifest.description && (
                   <p className="text-sm text-text-secondary">{manifest.description}</p>
                 )}
-                <div className="text-xs text-text-secondary space-y-1">
-                  <div>
-                    <span className="font-semibold text-text-primary">Разрешения:</span>{' '}
-                    {permissions.length > 0
-                      ? permissions.map(perm => describePluginPermission(perm)).join(', ')
-                      : 'Нет специальных разрешений'}
+                <div className="grid gap-3 text-xs text-text-secondary sm:grid-cols-2">
+                  <div className="space-y-1">
+                    <div className="text-sm font-semibold text-text-primary">Разрешения</div>
+                    {permissions.length > 0 ? (
+                      <ul className="space-y-1">
+                        {permissions.map(permission => (
+                          <li key={permission} className="flex items-start gap-2">
+                            <span className="mt-1 h-1.5 w-1.5 rounded-full bg-accent" aria-hidden="true" />
+                            <span>{describePluginPermission(permission)}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    ) : (
+                      <div className="text-text-secondary/80">Нет специальных разрешений</div>
+                    )}
                   </div>
+                  <div className="space-y-1">
+                    <div className="text-sm font-semibold text-text-primary">Поверхности UI</div>
+                    {surfaces.length > 0 ? (
+                      <ul className="space-y-1">
+                        {surfaces.map(surface => (
+                          <li key={surface.id} className="rounded border border-border-secondary/60 bg-bg-secondary/40 p-2">
+                            <div className="font-medium text-text-secondary">{surface.label ?? surface.id}</div>
+                            <div className="text-text-secondary/70">Расположение: {surface.location}</div>
+                            {surface.description && (
+                              <div className="text-text-secondary/60">{surface.description}</div>
+                            )}
+                          </li>
+                        ))}
+                      </ul>
+                    ) : (
+                      <div className="text-text-secondary/80">Нет встроенных поверхностей.</div>
+                    )}
+                  </div>
+                </div>
+                <div className="text-xs text-text-secondary space-y-1">
                   <div>
                     <span className="font-semibold text-text-primary">События:</span>{' '}
                     {events.length > 0 ? events.join(', ') : 'Не подписывается автоматически'}
                   </div>
+                  {capabilities.length > 0 && (
+                    <div>
+                      <span className="font-semibold text-text-primary">Возможности:</span>{' '}
+                      {capabilities.join(', ')}
+                    </div>
+                  )}
                 </div>
                 <div className="flex flex-wrap items-center gap-2 pt-2">
                   {!isInstalled && (

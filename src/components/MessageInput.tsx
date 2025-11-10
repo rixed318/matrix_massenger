@@ -1006,6 +1006,12 @@ const MessageInput: React.FC<MessageInputProps> = ({
                     ))}
                 </div>
             )}
+            <PluginSurfaceHost
+                location="chat.composer"
+                roomId={roomId}
+                context={replyingTo ? { replyingToId: replyingTo.id } : undefined}
+                className="ml-1 mr-1 mb-3"
+            />
             {isVideoRecording && (
                 <div className="ml-1 mr-1 mb-2 flex items-center gap-4 bg-bg-secondary/70 border border-border-secondary rounded-lg p-3">
                     <div className="w-24 h-24 rounded-xl overflow-hidden bg-black/60 flex items-center justify-center">
