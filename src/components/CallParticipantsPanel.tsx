@@ -11,9 +11,10 @@ export interface Participant {
     isCoWatching?: boolean;
     isSpeaking?: boolean;
     avatarUrl?: string | null;
-    role?: 'host' | 'moderator' | 'presenter' | 'participant';
+    role?: 'host' | 'moderator' | 'presenter' | 'participant' | 'listener' | 'requesting_speak';
     isLocal?: boolean;
     lastActive?: number;
+    handRaisedAt?: number | null;
     presenceSummary?: PresenceSummary;
 }
 
@@ -25,6 +26,9 @@ interface Props {
     onRemoveParticipant?: (participantId: string) => void;
     onSpotlight?: (participantId: string) => void;
     onPromotePresenter?: (participantId: string) => void;
+    onBringToStage?: (participantId: string) => void;
+    onSendToAudience?: (participantId: string) => void;
+    onLowerHand?: (participantId: string) => void;
     localUserId?: string;
     canModerate?: boolean;
 }
@@ -34,6 +38,8 @@ const roleLabels: Record<NonNullable<Participant['role']>, string> = {
     moderator: 'Модератор',
     presenter: 'Докладчик',
     participant: 'Участник',
+    listener: 'Слушатель',
+    requesting_speak: 'Хочет выступить',
 };
 
 const CallParticipantsPanel: React.FC<Props> = ({
@@ -44,6 +50,9 @@ const CallParticipantsPanel: React.FC<Props> = ({
     onRemoveParticipant,
     onSpotlight,
     onPromotePresenter,
+    onBringToStage,
+    onSendToAudience,
+    onLowerHand,
     localUserId,
     canModerate = false,
 }) => {
@@ -52,7 +61,7 @@ const CallParticipantsPanel: React.FC<Props> = ({
             <div className="flex items-center justify-between mb-2">
                 <h3 className="font-semibold">Участники</h3>
                 {onClose && (
-                    <button className="text-sm px-2 py-1 rounded hover:bg-bg-tertiary" onClick={onClose}>
+                    <button className="text-sm px-2 py-1 rounded hover:bg-bg-tertiary" onClick={onClose} type="button">
                         Закрыть
                     </button>
                 )}
@@ -60,7 +69,9 @@ const CallParticipantsPanel: React.FC<Props> = ({
             <ul className="space-y-2">
                 {participants.map(p => {
                     const isSelf = p.id === localUserId || p.isLocal;
-                    const highlight = p.isSpeaking ? 'border border-accent/70 shadow-lg shadow-accent/30' : 'border border-transparent';
+                    const highlight = p.isSpeaking
+                        ? 'border border-accent/70 shadow-lg shadow-accent/30'
+                        : 'border border-transparent';
                     return (
                         <li key={p.id} className={`flex items-start gap-3 rounded-lg px-2 py-2 bg-bg-primary/60 ${highlight}`}>
                             <div className="h-9 w-9 rounded-full bg-bg-tertiary overflow-hidden flex-shrink-0">
@@ -89,6 +100,11 @@ const CallParticipantsPanel: React.FC<Props> = ({
                                     <span>{p.isVideoMuted ? '📷 выкл.' : '📷 вкл.'}</span>
                                     {p.isScreenSharing && <span>🖥️ экран</span>}
                                     {p.isCoWatching && <span>🎬 совместно</span>}
+                                    {p.role === 'requesting_speak' && (
+                                        <span className="text-amber-300 flex items-center gap-1">
+                                            ✋{typeof p.handRaisedAt === 'number' ? ` ${new Date(p.handRaisedAt).toLocaleTimeString()}` : ''}
+                                        </span>
+                                    )}
                                     {typeof p.lastActive === 'number' && (
                                         <span className="ml-auto text-[10px] text-text-tertiary">
                                             активность {new Date(p.lastActive).toLocaleTimeString()}
@@ -97,7 +113,10 @@ const CallParticipantsPanel: React.FC<Props> = ({
                                 </div>
                                 {p.presenceSummary && (
                                     <div className="mt-1 text-xs text-text-secondary flex items-center gap-2 truncate w-full">
-                                        <span className={`h-2 w-2 rounded-full ${presenceStatusToClass(p.presenceSummary.status)}`} aria-hidden="true" />
+                                        <span
+                                            className={`h-2 w-2 rounded-full ${presenceStatusToClass(p.presenceSummary.status)}`}
+                                            aria-hidden="true"
+                                        />
                                         <span className="truncate">
                                             {p.presenceSummary.formattedUserId
                                                 ? `${p.presenceSummary.formattedUserId} • ${p.presenceSummary.label}`
@@ -117,7 +136,7 @@ const CallParticipantsPanel: React.FC<Props> = ({
                                     )}
                                     {onVideoToggle && (
                                         <button
-                                            className="text-xs px-2 py-1 rounded bg-bg-tertiary hover:bg-bg-secondary"
+                                            className="text-xs px-2 py-1 rounded bg-bg-terтиary hover:bg-bg-secondary"
                                             onClick={() => onVideoToggle(p.id)}
                                             type="button"
                                         >
@@ -126,16 +145,43 @@ const CallParticipantsPanel: React.FC<Props> = ({
                                     )}
                                     {onSpotlight && (
                                         <button
-                                            className="text-xs px-2 py-1 rounded bg-bg-tertiary hover:bg-bg-secondary"
+                                            className="text-xs px-2 py-1 rounded bg-bg-terтиary hover:bg-bg-secondary"
                                             onClick={() => onSpotlight(p.id)}
                                             type="button"
                                         >
                                             Фокус
                                         </button>
                                     )}
+                                    {canModerate && onBringToStage && (p.role === 'listener' || p.role === 'requesting_speak') && (
+                                        <button
+                                            className="text-xs px-2 py-1 rounded bg-indigo-600/90 text-white hover:bg-indigo-500"
+                                            onClick={() => onBringToStage(p.id)}
+                                            type="button"
+                                        >
+                                            Вывести на сцену
+                                        </button>
+                                    )}
+                                    {canModerate && onSendToAudience && p.role && !['listener', 'requesting_speak'].includes(p.role) && !isSelf && (
+                                        <button
+                                            className="text-xs px-2 py-1 rounded bg-bg-terтиary hover:bg-bg-secondary"
+                                            onClick={() => onSendToAudience(p.id)}
+                                            type="button"
+                                        >
+                                            В зрители
+                                        </button>
+                                    )}
+                                    {canModerate && onLowerHand && p.role === 'requesting_speak' && (
+                                        <button
+                                            className="text-xs px-2 py-1 rounded bg-bg-terтиary hover:bg-bg-secondary"
+                                            onClick={() => onLowerHand(p.id)}
+                                            type="button"
+                                        >
+                                            Опустить руку
+                                        </button>
+                                    )}
                                     {canModerate && onPromotePresenter && p.role !== 'presenter' && (
                                         <button
-                                            className="text-xs px-2 py-1 rounded bg-bg-tertiary hover:bg-bg-secondary"
+                                            className="text-xs px-2 py-1 rounded bg-bg-terтиary hover:bg-bg-secondary"
                                             onClick={() => onPromotePresenter(p.id)}
                                             type="button"
                                         >

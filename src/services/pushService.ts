@@ -39,6 +39,18 @@ const defaultPushGatewayUrl = resolveStringEnv('VITE_MATRIX_PUSH_GATEWAY')
   ?? resolveStringEnv('VITE_MATRIX_PUSH_GATEWAY_URL');
 const defaultProfileTag = resolveStringEnv('VITE_MATRIX_PUSH_PROFILE_TAG');
 
+const postToServiceWorker = (type: string, payload: Record<string, unknown>) => {
+  if (!isBrowser) {
+    return;
+  }
+  try {
+    const controller = navigator.serviceWorker?.controller;
+    controller?.postMessage({ type, payload });
+  } catch (error) {
+    console.warn('Failed to post message to service worker', error);
+  }
+};
+
 export interface StoredPushSubscription {
   endpoint: string;
   auth: string;
@@ -158,4 +170,53 @@ export const registerMatrixWebPush = async (
   }
 
   return serialized;
+};
+
+export interface StageNotificationPayload {
+  roomId: string;
+  sessionId: string;
+  userId: string;
+  displayName?: string;
+  inviterId?: string;
+  reason: 'hand_raise' | 'invite' | 'auto_demote';
+}
+
+export const notifyStageInvite = (payload: StageNotificationPayload) => {
+  postToServiceWorker('GROUP_CALL_STAGE_INVITE', payload);
+};
+
+export const notifyStageRequest = (payload: StageNotificationPayload) => {
+  postToServiceWorker('GROUP_CALL_STAGE_REQUEST', payload);
+};
+
+export const notifyStageAutoDemote = (payload: StageNotificationPayload) => {
+  postToServiceWorker('GROUP_CALL_STAGE_AUTO_DEMOTE', payload);
+};
+
+export interface StageModerationSnapshot {
+  role?: string | null;
+  isMuted?: boolean;
+  isVideoMuted?: boolean;
+  lastActive?: number | null;
+}
+
+export const shouldAutoDemoteParticipant = (
+  participant: StageModerationSnapshot,
+  now: number = Date.now(),
+): boolean => {
+  const role = participant.role ?? 'participant';
+  if (role === 'host' || role === 'moderator') {
+    return false;
+  }
+  if (role !== 'participant' && role !== 'presenter') {
+    return false;
+  }
+  const muted = participant.isMuted ?? false;
+  const videoMuted = participant.isVideoMuted ?? true;
+  if (!muted && !videoMuted) {
+    return false;
+  }
+  const lastActive = participant.lastActive ?? now;
+  const idleMs = now - lastActive;
+  return idleMs > 90_000;
 };

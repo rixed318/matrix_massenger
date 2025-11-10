@@ -73,7 +73,7 @@ import {
     updateLocalCallDeviceState,
 } from '../services/matrixService';
 import GroupCallCoordinator from '../services/webrtc/groupCallCoordinator';
-import { GROUP_CALL_STATE_EVENT_TYPE } from '../services/webrtc/groupCallConstants';
+import { GROUP_CALL_STATE_EVENT_TYPE, GroupCallStageState } from '../services/webrtc/groupCallConstants';
 import type { CallLayout } from './CallView';
 import { useAccountStore } from '../services/accountManager';
 import { getAppLockSnapshot, unlockWithPin, unlockWithBiometric, isSessionUnlocked, ensureAppLockConsistency } from '../services/appLockService';
@@ -92,6 +92,7 @@ import {
     setAnimatedReactionsEnabled as persistAnimatedReactionsEnabled,
     onAnimatedReactionsPreferenceChange,
 } from '../services/animatedReactions';
+import { notifyStageInvite, notifyStageRequest, notifyStageAutoDemote, shouldAutoDemoteParticipant } from '../services/pushService';
 
 interface ChatPageProps {
     client?: MatrixClient;
@@ -856,6 +857,7 @@ const ChatSidePanels: React.FC<ChatSidePanelsProps> = ({
                     client={groupCall.client}
                     onHangup={groupCall.onHangup}
                     participants={groupCall.participantViews}
+                    stageState={groupCall.stageState}
                     layout={groupCall.activeGroupCall.layout}
                     onLayoutChange={groupCall.onLayoutChange}
                     showParticipantsPanel={groupCall.showParticipantsPanel}
@@ -874,6 +876,10 @@ const ChatSidePanels: React.FC<ChatSidePanelsProps> = ({
                     onRemoveParticipant={groupCall.onRemoveParticipant}
                     onPromotePresenter={groupCall.onPromotePresenter}
                     onSpotlightParticipant={groupCall.onSpotlightParticipant}
+                    onRaiseHand={groupCall.onRaiseHand}
+                    onLowerHand={groupCall.onLowerHand}
+                    onBringParticipantToStage={groupCall.onBringToStage}
+                    onSendParticipantToAudience={groupCall.onSendToAudience}
                     localUserId={groupCall.localUserId}
                     canModerateParticipants={groupCall.canModerateParticipants}
                 />
@@ -1014,9 +1020,12 @@ const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, s
     } | null>(null);
     const [groupCallCoordinator, setGroupCallCoordinator] = useState<GroupCallCoordinator | null>(null);
     const [groupParticipants, setGroupParticipants] = useState<GroupCallParticipant[]>([]);
+    const [stageState, setStageState] = useState<GroupCallStageState | null>(null);
     const [showParticipantsPanel, setShowParticipantsPanel] = useState(false);
     const [spotlightParticipantId, setSpotlightParticipantId] = useState<string | null>(null);
     const previousParticipantIdsRef = useRef<Set<string>>(new Set());
+    const previousHandRaiseRef = useRef<Set<string>>(new Set());
+    const handRaiseQueueRef = useRef<string[]>([]);
     const [groupCallPermissionError, setGroupCallPermissionError] = useState<string | null>(null);
     const stories = useStoryStore<Story[]>(state => state.stories);
     const storiesHydrated = useStoryStore(state => state.isHydrated);
@@ -1902,6 +1911,10 @@ const handleStartGroupCall = useCallback(async () => {
         }, { constraints: { audio: true, video: true } });
         setGroupCallCoordinator(coordinator);
         setGroupParticipants(coordinator.getParticipants());
+        const stageSnapshot = coordinator.getStageState();
+        setStageState(stageSnapshot);
+        handRaiseQueueRef.current = stageSnapshot.handRaiseQueue;
+        previousHandRaiseRef.current = new Set(stageSnapshot.handRaiseQueue);
         const localParticipant = coordinator.getParticipants().find(p => p.userId === localUserId);
         setActiveGroupCall({
             roomId: selectedRoomId,
@@ -1950,8 +1963,11 @@ const handleCloseGroupCall = useCallback(() => {
     setActiveGroupCall(null);
     setGroupCallCoordinator(null);
     setGroupParticipants([]);
+    setStageState(null);
     setShowParticipantsPanel(false);
     previousParticipantIdsRef.current.clear();
+    previousHandRaiseRef.current = new Set();
+    handRaiseQueueRef.current = [];
     setSpotlightParticipantId(null);
 }, [activeGroupCall]);
 
@@ -1983,6 +1999,40 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
     setSpotlightParticipantId(participantId);
     setActiveGroupCall(prev => (prev ? { ...prev, layout: 'spotlight' } : prev));
 }, []);
+
+const handleRaiseHand = useCallback(() => {
+    groupCallCoordinator?.raiseHand();
+}, [groupCallCoordinator]);
+
+const handleLowerHand = useCallback((participantId?: string) => {
+    if (!groupCallCoordinator) return;
+    if (participantId) {
+        groupCallCoordinator.lowerHand(participantId);
+    } else {
+        groupCallCoordinator.lowerHand();
+    }
+}, [groupCallCoordinator]);
+
+const handleBringParticipantToStage = useCallback((participantId: string) => {
+    if (!groupCallCoordinator) return;
+    groupCallCoordinator.bringParticipantToStage(participantId);
+    if (activeGroupCall) {
+        const participant = groupParticipants.find(p => p.userId === participantId);
+        notifyStageInvite({
+            roomId: activeGroupCall.roomId,
+            sessionId: activeGroupCall.sessionId,
+            userId: participantId,
+            displayName: participant?.displayName ?? participantId,
+            inviterId: client.getUserId() ?? undefined,
+            reason: 'invite',
+        });
+    }
+}, [groupCallCoordinator, activeGroupCall, groupParticipants, client]);
+
+const handleSendParticipantToAudience = useCallback((participantId: string) => {
+    if (!groupCallCoordinator) return;
+    groupCallCoordinator.moveParticipantToAudience(participantId);
+}, [groupCallCoordinator]);
 // ===== end group call handlers =====
 
     useEffect(() => {
@@ -1999,6 +2049,8 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
                     isScreensharing: Boolean(localParticipant?.isScreensharing),
                 }
                 : prev);
+            setStageState(groupCallCoordinator.getStageState());
+            handRaiseQueueRef.current = groupCallCoordinator.getHandRaiseQueue();
             if (notificationsEnabled) {
                 const previous = previousParticipantIdsRef.current;
                 const next = new Set<string>();
@@ -2019,12 +2071,99 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
         const offCoWatch = groupCallCoordinator.on('co-watch-changed', state => {
             setActiveGroupCall(prev => (prev && prev.sessionId === groupCallCoordinator.sessionId) ? { ...prev, coWatchActive: Boolean(state?.active) } : prev);
         });
+        const offStage = groupCallCoordinator.on('stage-changed', stage => {
+            setStageState(stage);
+            handRaiseQueueRef.current = stage.handRaiseQueue;
+            const localId = client.getUserId();
+            const previousHands = previousHandRaiseRef.current;
+            const nextHands = new Set(stage.handRaiseQueue);
+            if (notificationsEnabled && canStartGroupCall) {
+                stage.handRaiseQueue.forEach(userId => {
+                    if (userId === localId || previousHands.has(userId)) {
+                        return;
+                    }
+                    const participant = groupCallCoordinator.getParticipants().find(p => p.userId === userId);
+                    const displayName = participant?.displayName ?? userId;
+                    const roomId = activeGroupCall?.roomId ?? selectedRoomId ?? undefined;
+                    if (roomId) {
+                        sendNotification('Запрос на выступление', `${displayName} поднял руку`, { roomId });
+                    }
+                    const targetRoomId = activeGroupCall?.roomId ?? selectedRoomId ?? null;
+                    if (targetRoomId) {
+                        notifyStageRequest({
+                            roomId: targetRoomId,
+                            sessionId: activeGroupCall?.sessionId ?? groupCallCoordinator.sessionId,
+                            userId,
+                            displayName,
+                            inviterId: localId ?? undefined,
+                            reason: 'hand_raise',
+                        });
+                    }
+                });
+            }
+            previousHandRaiseRef.current = nextHands;
+        });
+        setStageState(groupCallCoordinator.getStageState());
+        handRaiseQueueRef.current = groupCallCoordinator.getHandRaiseQueue();
+        previousHandRaiseRef.current = new Set(groupCallCoordinator.getHandRaiseQueue());
         return () => {
             offParticipants?.();
             offScreenshare?.();
             offCoWatch?.();
+            offStage?.();
         };
-    }, [groupCallCoordinator, client, notificationsEnabled, activeGroupCall?.roomId, activeGroupCall?.sessionId]);
+    }, [
+        groupCallCoordinator,
+        client,
+        notificationsEnabled,
+        activeGroupCall?.roomId,
+        activeGroupCall?.sessionId,
+        canStartGroupCall,
+        selectedRoomId,
+    ]);
+
+    useEffect(() => {
+        if (!groupCallCoordinator || !activeGroupCall || !canStartGroupCall) return;
+        let disposed = false;
+        const interval = window.setInterval(() => {
+            if (disposed) return;
+            const now = Date.now();
+            const snapshot = groupCallCoordinator.getParticipants();
+            snapshot.forEach(participant => {
+                if (participant.userId === client.getUserId()) return;
+                if (
+                    shouldAutoDemoteParticipant(
+                        {
+                            role: participant.role,
+                            isMuted: participant.isMuted,
+                            isVideoMuted: participant.isVideoMuted,
+                            lastActive: participant.lastActive,
+                        },
+                        now,
+                    )
+                ) {
+                    groupCallCoordinator.moveParticipantToAudience(participant.userId);
+                    notifyStageAutoDemote({
+                        roomId: activeGroupCall.roomId,
+                        sessionId: activeGroupCall.sessionId,
+                        userId: participant.userId,
+                        displayName: participant.displayName ?? participant.userId,
+                        inviterId: client.getUserId() ?? undefined,
+                        reason: 'auto_demote',
+                    });
+                    if (notificationsEnabled) {
+                        sendNotification('Участник переведён в зрители', participant.displayName ?? participant.userId, {
+                            roomId: activeGroupCall.roomId,
+                        });
+                    }
+                }
+            });
+        }, 45_000);
+        return () => {
+            disposed = true;
+            window.clearInterval(interval);
+        };
+    }, [groupCallCoordinator, activeGroupCall, client, canStartGroupCall, notificationsEnabled]);
 
     useEffect(() => {
         if (!activeGroupCall) return;
@@ -2062,6 +2201,7 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
                 role: participant.role ?? 'participant',
                 isLocal: participant.userId === (client.getUserId() || ''),
                 lastActive: participant.lastActive,
+                handRaisedAt: participant.handRaisedAt ?? undefined,
                 stream: participant.stream ?? null,
                 screenshareStream: participant.screenshareStream ?? null,
                 dominant: Boolean(spotlightParticipantId && participant.userId === spotlightParticipantId),
@@ -3927,6 +4067,7 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
         groupCall: {
             activeGroupCall,
             participantViews,
+            stageState,
             showParticipantsPanel,
             onToggleParticipantsPanel: () => setShowParticipantsPanel(prev => !prev),
             onLayoutChange: handleLayoutChange,
@@ -3939,6 +4080,10 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
             onRemoveParticipant: handleRemoveParticipant,
             onPromotePresenter: handlePromotePresenter,
             onSpotlightParticipant: handleSpotlightParticipant,
+            onRaiseHand: handleRaiseHand,
+            onLowerHand: handleLowerHand,
+            onBringToStage: handleBringParticipantToStage,
+            onSendToAudience: handleSendParticipantToAudience,
             localUserId: client.getUserId() || undefined,
             canModerateParticipants: canStartGroupCall,
             client,

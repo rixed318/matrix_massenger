@@ -4,6 +4,7 @@ import Avatar from './Avatar';
 import { mxcToHttp } from '@matrix-messenger/core';
 import { CallEvent } from 'matrix-js-sdk';
 import CallParticipantsPanel, { Participant as CallParticipant } from './CallParticipantsPanel';
+import { GroupCallStageState } from '../services/webrtc/groupCallConstants';
 
 export type CallLayout = 'spotlight' | 'grid';
 
@@ -18,6 +19,7 @@ interface CallViewProps {
     onHangup: () => void;
     client: MatrixClient;
     participants?: ExtendedParticipant[];
+    stageState?: GroupCallStageState | null;
     layout?: CallLayout;
     onLayoutChange?: (layout: CallLayout) => void;
     showParticipantsPanel?: boolean;
@@ -36,6 +38,10 @@ interface CallViewProps {
     onRemoveParticipant?: (participantId: string) => void;
     onPromotePresenter?: (participantId: string) => void;
     onSpotlightParticipant?: (participantId: string) => void;
+    onRaiseHand?: () => void;
+    onLowerHand?: (participantId?: string) => void;
+    onBringParticipantToStage?: (participantId: string) => void;
+    onSendParticipantToAudience?: (participantId: string) => void;
     localUserId?: string;
     canModerateParticipants?: boolean;
     callSession?: CallSessionState | null;
@@ -113,6 +119,7 @@ const CallView: React.FC<CallViewProps> = ({
     onHangup,
     client,
     participants,
+    stageState,
     layout = 'grid',
     onLayoutChange,
     showParticipantsPanel,
@@ -131,6 +138,10 @@ const CallView: React.FC<CallViewProps> = ({
     onRemoveParticipant,
     onPromotePresenter,
     onSpotlightParticipant,
+    onRaiseHand,
+    onLowerHand,
+    onBringParticipantToStage,
+    onSendParticipantToAudience,
     localUserId,
     canModerateParticipants = false,
     callSession,
@@ -146,6 +157,15 @@ const CallView: React.FC<CallViewProps> = ({
     const remoteVideoRef = useRef<HTMLVideoElement>(null);
 
     const isGroupCall = Boolean(participants && participants.length > 0);
+    const stageSpeakers = useMemo(
+        () => (participants ?? []).filter(p => p.role !== 'listener' && p.role !== 'requesting_speak'),
+        [participants],
+    );
+    const listenerParticipants = useMemo(
+        () => (participants ?? []).filter(p => p.role === 'listener' || p.role === 'requesting_speak'),
+        [participants],
+    );
+    const queueOrder = stageState?.handRaiseQueue ?? [];
 
     useEffect(() => {
         if (!call || isGroupCall) return;
@@ -280,8 +300,8 @@ const CallView: React.FC<CallViewProps> = ({
     };
 
     const participantTiles = useMemo<VideoTileInfo[]>(() => {
-        if (!participants || participants.length === 0) return [];
-        return participants.flatMap(participant => {
+        if (stageSpeakers.length === 0) return [];
+        return stageSpeakers.flatMap(participant => {
             const tiles: VideoTileInfo[] = [
                 {
                     id: participant.id,
@@ -309,9 +329,9 @@ const CallView: React.FC<CallViewProps> = ({
             }
             return tiles;
         });
-    }, [participants]);
+    }, [stageSpeakers]);
 
-    const dominantId = useMemo(() => participants?.find(p => p.dominant)?.id, [participants]);
+    const dominantId = useMemo(() => stageSpeakers.find(p => p.dominant)?.id, [stageSpeakers]);
     const spotlightTile = layout === 'spotlight'
         ? participantTiles.find(tile => tile.baseId === dominantId) ?? participantTiles[0] ?? null
         : null;
@@ -320,6 +340,13 @@ const CallView: React.FC<CallViewProps> = ({
         : participantTiles;
 
     if (isGroupCall) {
+        const localParticipant = participants?.find(p => p.isLocal);
+        const localParticipantId = localParticipant?.id ?? localUserId ?? '';
+        const localRole = localParticipant?.role ?? 'participant';
+        const canRaise = Boolean(onRaiseHand) && localRole === 'listener';
+        const canLower = Boolean(onLowerHand) && localRole === 'requesting_speak';
+        const canStepDown = Boolean(onSendParticipantToAudience) && localParticipantId && !['listener', 'requesting_speak'].includes(localRole ?? '');
+        const getParticipantByTile = (tile: VideoTileInfo) => stageSpeakers.find(p => p.id === tile.baseId);
         return (
             <div className="fixed inset-0 bg-gray-900/95 z-40 flex flex-col">
                 <div className="absolute top-6 left-6 flex items-center gap-3">
@@ -371,17 +398,133 @@ const CallView: React.FC<CallViewProps> = ({
                 <div className="flex-1 overflow-y-auto pt-20 pb-36">
                     {layout === 'spotlight' && spotlightTile && (
                         <div className="max-w-5xl mx-auto px-6">
-                            <VideoTile tile={spotlightTile} localMuted={computedMuted} />
+                            <div className="relative">
+                                <VideoTile tile={spotlightTile} localMuted={computedMuted} />
+                                {canModerateParticipants && onSendParticipantToAudience && (() => {
+                                    const spotlightParticipant = getParticipantByTile(spotlightTile);
+                                    if (!spotlightParticipant || spotlightParticipant.isLocal || !spotlightParticipant.role || ['host', 'moderator'].includes(spotlightParticipant.role)) {
+                                        return null;
+                                    }
+                                    return (
+                                        <button
+                                            type="button"
+                                            className="absolute top-3 right-3 rounded-full bg-black/60 hover:bg-black/80 px-3 py-1 text-xs text-white"
+                                            onClick={() => onSendParticipantToAudience(spotlightParticipant.id)}
+                                        >
+                                            В зрители
+                                        </button>
+                                    );
+                                })()}
+                            </div>
                         </div>
                     )}
-                    <div className={`mt-6 px-6 ${layout === 'grid' ? 'grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4' : 'grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4'}`}>
-                        {secondaryTiles.map(tile => (
-                            <VideoTile key={tile.id} tile={tile} localMuted={computedMuted} compact={layout === 'spotlight'} />
-                        ))}
+                    <div className="mt-6 px-6 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                        {secondaryTiles.map(tile => {
+                            const tileParticipant = getParticipantByTile(tile);
+                            const canDemote =
+                                canModerateParticipants &&
+                                onSendParticipantToAudience &&
+                                tileParticipant &&
+                                !tileParticipant.isLocal &&
+                                tileParticipant.role &&
+                                !['host', 'moderator'].includes(tileParticipant.role);
+                            return (
+                                <div key={tile.id} className="relative">
+                                    <VideoTile tile={tile} localMuted={computedMuted} compact={layout === 'spotlight'} />
+                                    {canDemote && (
+                                        <button
+                                            type="button"
+                                            className="absolute top-3 right-3 rounded-full bg-black/60 hover:bg-black/80 px-3 py-1 text-xs text-white"
+                                            onClick={() => onSendParticipantToAudience(tileParticipant.id)}
+                                        >
+                                            В зрители
+                                        </button>
+                                    )}
+                                </div>
+                            );
+                        })}
                     </div>
+
+                    {listenerParticipants.length > 0 && (
+                        <div className="mt-10 px-6">
+                            <div className="flex items-center justify-between mb-2">
+                                <h3 className="text-xs uppercase tracking-wide text-text-secondary">Зрители</h3>
+                                {queueOrder.length > 0 && (
+                                    <span className="text-xs text-text-secondary">Очередь рук: {queueOrder.length}</span>
+                                )}
+                            </div>
+                            <div className="flex gap-3 overflow-x-auto pb-4">
+                                {listenerParticipants.map(listener => {
+                                    const queuePos = queueOrder.indexOf(listener.id);
+                                    return (
+                                        <div
+                                            key={listener.id}
+                                            className={`min-w-[180px] rounded-xl border ${listener.role === 'requesting_speak' ? 'border-amber-400/80 bg-amber-500/10' : 'border-transparent bg-bg-secondary/70'} p-3`}
+                                        >
+                                            <div className="flex items-center justify-between">
+                                                <span className="text-sm font-medium truncate">{listener.name}</span>
+                                                <span>{listener.role === 'requesting_speak' ? `✋${queuePos >= 0 ? ` #${queuePos + 1}` : ''}` : '👀'}</span>
+                                            </div>
+                                            <div className="mt-1 text-[11px] text-text-secondary flex items-center gap-2">
+                                                <span>{listener.isMuted ? '🔇' : '🎙️'}</span>
+                                                <span>{listener.isVideoMuted ? '📷 выкл.' : '📷 вкл.'}</span>
+                                            </div>
+                                            <div className="mt-3 flex flex-wrap gap-2">
+                                                {listener.role === 'requesting_speak' && onLowerHand && (
+                                                    <button
+                                                        type="button"
+                                                        className="text-xs px-2 py-1 rounded bg-bg-tertiary hover:bg-bg-secondary"
+                                                        onClick={() => onLowerHand(listener.id)}
+                                                    >
+                                                        Опустить руку
+                                                    </button>
+                                                )}
+                                                {canModerateParticipants && onBringParticipantToStage && (
+                                                    <button
+                                                        type="button"
+                                                        className="text-xs px-2 py-1 rounded bg-indigo-600/90 text-white hover:bg-indigo-500"
+                                                        onClick={() => onBringParticipantToStage(listener.id)}
+                                                    >
+                                                        Вывести на сцену
+                                                    </button>
+                                                )}
+                                            </div>
+                                        </div>
+                                    );
+                                })}
+                            </div>
+                        </div>
+                    )}
                 </div>
 
-                <div className="absolute bottom-12 inset-x-0 flex items-center justify-center gap-6">
+                <div className="absolute bottom-12 inset-x-0 flex flex-wrap items-center justify-center gap-4">
+                    {canRaise && (
+                        <button
+                            onClick={onRaiseHand}
+                            className="px-4 py-2 rounded-full bg-amber-500/90 hover:bg-amber-500 text-white text-sm"
+                            type="button"
+                        >
+                            ✋ Поднять руку
+                        </button>
+                    )}
+                    {canLower && (
+                        <button
+                            onClick={() => onLowerHand?.()}
+                            className="px-4 py-2 rounded-full bg-amber-600/90 hover:bg-amber-600 text-white text-sm"
+                            type="button"
+                        >
+                            ✋ Опустить руку
+                        </button>
+                    )}
+                    {canStepDown && (
+                        <button
+                            onClick={() => localParticipantId && onSendParticipantToAudience?.(localParticipantId)}
+                            className="px-4 py-2 rounded-full bg-bg-secondary hover:bg-bg-tertiary text-text-primary text-sm"
+                            type="button"
+                        >
+                            ⬇️ В зрители
+                        </button>
+                    )}
                     <button
                         onClick={toggleMute}
                         className={`h-14 w-14 rounded-full flex items-center justify-center transition-colors ${computedMuted ? 'bg-indigo-600 text-white' : 'bg-gray-700 hover:bg-gray-600 text-white'}`}
@@ -417,6 +560,9 @@ const CallView: React.FC<CallViewProps> = ({
                         onRemoveParticipant={onRemoveParticipant}
                         onPromotePresenter={onPromotePresenter}
                         onSpotlight={onSpotlightParticipant}
+                        onBringToStage={onBringParticipantToStage}
+                        onSendToAudience={onSendParticipantToAudience}
+                        onLowerHand={id => onLowerHand?.(id)}
                         localUserId={localUserId}
                         canModerate={canModerateParticipants}
                     />

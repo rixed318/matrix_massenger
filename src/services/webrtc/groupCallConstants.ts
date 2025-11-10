@@ -3,7 +3,13 @@ export const GROUP_CALL_PARTICIPANTS_EVENT_TYPE = 'org.matrix.call.participants'
 export const GROUP_CALL_SIGNAL_EVENT_TYPE = 'org.matrix.call.signal';
 export const GROUP_CALL_CONTROL_EVENT_TYPE = 'org.matrix.call.control';
 
-export type GroupCallRole = 'host' | 'moderator' | 'presenter' | 'participant';
+export type GroupCallRole =
+    | 'host'
+    | 'moderator'
+    | 'presenter'
+    | 'participant'
+    | 'listener'
+    | 'requesting_speak';
 
 export interface SerializedGroupCallParticipant {
     userId: string;
@@ -17,6 +23,14 @@ export interface SerializedGroupCallParticipant {
     sessionId?: string;
     streamId?: string;
     lastActive?: number;
+    handRaisedAt?: number | null;
+}
+
+export interface GroupCallStageState {
+    speakers: string[];
+    listeners: string[];
+    handRaiseQueue: string[];
+    updatedAt: number;
 }
 
 export interface GroupCallStateEventContent {
@@ -33,6 +47,7 @@ export interface GroupCallStateEventContent {
         startedAt?: number;
     } | null;
     participants: SerializedGroupCallParticipant[];
+    stage?: GroupCallStageState | null;
 }
 
 export interface GroupCallParticipantsContent {
@@ -42,6 +57,13 @@ export interface GroupCallParticipantsContent {
 }
 
 export interface GroupCallControlMessage {
-    type: 'cowatch-toggle' | 'participants-sync' | 'screenshare-toggle';
+    type:
+        | 'cowatch-toggle'
+        | 'participants-sync'
+        | 'screenshare-toggle'
+        | 'stage-update'
+        | 'stage-invite'
+        | 'hand-raise'
+        | 'hand-lower';
     payload?: any;
 }

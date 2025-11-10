@@ -201,6 +201,11 @@ export class PluginHost {
                 getClient: accountId => this.accounts.get(accountId)?.client,
             },
             scheduler,
+            ui: {
+                render: () => {
+                    throw new Error('UI surfaces are not supported outside of sandboxed plugins');
+                },
+            },
         };
     }
     ensureAccount(accountId) {
