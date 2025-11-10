@@ -17,3 +17,4 @@ export * from '../../../src/hooks/useChats';
 export * from '../../../src/hooks/useRoomTimeline';
 export * from '../../../src/services/matrixRuntime';
 export * from '../../../src/services/matrixService';
+export * from '../../../src/utils/location';
