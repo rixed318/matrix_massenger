@@ -1,11 +1,18 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ActivityIndicator, SafeAreaView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { RouteProp, useNavigation } from '@react-navigation/native';
 import { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { mediaDevices, MediaStream, RTCView } from 'react-native-webrtc';
 import { MatrixSessionWithAccount } from '../context/MatrixSessionContext';
 import { RootStackParamList } from '../types/navigation';
-import { useNativeCallBridge } from '../hooks/useNativeCallBridge';
+import {
+  buildCallSessionSnapshot,
+  CallSessionState,
+  handoverCallToCurrentDevice,
+  setCallSessionForClient,
+  subscribeCallState,
+  updateLocalCallDeviceState,
+} from '@matrix-messenger/core';
 
 interface CallScreenProps {
   session: MatrixSessionWithAccount;
@@ -18,6 +25,21 @@ export const CallScreen: React.FC<CallScreenProps> = ({ session, route }) => {
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
   const [callState, setCallState] = useState<string>('connecting');
   const [error, setError] = useState<string | null>(null);
+  const [callSession, setCallSession] = useState<CallSessionState | null>(null);
+  const [handoverInFlight, setHandoverInFlight] = useState(false);
+  const deviceId = useMemo(() => session.client.getDeviceId?.() ?? null, [session.client]);
+  const accountKey = useMemo(
+    () => `${session.account.homeserver_url.replace(/\/+$/, '')}/${session.account.user_id}`,
+    [session.account.homeserver_url, session.account.user_id],
+  );
+  const matrixCallRef = useRef<any>(null);
+
+  useEffect(() => {
+    const unsubscribe = subscribeCallState(accountKey, setCallSession);
+    return () => {
+      try { unsubscribe?.(); } catch (err) { console.warn('call session unsubscribe failed', err); }
+    };
+  }, [accountKey]);
 
   useNativeCallBridge(roomId, callState);
 
@@ -48,10 +70,14 @@ export const CallScreen: React.FC<CallScreenProps> = ({ session, route }) => {
           setError('Не удалось создать звонок');
           return;
         }
+        matrixCallRef.current = matrixCall;
         matrixCall.on?.('state', (state: string) => {
           setCallState(state);
-          if (state === 'ended') {
+          if (state === 'connected') {
+            setCallSessionForClient(session.client, buildCallSessionSnapshot(session.client, matrixCall, 'connected'));
+          } else if (state === 'ended') {
             navigation.goBack();
+            setCallSessionForClient(session.client, null);
           }
         });
         matrixCall.on?.('error', (callError: Error) => {
@@ -59,9 +85,11 @@ export const CallScreen: React.FC<CallScreenProps> = ({ session, route }) => {
           setError(callError.message);
         });
         matrixCall.placeVideoCall(stream);
+        setCallSessionForClient(session.client, buildCallSessionSnapshot(session.client, matrixCall, 'connecting'));
       } catch (err) {
         console.warn('start call failed', err);
         setError(err instanceof Error ? err.message : 'Не удалось начать звонок');
+        setCallSessionForClient(session.client, null);
       }
     };
 
@@ -72,6 +100,8 @@ export const CallScreen: React.FC<CallScreenProps> = ({ session, route }) => {
       if (matrixCall) {
         try { matrixCall.hangup?.(); } catch (err) { console.warn('hangup failed', err); }
       }
+      matrixCallRef.current = null;
+      setCallSessionForClient(session.client, null);
       const stream = activeStream ?? localStream;
       if (stream) {
         stream.getTracks().forEach(track => track.stop());
@@ -83,11 +113,121 @@ export const CallScreen: React.FC<CallScreenProps> = ({ session, route }) => {
     navigation.goBack();
   };
 
+  useEffect(() => {
+    const matrixCall = matrixCallRef.current;
+    if (!matrixCall || !callSession || !deviceId) {
+      return;
+    }
+    const localDevice = callSession.devices.find(device => device.deviceId === deviceId);
+    if (!localDevice) {
+      return;
+    }
+    const shouldBeActive = callSession.activeDeviceId === deviceId;
+    const isMuted = typeof matrixCall.isMicrophoneMuted === 'function'
+      ? Boolean(matrixCall.isMicrophoneMuted())
+      : false;
+
+    if (!shouldBeActive) {
+      if (!isMuted) {
+        try {
+          if (typeof matrixCall.setMicrophoneMuted === 'function') {
+            matrixCall.setMicrophoneMuted(true);
+          }
+        } catch (err) {
+          console.warn('Failed to mute local mobile call after remote handover', err);
+        }
+      }
+      updateLocalCallDeviceState(session.client, { muted: true, connected: false });
+    } else {
+      if (localDevice.muted && isMuted) {
+        try {
+          if (typeof matrixCall.setMicrophoneMuted === 'function') {
+            matrixCall.setMicrophoneMuted(false);
+          }
+        } catch (err) {
+          console.warn('Failed to unmute local mobile call during handover', err);
+        }
+      }
+      updateLocalCallDeviceState(session.client, { muted: false, connected: true });
+    }
+  }, [callSession, deviceId, session.client]);
+
+  useEffect(() => {
+    if (callSession?.status === 'ended') {
+      navigation.goBack();
+    }
+  }, [callSession?.status, navigation]);
+
+  const handoverEnabled = useMemo(() => {
+    if (!callSession || !deviceId) {
+      return false;
+    }
+    return Boolean(callSession.activeDeviceId && callSession.activeDeviceId !== deviceId);
+  }, [callSession, deviceId]);
+
+  const secondaryDevices = useMemo(() => {
+    if (!callSession) {
+      return [] as CallSessionState['devices'];
+    }
+    return callSession.devices.filter(device => device.deviceId !== callSession.activeDeviceId && device.deviceId !== deviceId);
+  }, [callSession, deviceId]);
+
+  const localDeviceEntry = useMemo(() => {
+    if (!callSession || !deviceId) {
+      return null;
+    }
+    return callSession.devices.find(device => device.deviceId === deviceId) ?? null;
+  }, [callSession, deviceId]);
+
+  const handleHandover = useCallback(() => {
+    if (!callSession) {
+      return;
+    }
+    setHandoverInFlight(true);
+    handoverCallToCurrentDevice(session.client, callSession)
+      .catch(err => {
+        console.warn('Failed to hand over mobile call to current device', err);
+      })
+      .finally(() => setHandoverInFlight(false));
+  }, [callSession, session.client]);
+
   return (
     <SafeAreaView style={styles.container}>
       <View style={styles.content}>
         <Text style={styles.title}>Звонок</Text>
         <Text style={styles.subtitle}>Комната: {roomId}</Text>
+        {callSession ? (
+          <View style={styles.banner}>
+            <Text style={styles.bannerText}>
+              {callSession.activeDeviceId && callSession.activeDeviceId === deviceId
+                ? 'Звонок активен на этом устройстве'
+                : 'Звонок активен на другом устройстве'}
+            </Text>
+            {secondaryDevices.length > 0 ? (
+              <Text style={styles.bannerSecondary} numberOfLines={2}>
+                Вторичные устройства: {secondaryDevices
+                  .map(device => device.label || device.userId || device.deviceId)
+                  .filter(Boolean)
+                  .join(', ')}
+              </Text>
+            ) : null}
+            {localDeviceEntry && localDeviceEntry.muted && callSession.activeDeviceId !== deviceId ? (
+              <Text style={styles.bannerMuted}>Микрофон этого устройства отключён</Text>
+            ) : null}
+            {handoverEnabled ? (
+              <TouchableOpacity
+                style={[styles.handoverButton, handoverInFlight && styles.handoverButtonDisabled]}
+                accessibilityRole="button"
+                onPress={handleHandover}
+                disabled={handoverInFlight}
+              >
+                <Text style={styles.handoverButtonText}>
+                  {handoverInFlight ? 'Подключение…' : 'Подхватить на этом устройстве'}
+                </Text>
+              </TouchableOpacity>
+            ) : null}
+          </View>
+        ) : null}
         {error ? (
           <Text style={styles.error}>{error}</Text>
         ) : null}
@@ -102,7 +242,10 @@ export const CallScreen: React.FC<CallScreenProps> = ({ session, route }) => {
             mirror
           />
         ) : null}
-        <Text style={styles.status}>Статус: {callState}</Text>
+        <Text style={styles.status}>
+          Статус: {callState}
+          {callSession?.status && callSession.status !== callState ? ` (${callSession.status})` : ''}
+        </Text>
       </View>
       <TouchableOpacity style={styles.hangupButton} onPress={handleEndCall} accessibilityRole="button">
         <Text style={styles.hangupText}>Завершить</Text>
@@ -133,6 +276,37 @@ const styles = StyleSheet.create({
   error: {
     color: '#ff6b6b',
     textAlign: 'center',
+  },
+  banner: {
+    width: '100%',
+    backgroundColor: 'rgba(15, 27, 46, 0.85)',
+    borderRadius: 16,
+    padding: 12,
+    gap: 6,
+  },
+  bannerText: {
+    color: '#e2e8f0',
+    fontWeight: '600',
+  },
+  bannerSecondary: {
+    color: '#cbd5f5',
+  },
+  bannerMuted: {
+    color: '#f7c948',
+  },
+  handoverButton: {
+    marginTop: 4,
+    backgroundColor: '#34d399',
+    paddingVertical: 10,
+    borderRadius: 12,
+    alignItems: 'center',
+  },
+  handoverButtonDisabled: {
+    opacity: 0.7,
+  },
+  handoverButtonText: {
+    color: '#0b1526',
+    fontWeight: '700',
   },
   video: {
     width: '100%',

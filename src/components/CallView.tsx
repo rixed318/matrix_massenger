@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { MatrixCall, MatrixClient } from '@matrix-messenger/core';
+import { MatrixCall, MatrixClient, CallSessionState, updateLocalCallDeviceState } from '@matrix-messenger/core';
 import Avatar from './Avatar';
 import { mxcToHttp } from '@matrix-messenger/core';
 import { CallEvent } from 'matrix-js-sdk';
@@ -38,6 +38,9 @@ interface CallViewProps {
     onSpotlightParticipant?: (participantId: string) => void;
     localUserId?: string;
     canModerateParticipants?: boolean;
+    callSession?: CallSessionState | null;
+    onHandover?: () => void;
+    localDeviceId?: string | null;
 }
 
 interface VideoTileInfo {
@@ -130,6 +133,9 @@ const CallView: React.FC<CallViewProps> = ({
     onSpotlightParticipant,
     localUserId,
     canModerateParticipants = false,
+    callSession,
+    onHandover,
+    localDeviceId,
 }) => {
     const [callState, setCallState] = useState<string>(call?.state ?? '');
     const [duration, setDuration] = useState(0);
@@ -193,6 +199,46 @@ const CallView: React.FC<CallViewProps> = ({
             setInternalVideoMuted(videoMutedProp);
         }
     }, [videoMutedProp]);
+
+    useEffect(() => {
+        if (!call || isGroupCall || !callSession || !localDeviceId) {
+            return;
+        }
+        const localDevice = callSession.devices.find(device => device.deviceId === localDeviceId);
+        if (!localDevice) {
+            return;
+        }
+        const isCurrentlyMuted = typeof (call as any).isMicrophoneMuted === 'function'
+            ? Boolean((call as any).isMicrophoneMuted())
+            : internalMuted;
+        const shouldBeActive = callSession.activeDeviceId === localDeviceId;
+
+        if (!shouldBeActive && (!localDevice.muted || !isCurrentlyMuted)) {
+            try {
+                if (typeof (call as any).setMicrophoneMuted === 'function') {
+                    (call as any).setMicrophoneMuted(true);
+                } else if (typeof call.setLocalMute === 'function') {
+                    call.setLocalMute(true);
+                }
+            } catch (error) {
+                console.warn('Failed to mute local call after handover', error);
+            }
+            updateLocalCallDeviceState(client, { muted: true, connected: false });
+        } else if (shouldBeActive && localDevice.muted && isCurrentlyMuted) {
+            try {
+                if (typeof (call as any).setMicrophoneMuted === 'function') {
+                    (call as any).setMicrophoneMuted(false);
+                } else if (typeof call.setLocalMute === 'function') {
+                    call.setLocalMute(false);
+                }
+            } catch (error) {
+                console.warn('Failed to unmute local call after handover', error);
+            }
+            updateLocalCallDeviceState(client, { muted: false, connected: true });
+        } else if (shouldBeActive && localDevice.connected !== true) {
+            updateLocalCallDeviceState(client, { connected: true });
+        }
+    }, [call, client, callSession, localDeviceId, isGroupCall, internalMuted]);
 
     const computedMuted = typeof mutedProp === 'boolean' ? mutedProp : internalMuted;
     const computedVideoMuted = typeof videoMutedProp === 'boolean' ? videoMutedProp : internalVideoMuted;
@@ -384,6 +430,17 @@ const CallView: React.FC<CallViewProps> = ({
     const peerName = peerMember?.name || 'Unknown User';
     const peerAvatar = mxcToHttp(client, peerMember?.getMxcAvatarUrl?.(), 128);
     const isVideoCall = call?.type === 'video';
+    const secondaryParticipants = callSession
+        ? callSession.devices.filter(device => device.deviceId !== callSession.activeDeviceId)
+        : [];
+    const handoverEnabled = Boolean(
+        callSession &&
+        onHandover &&
+        localDeviceId &&
+        callSession.activeDeviceId &&
+        callSession.activeDeviceId !== localDeviceId,
+    );
+    const localCallDevice = callSession?.devices.find(device => device.deviceId === localDeviceId);
 
     return (
         <div className="fixed inset-0 bg-gray-900/95 z-40 flex flex-col items-center justify-center animate-fade-in-fast">
@@ -401,6 +458,38 @@ const CallView: React.FC<CallViewProps> = ({
                 <h2 className="text-3xl font-bold mt-4 text-shadow">{peerName}</h2>
                 <p className="text-gray-300 text-lg mt-2 text-shadow">{getStateText()}</p>
             </div>
+
+            {callSession && (
+                <div className="absolute top-20 inset-x-0 flex justify-center z-10 px-4">
+                    <div className="flex flex-wrap items-center gap-3 bg-black/60 backdrop-blur px-4 py-2 rounded-full text-xs text-white max-w-3xl">
+                        <span>
+                            {callSession.activeDeviceId && callSession.activeDeviceId === localDeviceId
+                                ? 'Звонок активен на этом устройстве'
+                                : 'Звонок активен на другом устройстве'}
+                        </span>
+                        {secondaryParticipants.length > 0 && (
+                            <span className="text-white/70 truncate">
+                                Вторичные устройства: {secondaryParticipants
+                                    .map(device => device.label || device.userId || device.deviceId)
+                                    .filter(Boolean)
+                                    .join(', ')}
+                            </span>
+                        )}
+                        {localCallDevice && localCallDevice.muted && callSession.activeDeviceId !== localDeviceId && (
+                            <span className="text-amber-300/80">Микрофон этого устройства отключён</span>
+                        )}
+                        {handoverEnabled && (
+                            <button
+                                type="button"
+                                onClick={onHandover}
+                                className="px-3 py-1 rounded-full bg-emerald-500 hover:bg-emerald-400 text-white font-medium"
+                            >
+                                Подхватить на этом устройстве
+                            </button>
+                        )}
+                    </div>
+                </div>
+            )}
 
             {isVideoCall && (
                 <video

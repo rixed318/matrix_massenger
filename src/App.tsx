@@ -1,9 +1,10 @@
-import React, { useEffect } from 'react';
+import React, { useEffect, useMemo } from 'react';
 import LoginPage from './components/LoginPage';
 import ChatPage from './components/ChatPage';
 import AppErrorBoundary from './components/AppErrorBoundary';
 import { AccountProvider, useAccountStore } from './services/accountManager';
 import { bootstrapStoredPlugins } from './services/pluginHost';
+import SecureCloudAdminApp from './components/SecureCloudAdminApp';
 
 const AppContent: React.FC = () => {
   const boot = useAccountStore(state => state.boot);
@@ -16,6 +17,13 @@ const AppContent: React.FC = () => {
   const setUniversalMode = useAccountStore(state => state.setUniversalMode);
   const aggregatedUnread = useAccountStore(state => state.aggregatedUnread);
   const aggregatedRooms = useAccountStore(state => state.aggregatedRooms);
+
+  const view = useMemo(() => {
+    if (typeof window === 'undefined') {
+      return null;
+    }
+    return new URLSearchParams(window.location.search).get('view');
+  }, []);
 
   useEffect(() => {
     const savedTheme = localStorage.getItem('matrix-theme') || '';
@@ -45,6 +53,10 @@ const AppContent: React.FC = () => {
         <span className="ml-4 text-xl">Loading Sessions...</span>
       </div>
     );
+  }
+
+  if (view === 'secure-cloud-admin') {
+    return <SecureCloudAdminApp />;
   }
 
   return (

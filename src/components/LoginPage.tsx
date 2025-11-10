@@ -1,5 +1,5 @@
 import React, { useState, FormEvent, useEffect } from 'react';
-import type { MatrixClient, SecureCloudProfile } from '@matrix-messenger/core';
+import type { MatrixClient, SecureCloudProfile, SecureCloudDetector } from '@matrix-messenger/core';
 import {
   login,
   resolveHomeserverBaseUrl,
@@ -7,9 +7,17 @@ import {
   register as registerAccount,
   TotpRequiredError,
   type LoginOptions,
+  getSecureCloudDetectorCatalog,
 } from '@matrix-messenger/core';
 import ServerDeploymentWizard from './ServerDeploymentWizard';
-import { useAccountStore } from '../services/accountManager';
+import { useAccountStore, createAccountKey } from '../services/accountManager';
+import {
+  listPasskeyDevices,
+  removePasskeyDevice,
+  savePasskeyDevice,
+  touchPasskeyDevice,
+  type StoredPasskeyDevice,
+} from '../services/passkeyStore';
 
 interface LoginPageProps {
   onLoginSuccess?: (client: MatrixClient) => void;
@@ -30,6 +38,36 @@ const getDefaultHomeserver = (connectionType: ConnectionType) => {
     case 'selfhosted':
     default:
       return '';
+  }
+};
+
+const deriveAccountKey = (homeserverUrl: string, username: string): string | null => {
+  const trimmedHomeserver = homeserverUrl.trim();
+  const trimmedUsername = username.trim();
+  if (!trimmedHomeserver || !trimmedUsername) return null;
+  try {
+    const url = new URL(trimmedHomeserver);
+    const hasDomain = trimmedUsername.includes(':');
+    const normalisedUserId = hasDomain
+      ? trimmedUsername.startsWith('@')
+        ? trimmedUsername
+        : `@${trimmedUsername}`
+      : `@${trimmedUsername.replace(/^@/, '')}:${url.host}`;
+    return createAccountKey({ homeserver_url: trimmedHomeserver, user_id: normalisedUserId, access_token: '' });
+  } catch {
+    return null;
+  }
+};
+
+const describePasskeyType = (value?: string | null): string => {
+  switch (value) {
+    case 'security-key':
+      return 'Аппаратный ключ';
+    case 'webauthn':
+      return 'WebAuthn';
+    case 'passkey':
+    default:
+      return 'Passkey';
   }
 };
 
@@ -78,6 +116,22 @@ const LoginForm: React.FC<{
 
 
   // Secure Cloud controls
+  const detectorCatalog = React.useMemo<SecureCloudDetector[]>(() => {
+    try {
+      return getSecureCloudDetectorCatalog().filter((detector) => detector.type === 'ml' || detector.type === 'llm');
+    } catch {
+      return [];
+    }
+  }, []);
+  const defaultModelMapping = React.useMemo<Record<string, string>>(() => {
+    const mapping: Record<string, string> = {};
+    detectorCatalog.forEach((detector) => {
+      if (Array.isArray(detector.models) && detector.models.length > 0) {
+        mapping[detector.id] = detector.models[0].id;
+      }
+    });
+    return mapping;
+  }, [detectorCatalog]);
   const [useSecureCloud, setUseSecureCloud] = useState(connectionType === 'secure');
   const [secureApiUrl, setSecureApiUrl] = useState(getDefaultHomeserver(connectionType));
   const [metadataToken, setMetadataToken] = useState('');
@@ -85,6 +139,55 @@ const LoginForm: React.FC<{
   const [enableAnalytics, setEnableAnalytics] = useState(false);
   const [analyticsToken, setAnalyticsToken] = useState('');
   const [riskThreshold, setRiskThreshold] = useState('0.6');
+  const [retentionDays, setRetentionDays] = useState('30');
+  const [selectedModels, setSelectedModels] = useState<Record<string, string>>(defaultModelMapping);
+  const [userSensitivity, setUserSensitivity] = useState<'low' | 'medium' | 'high'>('medium');
+  const [organizationSensitivity, setOrganizationSensitivity] = useState<'low' | 'medium' | 'high'>('medium');
+
+  const [passkeyDevices, setPasskeyDevices] = useState<StoredPasskeyDevice[]>([]);
+  const [passkeyLoading, setPasskeyLoading] = useState(false);
+  const [passkeyError, setPasskeyError] = useState<string | null>(null);
+
+  const refreshPasskeys = useCallback(async () => {
+    const key = deriveAccountKey(homeserverUrl, username);
+    if (!key) {
+      setPasskeyDevices([]);
+      setPasskeyError(null);
+      return;
+    }
+    setPasskeyLoading(true);
+    try {
+      const devices = await listPasskeyDevices(key);
+      setPasskeyDevices(devices);
+      setPasskeyError(null);
+    } catch (err: any) {
+      setPasskeyDevices([]);
+      setPasskeyError(err?.message ? `Не удалось загрузить passkey: ${err.message}` : 'Не удалось загрузить passkey.');
+    } finally {
+      setPasskeyLoading(false);
+    }
+  }, [homeserverUrl, username]);
+
+  useEffect(() => {
+    void refreshPasskeys();
+  }, [refreshPasskeys]);
+
+  const handleRemovePasskey = useCallback(
+    async (credentialId: string) => {
+      const key = deriveAccountKey(homeserverUrl, username);
+      if (!key) return;
+      try {
+        await removePasskeyDevice(key, credentialId);
+        await refreshPasskeys();
+      } catch (err) {
+        console.warn('Failed to remove passkey device', err);
+      }
+    },
+    [homeserverUrl, username, refreshPasskeys],
+  );
+
+  const shouldShowPasskeys = Boolean(homeserverUrl.trim() && username.trim());
+  const hasAccountKey = shouldShowPasskeys && deriveAccountKey(homeserverUrl, username) !== null;
 
   // Reset form fields when connection type changes
   useEffect(() => {
@@ -98,8 +201,12 @@ const LoginForm: React.FC<{
     setEnableAnalytics(false);
     setAnalyticsToken('');
     setRiskThreshold('0.6');
+    setRetentionDays('30');
+    setSelectedModels(defaultModelMapping);
+    setUserSensitivity('medium');
+    setOrganizationSensitivity('medium');
     onResetTotp();
-  }, [connectionType]);
+  }, [connectionType, defaultModelMapping, onResetTotp]);
 
   // Load saved Secure Cloud settings on mount or connectionType change.
   // Ignore for public servers.
@@ -113,6 +220,16 @@ const LoginForm: React.FC<{
       if (typeof data !== 'object' || data === null) return;
       const getBool = (v, d=false) => typeof v === 'boolean' ? v : d;
       const getStr = (v, d='') => typeof v === 'string' ? v : d;
+      const parseSensitivity = (value: unknown): 'low' | 'medium' | 'high' => {
+        if (value === 'low' || value === 'medium' || value === 'high') return value;
+        if (typeof value === 'string') {
+          const lowered = value.toLowerCase();
+          if (lowered === 'low' || lowered === 'medium' || lowered === 'high') {
+            return lowered as 'low' | 'medium' | 'high';
+          }
+        }
+        return 'medium';
+      };
       const next = {
         useSecureCloud: getBool(data.useSecureCloud, connectionType === 'secure'),
         secureApiUrl: getStr(data.secureApiUrl, getDefaultHomeserver(connectionType)),
@@ -125,6 +242,25 @@ const LoginForm: React.FC<{
           if (typeof data.riskThreshold === 'string' && data.riskThreshold.trim()) return data.riskThreshold.trim();
           return '0.6';
         })(),
+        retentionDays: (() => {
+          if (typeof data.retentionDays === 'number' && Number.isFinite(data.retentionDays)) {
+            return String(data.retentionDays);
+          }
+          if (typeof data.retentionDays === 'string' && data.retentionDays.trim()) {
+            return data.retentionDays.trim();
+          }
+          return '30';
+        })(),
+        selectedModels: (() => {
+          if (typeof data.selectedModels === 'object' && data.selectedModels) {
+            const entries = Object.entries(data.selectedModels as Record<string, unknown>)
+              .filter(([key, value]) => typeof key === 'string' && typeof value === 'string');
+            return Object.fromEntries(entries) as Record<string, string>;
+          }
+          return {} as Record<string, string>;
+        })(),
+        userSensitivity: parseSensitivity((data as any).userSensitivity),
+        organizationSensitivity: parseSensitivity((data as any).organizationSensitivity),
       };
       setUseSecureCloud(next.useSecureCloud);
       setSecureApiUrl(next.secureApiUrl);
@@ -133,14 +269,21 @@ const LoginForm: React.FC<{
       setEnableAnalytics(next.enableAnalytics);
       setAnalyticsToken(next.analyticsToken);
       setRiskThreshold(next.riskThreshold);
+      setRetentionDays(next.retentionDays);
+      setSelectedModels({ ...defaultModelMapping, ...next.selectedModels });
+      setUserSensitivity(next.userSensitivity);
+      setOrganizationSensitivity(next.organizationSensitivity);
     } catch {
       // Ignore malformed JSON
     }
-  }, [connectionType]);
+  }, [connectionType, defaultModelMapping]);
 
   // Persist settings when they change. Skip for public servers.
   useEffect(() => {
     if (connectionType === 'public') return;
+    const persistedModels = Object.fromEntries(
+      Object.entries(selectedModels).filter(([_, value]) => typeof value === 'string' && value.length > 0),
+    );
     const payload = {
       useSecureCloud,
       secureApiUrl,
@@ -149,19 +292,26 @@ const LoginForm: React.FC<{
       enableAnalytics,
       analyticsToken,
       riskThreshold,
+      retentionDays,
+      selectedModels: persistedModels,
+      userSensitivity,
+      organizationSensitivity,
     };
     try {
       localStorage.setItem('secure-cloud-settings', JSON.stringify(payload));
     } catch {
       // Storage may be unavailable (private mode). Ignore.
     }
-  }, [connectionType, useSecureCloud, secureApiUrl, metadataToken, enablePremium, enableAnalytics, analyticsToken, riskThreshold]);
+  }, [connectionType, useSecureCloud, secureApiUrl, metadataToken, enablePremium, enableAnalytics, analyticsToken, riskThreshold, retentionDays, selectedModels, userSensitivity, organizationSensitivity]);
 
 
   
   // Persist current Secure Cloud settings to localStorage
   function persistSecureSettings() {
     if (connectionType === 'public') return;
+    const persistedModels = Object.fromEntries(
+      Object.entries(selectedModels).filter(([_, value]) => typeof value === 'string' && value.length > 0),
+    );
     const payload = {
       useSecureCloud,
       secureApiUrl,
@@ -170,6 +320,10 @@ const LoginForm: React.FC<{
       enableAnalytics,
       analyticsToken,
       riskThreshold,
+      retentionDays,
+      selectedModels: persistedModels,
+      userSensitivity,
+      organizationSensitivity,
     };
     try {
       localStorage.setItem('secure-cloud-settings', JSON.stringify(payload));
@@ -181,6 +335,13 @@ const handleSubmit = (e: FormEvent) => {
     const normalisedThreshold = Number.isFinite(thresholdValue)
       ? Math.min(1, Math.max(0, thresholdValue))
       : 0.6;
+    const retentionValue = (() => {
+      const parsed = Number.parseInt(retentionDays, 10);
+      return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
+    })();
+    const modelOverrides = Object.fromEntries(
+      Object.entries(selectedModels).filter(([_, value]) => typeof value === 'string' && value.length > 0),
+    );
 
     const shouldAttachSecure = connectionType === 'secure' || useSecureCloud;
     const secureProfile: SecureCloudProfile | undefined = shouldAttachSecure
@@ -192,6 +353,10 @@ const handleSubmit = (e: FormEvent) => {
           enablePremium,
           enableAnalytics,
           riskThreshold: normalisedThreshold,
+          retentionPeriodDays: retentionValue,
+          detectorModels: Object.keys(modelOverrides).length > 0 ? modelOverrides : undefined,
+          userSensitivity,
+          organizationSensitivity,
         }
       : undefined;
 
@@ -284,6 +449,56 @@ const handleSubmit = (e: FormEvent) => {
             {totpValidationError && (
               <p className="text-xs text-error" role="alert">{totpValidationError}</p>
             )}
+          </div>
+        )}
+        {shouldShowPasskeys && (
+          <div className="space-y-2 border border-border-primary rounded-md p-3 bg-bg-tertiary/30">
+            <div className="flex items-center justify-between text-xs">
+              <span className="font-semibold uppercase tracking-wide text-text-primary">Passkey устройства</span>
+              <button
+                type="button"
+                className="text-text-accent hover:underline disabled:opacity-50"
+                onClick={() => void refreshPasskeys()}
+                disabled={passkeyLoading || !hasAccountKey}
+              >
+                Обновить
+              </button>
+            </div>
+            {passkeyError && <p className="text-xs text-error" role="alert">{passkeyError}</p>}
+            {passkeyLoading ? (
+              <p className="text-xs text-text-secondary">Загрузка списка устройств...</p>
+            ) : passkeyDevices.length > 0 ? (
+              <ul className="space-y-2 text-xs">
+                {passkeyDevices.map((device) => (
+                  <li key={device.credentialId} className="flex items-start justify-between gap-2">
+                    <div>
+                      <div className="font-medium text-text-primary">{device.label}</div>
+                      <div className="text-text-secondary">
+                        {describePasskeyType((device as any).deviceType ?? (device as any).device_type)} ·{' '}
+                        {device.lastUsedAt
+                          ? new Date(device.lastUsedAt).toLocaleString()
+                          : 'ещё не использовалось'}
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      className="text-red-400 hover:underline disabled:opacity-40"
+                      onClick={() => void handleRemovePasskey(device.credentialId)}
+                      disabled={passkeyLoading}
+                    >
+                      Удалить
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p className="text-xs text-text-secondary">
+                Passkey устройства для этой учётной записи не найдены.
+              </p>
+            )}
+            <p className="text-[11px] text-text-secondary leading-snug">
+              Passkey будет запрошен автоматически, когда сервер потребует подтверждение WebAuthn вместе с паролем.
+            </p>
           </div>
         )}
         {(connectionType === 'secure' || connectionType === 'selfhosted') && (
@@ -380,6 +595,77 @@ const handleSubmit = (e: FormEvent) => {
                     onChange={(e) => setRiskThreshold(e.target.value)}
                   />
                 </div>
+                <div>
+                  <label htmlFor="retention-days" className="block text-xs font-medium text-text-secondary uppercase">Политика хранения предупреждений</label>
+                  <select
+                    id="retention-days"
+                    name="retention-days"
+                    className="mt-1 block w-full rounded-md border border-border-primary bg-bg-secondary px-3 py-2 text-sm text-text-primary focus:outline-none focus:ring-ring-focus focus:border-ring-focus"
+                    value={retentionDays}
+                    onChange={(e) => setRetentionDays(e.target.value)}
+                  >
+                    <option value="0">Не хранить</option>
+                    <option value="7">7 дней</option>
+                    <option value="30">30 дней</option>
+                    <option value="90">90 дней</option>
+                    <option value="180">180 дней</option>
+                  </select>
+                </div>
+                <div className="grid gap-2 md:grid-cols-2">
+                  <div>
+                    <label htmlFor="user-sensitivity" className="block text-xs font-medium text-text-secondary uppercase">Чувствительность пользователя</label>
+                    <select
+                      id="user-sensitivity"
+                      className="mt-1 block w-full rounded-md border border-border-primary bg-bg-secondary px-3 py-2 text-sm text-text-primary focus:outline-none focus:ring-ring-focus focus:border-ring-focus"
+                      value={userSensitivity}
+                      onChange={(e) => setUserSensitivity(e.target.value as 'low' | 'medium' | 'high')}
+                    >
+                      <option value="low">Низкая</option>
+                      <option value="medium">Средняя</option>
+                      <option value="high">Высокая</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label htmlFor="org-sensitivity" className="block text-xs font-medium text-text-secondary uppercase">Чувствительность организации</label>
+                    <select
+                      id="org-sensitivity"
+                      className="mt-1 block w-full rounded-md border border-border-primary bg-bg-secondary px-3 py-2 text-sm text-text-primary focus:outline-none focus:ring-ring-focus focus:border-ring-focus"
+                      value={organizationSensitivity}
+                      onChange={(e) => setOrganizationSensitivity(e.target.value as 'low' | 'medium' | 'high')}
+                    >
+                      <option value="low">Низкая</option>
+                      <option value="medium">Средняя</option>
+                      <option value="high">Высокая</option>
+                    </select>
+                  </div>
+                </div>
+                {detectorCatalog.length > 0 && (
+                  <div className="space-y-2">
+                    <p className="text-xs font-semibold uppercase text-text-secondary">Модели детекторов</p>
+                    {detectorCatalog.map((detector) => (
+                      <div key={detector.id} className="space-y-1">
+                        <label className="block text-xs font-medium text-text-secondary uppercase" htmlFor={`detector-model-${detector.id}`}>
+                          {detector.displayName}
+                        </label>
+                        <select
+                          id={`detector-model-${detector.id}`}
+                          className="block w-full rounded-md border border-border-primary bg-bg-secondary px-3 py-2 text-sm text-text-primary focus:outline-none focus:ring-ring-focus focus:border-ring-focus"
+                          value={selectedModels[detector.id] ?? ''}
+                          onChange={(e) => setSelectedModels((prev) => ({ ...prev, [detector.id]: e.target.value }))}
+                        >
+                          {(detector.models ?? []).map((model) => (
+                            <option key={model.id} value={model.id}>
+                              {model.label} ({model.provider})
+                            </option>
+                          ))}
+                          {(!detector.models || detector.models.length === 0) && (
+                            <option value="">Нет доступных моделей</option>
+                          )}
+                        </select>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             )}
           </div>
@@ -579,6 +865,46 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess, initialError, sav
     applyError(initialErrorValue);
   }, [initialErrorValue]);
 
+  const persistPasskeyRecord = useCallback(
+    async (
+      client: MatrixClient,
+      details: PasskeyAssertionDetails | PasskeyAttestationDetails | null,
+    ) => {
+      if (!details) return;
+      try {
+        const homeserver = client.getHomeserverUrl?.() ?? '';
+        const userId = client.getUserId?.() ?? '';
+        if (!homeserver || !userId) return;
+        const accountKey = createAccountKey({
+          homeserver_url: homeserver,
+          user_id: userId,
+          access_token: client.getAccessToken?.() ?? '',
+        });
+        const existing = await listPasskeyDevices(accountKey);
+        const deviceType = details.stage === 'm.login.passkey' ? 'passkey' : 'webauthn';
+        const now = Date.now();
+        const matched = existing.find(device => device.credentialId === details.credentialId);
+        if (matched) {
+          await touchPasskeyDevice(accountKey, details.credentialId);
+          return;
+        }
+        const labelBase = deviceType === 'passkey' ? 'Passkey' : 'WebAuthn';
+        await savePasskeyDevice(accountKey, {
+          credentialId: details.credentialId,
+          userId,
+          label: `${labelBase} ${existing.length + 1}`,
+          addedAt: now,
+          lastUsedAt: now,
+          transports: details.transports ?? undefined,
+          deviceType,
+        });
+      } catch (err) {
+        console.warn('Failed to persist passkey metadata', err);
+      }
+    },
+    [],
+  );
+
   const handleLogin = async (
     homeserverInput: string,
     username: string,
@@ -588,6 +914,7 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess, initialError, sav
     applyError(null);
     setTotpValidationError(null);
     setIsLoading(true);
+    let capturedPasskey: PasskeyAssertionDetails | null = null;
     try {
       const baseUrl = await resolveHomeserverBaseUrl(homeserverInput);
       const options: LoginOptions = {};
@@ -597,10 +924,15 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess, initialError, sav
         options.totpCode = trimmedTotp;
         if (totpSessionId) options.totpSessionId = totpSessionId;
       }
+      options.onPasskeyAssertion = (details) => {
+        capturedPasskey = details;
+        loginOptions?.onPasskeyAssertion?.(details);
+      };
 
       const client = Object.keys(options).length
         ? await login(baseUrl, username, password, options)
         : await login(baseUrl, username, password);
+      await persistPasskeyRecord(client, capturedPasskey);
       await resolvedOnLoginSuccess(client);
       resetTotpState();
     } catch (err: any) {
@@ -635,8 +967,20 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess, initialError, sav
   const handleRegister = async (homeserverUrl: string, username: string, password: string) => {
     applyError(null);
     setIsLoading(true);
+    let capturedAttestation: PasskeyAttestationDetails | null = null;
+    let capturedAssertion: PasskeyAssertionDetails | null = null;
     try {
-      const client = await registerAccount(homeserverUrl, username, password);
+      const registerOptions: RegisterOptions = {
+        onPasskeyAttestation: (details) => {
+          capturedAttestation = details;
+        },
+        onPasskeyAssertion: (details) => {
+          capturedAssertion = details;
+        },
+      };
+      const client = await registerAccount(homeserverUrl, username, password, registerOptions);
+      await persistPasskeyRecord(client, capturedAttestation);
+      await persistPasskeyRecord(client, capturedAssertion);
       await resolvedOnLoginSuccess(client);
     } catch (err: any) {
       console.error(err);

@@ -1,6 +1,7 @@
 import { RoomEvent, EventType } from 'matrix-js-sdk';
 import type { MatrixClient, MatrixEvent, MatrixRoom } from '../types';
 import { getLocalMlDetectors } from './secureCloudDetectors/localMl';
+import { getRegisteredDetectors } from './secureCloudDetectors/registry';
 
 export type SecureCloudMode = 'disabled' | 'managed' | 'self-hosted';
 
@@ -22,6 +23,36 @@ export interface SecureCloudDetectorConfig {
     [key: string]: unknown;
 }
 
+export type SecureCloudDetectorType = 'heuristic' | 'ml' | 'llm';
+
+export type SecureCloudDetectorModelProvider = 'onnx' | 'transformer' | 'external';
+
+export interface SecureCloudDetectorCapabilities {
+    handlesAttachments?: boolean;
+    offlineSupport?: boolean;
+    requiresPremium?: boolean;
+}
+
+export interface SecureCloudDetectorModel {
+    id: string;
+    provider: SecureCloudDetectorModelProvider;
+    label: string;
+    description?: string;
+    path?: string;
+    endpoint?: string;
+    parameters?: Record<string, unknown>;
+    languages?: string[];
+    metadata?: Record<string, unknown>;
+}
+
+export interface SecureCloudDetectorLanguageConfig {
+    language: string;
+    threshold?: number;
+    modelId?: string;
+    promptTemplate?: string;
+    settings?: Record<string, unknown>;
+}
+
 export interface SecureCloudDetector {
     id: string;
     displayName: string;
@@ -29,6 +60,10 @@ export interface SecureCloudDetector {
     required?: boolean;
     requireForPremium?: boolean;
     defaultConfig?: SecureCloudDetectorConfig;
+    type?: SecureCloudDetectorType;
+    models?: SecureCloudDetectorModel[];
+    languageOverrides?: SecureCloudDetectorLanguageConfig[];
+    capabilities?: SecureCloudDetectorCapabilities;
     warmup?: () => Promise<void> | void;
     score: (
         event: MatrixEvent,
@@ -56,6 +91,9 @@ export interface SecureCloudProfile {
     riskThreshold?: number;
     allowedEventTypes?: string[];
     detectors?: SecureCloudDetectorState[];
+    detectorModels?: Record<string, string>;
+    userSensitivity?: number | 'low' | 'medium' | 'high';
+    organizationSensitivity?: number | 'low' | 'medium' | 'high';
 }
 
 export interface SuspiciousEventNotice {
@@ -86,11 +124,20 @@ export interface SecureCloudRetentionBucket {
     maxDurationMs: number | null;
 }
 
+export interface SecureCloudRoomAlertStats {
+    roomId: string;
+    roomName: string;
+    total: number;
+    open: number;
+    lastAlertTimestamp: number | null;
+}
+
 export interface SecureCloudAggregatedStats {
     totalFlagged: number;
     openNotices: number;
     flags: Record<string, number>;
     actions: Record<string, number>;
+    rooms: SecureCloudRoomAlertStats[];
     retention: {
         count: number;
         averageMs: number | null;
@@ -110,6 +157,12 @@ export interface SecureCloudLogExportOptions {
     roomId?: string;
     format?: SecureCloudLogFormat;
     includeHeaders?: boolean;
+    fromTimestamp?: number;
+    toTimestamp?: number;
+}
+
+export interface SecureCloudAggregatedExportOptions {
+    format?: SecureCloudLogFormat;
 }
 
 const KEYWORD_PATTERNS = [
@@ -128,6 +181,19 @@ const KEYWORD_PATTERNS = [
     'giveaway',
 ];
 
+const clamp01 = (value: number): number => {
+    if (!Number.isFinite(value)) {
+        return 0;
+    }
+    if (value <= 0) {
+        return 0;
+    }
+    if (value >= 1) {
+        return 1;
+    }
+    return value;
+};
+
 const summariseMessageBody = (body: string): string => {
     return body.length > 160 ? `${body.substring(0, 157)}...` : body;
 };
@@ -145,6 +211,8 @@ const builtinDetectors: SecureCloudDetector[] = [
         displayName: 'Базовые эвристики',
         description: 'Поиск ключевых слов и признаков фишинга в сообщениях.',
         required: true,
+        type: 'heuristic',
+        capabilities: { handlesAttachments: false, offlineSupport: true },
         score: (event) => {
             const { body, msgtype } = readEventBody(event);
             const lowerBody = body.toLowerCase();
@@ -212,11 +280,20 @@ interface AggregatedRetentionInternal {
     policyDays: number | null;
 }
 
+interface AggregatedRoomStatsInternal {
+    roomId: string;
+    roomName: string;
+    total: number;
+    open: number;
+    lastAlertTimestamp: number | null;
+}
+
 interface AggregatedStatsInternal {
     totalFlagged: number;
     openNotices: number;
     flags: Map<string, number>;
     actions: Map<string, number>;
+    rooms: Map<string, AggregatedRoomStatsInternal>;
     retention: AggregatedRetentionInternal;
     updatedAt: number;
 }
@@ -241,6 +318,7 @@ const createEmptyStats = (): AggregatedStatsInternal => ({
     openNotices: 0,
     flags: new Map<string, number>(),
     actions: new Map<string, number>(),
+    rooms: new Map<string, AggregatedRoomStatsInternal>(),
     retention: createEmptyRetention(),
     updatedAt: Date.now(),
 });
@@ -262,11 +340,26 @@ const buildSnapshot = (stats: AggregatedStatsInternal): SecureCloudAggregatedSta
     const averageMs = stats.retention.count > 0
         ? Math.round(stats.retention.totalDurationMs / stats.retention.count)
         : null;
+    const rooms: SecureCloudRoomAlertStats[] = Array.from(stats.rooms.values())
+        .map(room => ({
+            roomId: room.roomId,
+            roomName: room.roomName,
+            total: room.total,
+            open: room.open,
+            lastAlertTimestamp: room.lastAlertTimestamp,
+        }))
+        .sort((a, b) => {
+            if (b.total !== a.total) {
+                return b.total - a.total;
+            }
+            return a.roomName.localeCompare(b.roomName);
+        });
     return {
         totalFlagged: stats.totalFlagged,
         openNotices: stats.openNotices,
         flags: mapToRecord(stats.flags),
         actions: mapToRecord(stats.actions),
+        rooms,
         retention: {
             count: stats.retention.count,
             averageMs,
@@ -337,6 +430,24 @@ const recordFlaggedEventStats = (client: MatrixClient, notice: SuspiciousEventNo
     store.stats.totalFlagged += 1;
     store.stats.openNotices += 1;
     store.stats.actions.set('flagged', (store.stats.actions.get('flagged') ?? 0) + 1);
+    const roomId = notice.roomId;
+    if (roomId) {
+        const existing = store.stats.rooms.get(roomId) ?? {
+            roomId,
+            roomName: notice.roomName ?? roomId,
+            total: 0,
+            open: 0,
+            lastAlertTimestamp: null,
+        } satisfies AggregatedRoomStatsInternal;
+        existing.roomName = notice.roomName ?? existing.roomName ?? roomId;
+        existing.total += 1;
+        existing.open = Math.max(0, existing.open + 1);
+        const ts = typeof notice.timestamp === 'number' ? notice.timestamp : Date.now();
+        existing.lastAlertTimestamp = existing.lastAlertTimestamp === null
+            ? ts
+            : Math.max(existing.lastAlertTimestamp, ts);
+        store.stats.rooms.set(roomId, existing);
+    }
     const reasons = Array.isArray(notice.reasons) && notice.reasons.length > 0 ? notice.reasons : ['unspecified'];
     for (const reason of reasons) {
         const key = normaliseReasonKey(reason);
@@ -361,6 +472,13 @@ const recordNoticeResolutionStats = (
     store.stats.actions.set(action, (store.stats.actions.get(action) ?? 0) + notices.length);
     const now = Date.now();
     for (const notice of notices) {
+        if (notice.roomId) {
+            const room = store.stats.rooms.get(notice.roomId);
+            if (room) {
+                room.open = Math.max(0, room.open - 1);
+                room.roomName = notice.roomName ?? room.roomName ?? notice.roomId;
+            }
+        }
         const duration = now - notice.timestamp;
         applyRetentionSample(store.stats, duration);
     }
@@ -474,9 +592,31 @@ export const exportSuspiciousEventsLog = (
     client: MatrixClient,
     options: SecureCloudLogExportOptions = {},
 ): string => {
-    const { roomId, format = 'json', includeHeaders = true } = options;
+    const {
+        roomId,
+        format = 'json',
+        includeHeaders = true,
+        fromTimestamp,
+        toTimestamp,
+    } = options;
     const notices = getSuspiciousEvents(client, roomId);
-    const records = notices.map(notice => ({
+    const fromTs = typeof fromTimestamp === 'number' && Number.isFinite(fromTimestamp)
+        ? fromTimestamp
+        : null;
+    const toTs = typeof toTimestamp === 'number' && Number.isFinite(toTimestamp)
+        ? toTimestamp
+        : null;
+    const filtered = notices.filter(notice => {
+        const ts = typeof notice.timestamp === 'number' ? notice.timestamp : 0;
+        if (fromTs !== null && ts < fromTs) {
+            return false;
+        }
+        if (toTs !== null && ts > toTs) {
+            return false;
+        }
+        return true;
+    });
+    const records = filtered.map(notice => ({
         event_id: notice.eventId,
         room_id: notice.roomId,
         room_name: notice.roomName ?? '',
@@ -519,8 +659,66 @@ export const exportSuspiciousEventsLog = (
         payload = JSON.stringify(records, null, 2);
     }
 
-    recordExportedEventsStats(client, notices.length);
+    recordExportedEventsStats(client, records.length);
     return payload;
+};
+
+export const exportSecureCloudAggregatedStats = (
+    client: MatrixClient,
+    options: SecureCloudAggregatedExportOptions = {},
+): string => {
+    const { format = 'json' } = options;
+    const snapshot = getSecureCloudAggregatedStats(client);
+
+    if (format === 'csv') {
+        const rows: string[][] = [];
+        rows.push(['section', 'key', 'label', 'value', 'extra']);
+        rows.push(['summary', 'total_flagged', 'Всего флагов', String(snapshot.totalFlagged), '']);
+        rows.push(['summary', 'open_notices', 'Открытые инциденты', String(snapshot.openNotices), '']);
+        rows.push([
+            'summary',
+            'retention_average_ms',
+            'Средний срок хранения (мс)',
+            snapshot.retention.averageMs != null ? String(snapshot.retention.averageMs) : '',
+            '',
+        ]);
+        rows.push([
+            'summary',
+            'retention_policy_days',
+            'Политика хранения (дни)',
+            snapshot.retention.policyDays != null ? String(snapshot.retention.policyDays) : '',
+            '',
+        ]);
+
+        for (const room of snapshot.rooms) {
+            rows.push([
+                'rooms',
+                room.roomId,
+                room.roomName,
+                String(room.total),
+                `open:${room.open}${room.lastAlertTimestamp ? `;last:${room.lastAlertTimestamp}` : ''}`,
+            ]);
+        }
+
+        for (const [reason, count] of Object.entries(snapshot.flags)) {
+            rows.push(['reasons', reason, reason, String(count), '']);
+        }
+
+        for (const [action, count] of Object.entries(snapshot.actions)) {
+            rows.push(['actions', action, action, String(count), '']);
+        }
+
+        for (const bucket of SECURE_CLOUD_RETENTION_BUCKETS) {
+            const value = snapshot.retention.buckets[bucket.id] ?? 0;
+            rows.push(['retention', bucket.id, bucket.label, String(value), '']);
+        }
+
+        return rows
+            .map(row => row.map(value => escapeCsvCell(value ?? '')).join(','))
+            .join('\n');
+    }
+
+    return JSON.stringify(snapshot, null, 2);
 };
 
 const ensureStore = (client: MatrixClient): Map<string, SuspiciousEventNotice[]> => {
@@ -598,6 +796,15 @@ const mergeDetectors = (profile: SecureCloudProfile): SecureCloudDetectorState[]
         register(state);
     }
 
+    for (const detector of getRegisteredDetectors()) {
+        const existing = states.get(detector.id);
+        if (existing) {
+            register({ ...existing, detector, enabled: existing.enabled, config: existing.config });
+        } else {
+            register({ detector, enabled: Boolean(detector.required), config: detector.defaultConfig });
+        }
+    }
+
     for (const detector of getLocalMlDetectors()) {
         const existing = states.get(detector.id);
         if (existing) {
@@ -614,18 +821,90 @@ export const resolveSecureCloudDetectors = (profile: SecureCloudProfile): Secure
     return mergeDetectors(profile);
 };
 
+const sensitivityLabels: Record<'low' | 'medium' | 'high', number> = {
+    low: 0.2,
+    medium: 0.5,
+    high: 0.85,
+};
+
+const normaliseSensitivityValue = (value: SecureCloudProfile['userSensitivity']): number | undefined => {
+    if (value == null) {
+        return undefined;
+    }
+    if (typeof value === 'number' && Number.isFinite(value)) {
+        return Math.min(1, Math.max(0, value));
+    }
+    const key = String(value).toLowerCase() as 'low' | 'medium' | 'high';
+    if (key in sensitivityLabels) {
+        return sensitivityLabels[key];
+    }
+    return undefined;
+};
+
+const normaliseDetectorModels = (models: SecureCloudProfile['detectorModels']): Record<string, string> | undefined => {
+    if (!models || typeof models !== 'object') {
+        return undefined;
+    }
+    const entries: Array<[string, string]> = [];
+    for (const [detectorId, modelId] of Object.entries(models)) {
+        if (!detectorId || typeof modelId !== 'string') {
+            continue;
+        }
+        entries.push([detectorId, modelId]);
+    }
+    if (entries.length === 0) {
+        return undefined;
+    }
+    return Object.fromEntries(entries);
+};
+
 export const normaliseSecureCloudProfile = (profile: SecureCloudProfile): SecureCloudProfile => {
     const metadataConsent = profile.metadataConsent !== undefined ? Boolean(profile.metadataConsent) : true;
     const retentionPeriodDays =
         typeof profile.retentionPeriodDays === 'number' && Number.isFinite(profile.retentionPeriodDays)
             ? Math.max(0, profile.retentionPeriodDays)
             : undefined;
-    return {
+    const detectorModels = normaliseDetectorModels(profile.detectorModels);
+    const userSensitivity = normaliseSensitivityValue(profile.userSensitivity);
+    const organizationSensitivity = normaliseSensitivityValue(profile.organizationSensitivity);
+
+    const baseProfile: SecureCloudProfile = {
         ...profile,
         metadataConsent,
         retentionPeriodDays,
-        detectors: mergeDetectors(profile),
+        detectorModels,
+        userSensitivity,
+        organizationSensitivity,
     };
+
+    return {
+        ...baseProfile,
+        detectors: mergeDetectors(baseProfile),
+    };
+};
+
+export const getSecureCloudDetectorCatalog = (): SecureCloudDetector[] => {
+    const map = new Map<string, SecureCloudDetector>();
+    const collect = (detector: SecureCloudDetector | null | undefined) => {
+        if (!detector) {
+            return;
+        }
+        if (!map.has(detector.id)) {
+            map.set(detector.id, detector);
+        }
+    };
+
+    for (const detector of builtinDetectors) {
+        collect(detector);
+    }
+    for (const detector of getRegisteredDetectors()) {
+        collect(detector);
+    }
+    for (const detector of getLocalMlDetectors()) {
+        collect(detector);
+    }
+
+    return Array.from(map.values());
 };
 
 interface DetectorExecutionError {
@@ -674,9 +953,9 @@ const evaluateEventRisk = async (
                 for (const reason of result.reasons) {
                     reasons.push(`${detector.id}:${reason}`);
                 }
-            } else {
-                reasons.push(detector.id);
-            }
+    } else {
+        reasons.push(detector.id);
+    }
 
             if (Array.isArray(result.keywords)) {
                 for (const keyword of result.keywords) {
@@ -695,10 +974,22 @@ const evaluateEventRisk = async (
         }
     }
 
-    const threshold = typeof profile.riskThreshold === 'number' ? profile.riskThreshold : 0.6;
+    const baseThreshold = typeof profile.riskThreshold === 'number' ? profile.riskThreshold : 0.6;
+    const userSensitivity = typeof profile.userSensitivity === 'number' ? profile.userSensitivity : undefined;
+    const organizationSensitivity = typeof profile.organizationSensitivity === 'number'
+        ? profile.organizationSensitivity
+        : undefined;
+
+    let effectiveThreshold = clamp01(baseThreshold);
+    if (userSensitivity !== undefined || organizationSensitivity !== undefined) {
+        const combined = clamp01(((userSensitivity ?? 0.5) + (organizationSensitivity ?? userSensitivity ?? 0.5)) / 2);
+        const adjustment = (0.5 - combined) * 0.3;
+        effectiveThreshold = clamp01(baseThreshold + adjustment);
+    }
+
     const cappedScore = Math.min(1, aggregatedScore);
 
-    if (cappedScore < threshold) {
+    if (cappedScore < effectiveThreshold) {
         return { notice: null, errors };
     }
 

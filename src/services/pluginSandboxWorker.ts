@@ -23,6 +23,7 @@ import {
   type SandboxRegisterCommand,
   type SandboxStorageRequest,
   type SandboxStorageResponse,
+  type SandboxUiRenderMessage,
 } from './pluginSandboxProtocol';
 
 interface PendingRequest {
@@ -45,6 +46,9 @@ let allowedEvents = new Set<PluginEventName>();
 let allowedActions = new Set<string>();
 let allowStorage = false;
 let allowScheduler = false;
+let allowUiPanel = false;
+let allowBackground = false;
+let allowedSurfaces = new Set<string>();
 
 let pluginDefinition: PluginDefinition | null = null;
 let cleanup: PluginCleanup | void;
@@ -269,6 +273,23 @@ const actions = {
   getAnimatedReactionsPreference: createAction('getAnimatedReactionsPreference'),
 };
 
+const ui = {
+  render(surfaceId: string, payload: unknown) {
+    if (!allowUiPanel) {
+      throw new Error('UI access is not permitted for this plugin');
+    }
+    if (!allowedSurfaces.has(surfaceId)) {
+      throw new Error(`Unknown UI surface ${surfaceId}`);
+    }
+    const message: SandboxUiRenderMessage = {
+      type: SANDBOX_MESSAGE.UI_RENDER,
+      surfaceId,
+      payload,
+    };
+    post(message);
+  },
+};
+
 const buildLogger = (id: string) => ({
   debug: (...args: unknown[]) => post({ type: SANDBOX_MESSAGE.LOG, level: 'debug', message: `[${id}]`, args }),
   info: (...args: unknown[]) => post({ type: SANDBOX_MESSAGE.LOG, level: 'info', message: `[${id}]`, args }),
@@ -282,6 +303,9 @@ const handleInit = async (message: SandboxInitMessage) => {
     allowedActions = new Set(message.allowedActions);
     allowStorage = message.allowStorage;
     allowScheduler = message.allowScheduler;
+    allowUiPanel = message.allowUiPanel;
+    allowBackground = message.allowBackground;
+    allowedSurfaces = new Set((message.surfaces ?? []).map(surface => surface.id));
 
     const module = await import(/* @vite-ignore */ message.entryUrl);
     const definition = (module?.default ?? module) as PluginDefinition | undefined;
@@ -359,6 +383,7 @@ const handleInit = async (message: SandboxInitMessage) => {
       actions,
       matrix,
       scheduler,
+      ui,
     } as const;
 
     cleanup = await definition.setup(context);

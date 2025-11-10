@@ -92,6 +92,9 @@ const createSandboxDefinition = (workerFactory: () => MockWorker, allowedActions
     allowedActions,
     allowStorage: false,
     allowScheduler: false,
+    allowUiPanel: false,
+    allowBackground: false,
+    surfaces: [],
     createWorker: () => workerFactory(),
   });
 

@@ -65,7 +65,19 @@ const postPreferencesToServiceWorker = async (preferences: Record<string, RoomNo
     }
 };
 
+export interface SendNotificationOptions {
+    roomId?: string;
+    isMention?: boolean;
+    type?: 'message' | 'story';
+    storyId?: string;
+    authorId?: string;
+    url?: string;
+}
+
 const shouldSuppressNotification = (options: SendNotificationOptions): boolean => {
+    if (options.type === 'story') {
+        return false;
+    }
     if (!options.roomId) {
         return false;
     }
@@ -78,11 +90,6 @@ const shouldSuppressNotification = (options: SendNotificationOptions): boolean =
     }
     return !options.isMention;
 };
-
-export interface SendNotificationOptions {
-    roomId?: string;
-    isMention?: boolean;
-}
 
 export const setRoomNotificationPreferences = (preferences: Record<string, RoomNotificationMode>): void => {
     roomNotificationPreferences = { ...preferences };
@@ -146,10 +153,12 @@ export const sendNotification = async (title: string, body: string, options: Sen
         if (!hasPermission) {
             return;
         }
+        const effectiveTitle = title || (options.type === 'story' ? 'Новая сторис' : 'Matrix Messenger');
+        const effectiveBody = body || (options.type === 'story' ? 'Откройте, чтобы посмотреть историю.' : '');
         if (isTauriEnvironment()) {
-            tauriSendNotification({ title, body });
+            tauriSendNotification({ title: effectiveTitle, body: effectiveBody });
         } else if (typeof Notification !== 'undefined') {
-            new Notification(title, { body });
+            new Notification(effectiveTitle, { body: effectiveBody });
         }
     } catch (error) {
         console.error('Failed to send notification:', error);
