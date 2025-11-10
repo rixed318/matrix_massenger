@@ -183,6 +183,8 @@ export interface ScheduledMessage {
   sendAtUtc?: number;
   /** Timezone offset (in minutes) of the client that created the schedule. */
   timezoneOffset?: number;
+  /** Olson timezone identifier selected by the author (if provided). */
+  timezoneId?: string;
   status?: 'pending' | 'retrying' | 'sent';
   attempts?: number;
   lastError?: string;

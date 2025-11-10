@@ -1,4 +1,5 @@
 import { MatrixClient, MatrixEvent, ScheduledMessage, DraftAttachment, DraftContent, DraftAttachmentKind } from '../types';
+import { computeLocalTimestamp } from '../utils/timezone';
 
 export const SCHEDULED_MESSAGES_EVENT_TYPE = 'com.matrix_messenger.scheduled';
 
@@ -184,6 +185,9 @@ const normalizeScheduledMessage = (raw: any): ScheduledMessage => {
         sendAt: typeof raw?.sendAt === 'number' ? raw.sendAt : Number(raw?.sendAt ?? Date.now()),
         sendAtUtc: typeof raw?.sendAtUtc === 'number' ? raw.sendAtUtc : undefined,
         timezoneOffset: typeof raw?.timezoneOffset === 'number' ? raw.timezoneOffset : undefined,
+        timezoneId: typeof raw?.timezoneId === 'string' && raw.timezoneId.length > 0
+            ? raw.timezoneId
+            : undefined,
         status: raw?.status === 'sent' || raw?.status === 'retrying' ? raw.status : undefined,
         attempts: typeof raw?.attempts === 'number' ? raw.attempts : undefined,
         lastError: typeof raw?.lastError === 'string' ? raw.lastError : undefined,
@@ -213,6 +217,7 @@ const serializeScheduledMessage = (message: ScheduledMessage) => ({
     sendAt: message.sendAt,
     sendAtUtc: message.sendAtUtc,
     timezoneOffset: message.timezoneOffset,
+    timezoneId: message.timezoneId,
     status: message.status,
     attempts: message.attempts,
     lastError: message.lastError,
@@ -264,18 +269,29 @@ export const addScheduledMessage = async (
     client: MatrixClient,
     roomId: string,
     content: DraftContent,
-    sendAt: number,
+    sendAtUtc: number,
+    options?: {
+        timezoneOffset?: number;
+        timezoneId?: string;
+        localTimestamp?: number;
+    },
 ): Promise<ScheduledMessage> => {
     const existing = readAccountData(client).messages;
-    const sendAtDate = new Date(sendAt);
+    const timezoneOffset = typeof options?.timezoneOffset === 'number'
+        ? options.timezoneOffset
+        : new Date(sendAtUtc).getTimezoneOffset();
+    const localTimestamp = typeof options?.localTimestamp === 'number'
+        ? options.localTimestamp
+        : computeLocalTimestamp(sendAtUtc, timezoneOffset);
 
     const newMessage: ScheduledMessage = {
         id: `scheduled_${Date.now()}`,
         roomId,
         content: normalizeDraftContent(content),
-        sendAt,
-        sendAtUtc: sendAt,
-        timezoneOffset: sendAtDate.getTimezoneOffset(),
+        sendAt: localTimestamp,
+        sendAtUtc,
+        timezoneOffset,
+        timezoneId: options?.timezoneId,
         status: 'pending',
         attempts: 0,
     };
@@ -288,6 +304,119 @@ export const deleteScheduledMessage = async (client: MatrixClient, id: string): 
     const existing = readAccountData(client).messages;
     const updated = existing.filter(msg => msg.id !== id);
     await persistAccountData(client, updated);
+};
+
+export interface ScheduledMessageScheduleUpdate {
+    sendAtUtc: number;
+    timezoneOffset: number;
+    timezoneId?: string;
+}
+
+export interface ScheduledMessageUpdatePayload {
+    content?: DraftContent;
+    schedule?: ScheduledMessageScheduleUpdate;
+}
+
+export const updateScheduledMessage = async (
+    client: MatrixClient,
+    id: string,
+    update: ScheduledMessageUpdatePayload,
+): Promise<ScheduledMessage | null> => {
+    const existing = readAccountData(client).messages;
+    let hasChanges = false;
+
+    const updated = existing.map(message => {
+        if (message.id !== id) {
+            return message;
+        }
+
+        const next: ScheduledMessage = { ...message };
+
+        if (update.content) {
+            next.content = normalizeDraftContent(update.content);
+            hasChanges = true;
+        }
+
+        if (update.schedule) {
+            const { sendAtUtc, timezoneOffset, timezoneId } = update.schedule;
+            next.sendAtUtc = sendAtUtc;
+            next.timezoneOffset = timezoneOffset;
+            next.sendAt = computeLocalTimestamp(sendAtUtc, timezoneOffset);
+            next.timezoneId = timezoneId;
+            next.status = 'pending';
+            next.attempts = 0;
+            next.lastError = undefined;
+            next.nextRetryAt = undefined;
+            next.sentAt = undefined;
+            hasChanges = true;
+        }
+
+        return next;
+    });
+
+    if (!hasChanges) {
+        return existing.find(msg => msg.id === id) ?? null;
+    }
+
+    const sorted = [...updated].sort((a, b) => (a.sendAtUtc ?? a.sendAt) - (b.sendAtUtc ?? b.sendAt));
+    await persistAccountData(client, sorted);
+    return sorted.find(msg => msg.id === id) ?? null;
+};
+
+export const bulkUpdateScheduledMessages = async (
+    client: MatrixClient,
+    updates: Array<{ id: string } & ScheduledMessageUpdatePayload>,
+): Promise<ScheduledMessage[]> => {
+    if (updates.length === 0) {
+        return readAccountData(client).messages;
+    }
+
+    const updatesMap = new Map<string, ScheduledMessageUpdatePayload>();
+    updates.forEach(entry => {
+        const { id, ...rest } = entry;
+        updatesMap.set(id, rest);
+    });
+
+    const existing = readAccountData(client).messages;
+    let hasChanges = false;
+
+    const nextMessages = existing.map(message => {
+        const update = updatesMap.get(message.id);
+        if (!update) {
+            return message;
+        }
+
+        const next: ScheduledMessage = { ...message };
+
+        if (update.content) {
+            next.content = normalizeDraftContent(update.content);
+            hasChanges = true;
+        }
+
+        if (update.schedule) {
+            const { sendAtUtc, timezoneOffset, timezoneId } = update.schedule;
+            next.sendAtUtc = sendAtUtc;
+            next.timezoneOffset = timezoneOffset;
+            next.sendAt = computeLocalTimestamp(sendAtUtc, timezoneOffset);
+            next.timezoneId = timezoneId;
+            next.status = 'pending';
+            next.attempts = 0;
+            next.lastError = undefined;
+            next.nextRetryAt = undefined;
+            next.sentAt = undefined;
+            hasChanges = true;
+        }
+
+        return next;
+    });
+
+    if (!hasChanges) {
+        return existing;
+    }
+
+    const sorted = [...nextMessages].sort((a, b) => (a.sendAtUtc ?? a.sendAt) - (b.sendAtUtc ?? b.sendAt));
+    await persistAccountData(client, sorted);
+    return sorted;
 };
 
 const calculateRetryDelay = (attempts: number): number => {
