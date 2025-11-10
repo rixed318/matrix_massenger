@@ -12,6 +12,7 @@ import Avatar from './Avatar';
 import SecuritySettings from './SecuritySettings';
 import PluginsPanel from './Settings/PluginsPanel';
 import type { SendKeyBehavior } from '../types';
+import { useDigestSettings } from '../services/digestService';
 
 interface SettingsModalProps {
     isOpen: boolean;
@@ -71,6 +72,13 @@ const TRANSCRIPTION_LANG_OPTIONS = [
 ];
 
 
+const DIGEST_PERIOD_OPTIONS: Array<{ value: 'never' | 'daily' | 'weekly' | 'hourly'; label: string }> = [
+    { value: 'never', label: 'Отключено' },
+    { value: 'daily', label: 'Ежедневно' },
+    { value: 'weekly', label: 'Еженедельно' },
+    { value: 'hourly', label: 'Каждый час' },
+];
+
 const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, onSave, client, notificationsEnabled, onSetNotificationsEnabled, chatBackground, onSetChatBackground, onResetChatBackground, sendKeyBehavior, onSetSendKeyBehavior, isPresenceHidden, onSetPresenceHidden, presenceRestricted, animatedReactionsEnabled, onSetAnimatedReactionsEnabled }) => {
     const user = client.getUser(client.getUserId());
     const [displayName, setDisplayName] = useState(user?.displayName || '');
@@ -86,6 +94,11 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, onSave, 
     const [transcriptionMaxDuration, setTranscriptionMaxDuration] = useState<string>(
         typeof runtimeTranscription.maxDurationSec === 'number' ? String(runtimeTranscription.maxDurationSec) : ''
     );
+    const digestSettings = useDigestSettings(state => state.settings);
+    const setDigestSettings = useDigestSettings(state => state.setSettings);
+    const [digestPeriodicity, setDigestPeriodicity] = useState<'never' | 'daily' | 'weekly' | 'hourly'>(digestSettings.periodicity);
+    const [digestLanguage, setDigestLanguage] = useState<string>(digestSettings.language);
+    const [digestTokenLimit, setDigestTokenLimit] = useState<string>(digestSettings.tokenLimit ? String(digestSettings.tokenLimit) : '');
     const [isSecurityOpen, setIsSecurityOpen] = useState(false);
     const fileInputRef = useRef<HTMLInputElement>(null);
     const bgFileInputRef = useRef<HTMLInputElement>(null);
@@ -150,6 +163,26 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, onSave, 
         }, 400);
         return () => clearTimeout(handle);
     }, [transcriptionEnabled, transcriptionLanguage, transcriptionMaxDuration, client, isOpen]);
+
+    useEffect(() => {
+        if (!isOpen) return;
+        setDigestPeriodicity(digestSettings.periodicity);
+        setDigestLanguage(digestSettings.language);
+        setDigestTokenLimit(digestSettings.tokenLimit ? String(digestSettings.tokenLimit) : '');
+    }, [isOpen, digestSettings.periodicity, digestSettings.language, digestSettings.tokenLimit]);
+
+    useEffect(() => {
+        if (!isOpen) return;
+        const handle = window.setTimeout(() => {
+            const parsedLimit = digestTokenLimit.trim().length ? Number.parseInt(digestTokenLimit.trim(), 10) : 0;
+            setDigestSettings({
+                periodicity: digestPeriodicity,
+                language: digestLanguage,
+                tokenLimit: Number.isFinite(parsedLimit) && parsedLimit > 0 ? parsedLimit : 0,
+            });
+        }, 300);
+        return () => window.clearTimeout(handle);
+    }, [digestPeriodicity, digestLanguage, digestTokenLimit, setDigestSettings, isOpen]);
 
     useEffect(() => {
         if (!isOpen) {
@@ -476,6 +509,55 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, onSave, 
                             <div className="ml-3 text-sm">
                                 <label htmlFor="notifications" className="font-medium text-text-primary">Enable Desktop Notifications</label>
                                 <p className="text-text-secondary">Show a system notification for new messages and calls when the app is in the background.</p>
+                            </div>
+                        </div>
+                        <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-3">
+                            <div>
+                                <label htmlFor="digestFrequency" className="block text-sm font-medium text-text-secondary mb-1">
+                                    Частота дайджеста
+                                </label>
+                                <select
+                                    id="digestFrequency"
+                                    value={digestPeriodicity}
+                                    onChange={(event) => setDigestPeriodicity(event.target.value as typeof digestPeriodicity)}
+                                    className="block w-full rounded-md border border-border-primary bg-bg-secondary px-3 py-2 text-sm text-text-primary focus:border-ring-focus focus:outline-none focus:ring-1 focus:ring-ring-focus"
+                                >
+                                    {DIGEST_PERIOD_OPTIONS.map(option => (
+                                        <option key={option.value} value={option.value}>{option.label}</option>
+                                    ))}
+                                </select>
+                                <p className="mt-1 text-xs text-text-secondary">Контролирует автоматическую отправку дайджестов.</p>
+                            </div>
+                            <div>
+                                <label htmlFor="digestLanguage" className="block text-sm font-medium text-text-secondary mb-1">
+                                    Язык дайджеста
+                                </label>
+                                <select
+                                    id="digestLanguage"
+                                    value={digestLanguage}
+                                    onChange={event => setDigestLanguage(event.target.value)}
+                                    className="block w-full rounded-md border border-border-primary bg-bg-secondary px-3 py-2 text-sm text-text-primary focus:border-ring-focus focus:outline-none focus:ring-1 focus:ring-ring-focus"
+                                >
+                                    {TRANSCRIPTION_LANG_OPTIONS.map(option => (
+                                        <option key={option.value} value={option.value}>{option.label}</option>
+                                    ))}
+                                </select>
+                                <p className="mt-1 text-xs text-text-secondary">«auto» выбирает язык автоматически.</p>
+                            </div>
+                            <div>
+                                <label htmlFor="digestTokenLimit" className="block text-sm font-medium text-text-secondary mb-1">
+                                    Лимит токенов
+                                </label>
+                                <input
+                                    id="digestTokenLimit"
+                                    type="number"
+                                    min={0}
+                                    value={digestTokenLimit}
+                                    onChange={event => setDigestTokenLimit(event.target.value)}
+                                    placeholder="например, 512"
+                                    className="block w-full rounded-md border border-border-primary bg-bg-secondary px-3 py-2 text-sm text-text-primary focus:border-ring-focus focus:outline-none focus:ring-1 focus:ring-ring-focus"
+                                />
+                                <p className="mt-1 text-xs text-text-secondary">0 — использовать значение по умолчанию модели.</p>
                             </div>
                         </div>
                     </div>

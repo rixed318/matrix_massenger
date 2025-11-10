@@ -1,5 +1,6 @@
 import { MatrixClient } from '../types';
 import { getAccountStore } from './accountManager';
+import { sendNotification } from './notificationService';
 
 const isBrowser = typeof window !== 'undefined';
 
@@ -47,6 +48,45 @@ export interface StoredPushSubscription {
   expiration_time?: number | null;
   updated_at?: number;
 }
+
+export interface DailyDigestNotificationPayload {
+  title?: string;
+  body: string;
+  roomId?: string;
+  accountKey?: string | null;
+  unreadCount?: number;
+  url?: string;
+}
+
+export const sendDailyDigestNotification = async (
+  payload: DailyDigestNotificationPayload,
+): Promise<void> => {
+  const effectiveTitle = payload.title?.trim() || 'Ежедневный дайджест';
+  const effectiveBody = payload.body?.trim() || 'Посмотрите, что произошло в комнатах за день.';
+  try {
+    await sendNotification(effectiveTitle, effectiveBody, { roomId: payload.roomId });
+  } catch (error) {
+    console.debug('Failed to deliver daily digest notification via Notification API', error);
+  }
+
+  if (typeof navigator !== 'undefined' && navigator.serviceWorker?.controller) {
+    try {
+      navigator.serviceWorker.controller.postMessage({
+        type: 'DAILY_DIGEST_NOTIFICATION',
+        payload: {
+          title: effectiveTitle,
+          body: effectiveBody,
+          roomId: payload.roomId ?? null,
+          accountKey: payload.accountKey ?? null,
+          unreadCount: payload.unreadCount ?? null,
+          url: payload.url ?? null,
+        },
+      });
+    } catch (error) {
+      console.debug('Failed to forward daily digest notification to service worker', error);
+    }
+  }
+};
 
 const buildDeviceDisplayName = () => {
   if (defaultDeviceDisplayName) {
