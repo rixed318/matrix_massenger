@@ -1,4 +1,6 @@
 import React from 'react';
+import type { PresenceSummary } from '../utils/presence';
+import { presenceStatusToClass } from '../utils/presence';
 
 export interface Participant {
     id: string;
@@ -12,6 +14,7 @@ export interface Participant {
     role?: 'host' | 'moderator' | 'presenter' | 'participant';
     isLocal?: boolean;
     lastActive?: number;
+    presenceSummary?: PresenceSummary;
 }
 
 interface Props {
@@ -92,6 +95,16 @@ const CallParticipantsPanel: React.FC<Props> = ({
                                         </span>
                                     )}
                                 </div>
+                                {p.presenceSummary && (
+                                    <div className="mt-1 text-xs text-text-secondary flex items-center gap-2 truncate w-full">
+                                        <span className={`h-2 w-2 rounded-full ${presenceStatusToClass(p.presenceSummary.status)}`} aria-hidden="true" />
+                                        <span className="truncate">
+                                            {p.presenceSummary.formattedUserId
+                                                ? `${p.presenceSummary.formattedUserId} • ${p.presenceSummary.label}`
+                                                : p.presenceSummary.label}
+                                        </span>
+                                    </div>
+                                )}
                                 <div className="mt-2 flex flex-wrap items-center gap-2">
                                     {onMuteToggle && (
                                         <button

@@ -33,6 +33,7 @@ interface RoomListProps {
   hiddenRoomIds?: string[];
   onUnlockHidden?: () => void;
   isHiddenUnlocked?: boolean;
+  presenceSummaries?: Map<string, PresenceSummary>;
 }
 
 const quickFilterChipClass = (isActive: boolean) =>
@@ -64,6 +65,7 @@ const RoomList: React.FC<RoomListProps> = ({
   onOpenSettings, onOpenPlugins, onOpenCreateRoom, folders, activeFolderId, onSelectFolder, onManageFolders,
   accounts, activeAccountKey, onSwitchAccount, onAddAccount,
   hiddenRoomIds = [], onUnlockHidden, isHiddenUnlocked = true,
+  presenceSummaries,
 }) => {
   const user = client.getUser(client.getUserId());
   const userAvatarUrl = mxcToHttp(client, user?.avatarUrl);
@@ -386,6 +388,7 @@ const RoomList: React.FC<RoomListProps> = ({
                 room={room}
                 isSelected={room.roomId === selectedRoomId}
                 onSelect={() => onSelectRoom(room.roomId)}
+                presenceSummary={presenceSummaries?.get(room.roomId)}
               />
             ))}
           </ul>

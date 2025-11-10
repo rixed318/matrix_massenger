@@ -23,6 +23,9 @@ interface SecuritySettingsProps {
   client: MatrixClient;
   isOpen: boolean;
   onClose: () => void;
+  presenceHidden: boolean;
+  onSetPresenceHidden: (hidden: boolean) => void;
+  presenceRestricted?: boolean;
 }
 
 interface DeviceSummary {
@@ -88,7 +91,7 @@ const renderQrRequestToDataUrl = async (request: any): Promise<string | null> =>
   }
 };
 
-const SecuritySettings: React.FC<SecuritySettingsProps> = ({ client, isOpen, onClose }) => {
+const SecuritySettings: React.FC<SecuritySettingsProps> = ({ client, isOpen, onClose, presenceHidden, onSetPresenceHidden, presenceRestricted = false }) => {
   const [devices, setDevices] = useState<DeviceSummary[]>([]);
   const [roomsVersion, setRoomsVersion] = useState(0);
   const [passphrase, setPassphrase] = useState('');
@@ -578,6 +581,31 @@ const SecuritySettings: React.FC<SecuritySettingsProps> = ({ client, isOpen, onC
                   При смене PIN скрытые чаты потребуют повторной разблокировки.
                 </span>
               )}
+            </div>
+          </section>
+
+          <section className="space-y-4">
+            <div className="flex items-start justify-between gap-4">
+              <div className="space-y-1">
+                <h3 className="text-lg font-semibold text-text-primary">Присутствие</h3>
+                <p className="text-sm text-text-secondary">
+                  Управляйте видимостью вашего статуса онлайн. При скрытии вы будете отображаться офлайн для остальных пользователей.
+                </p>
+                {presenceRestricted && (
+                  <p className="text-xs text-amber-400">
+                    В некоторых комнатах требуются повышенные права для отправки событий <code>m.presence</code>. Это может ограничить передачу статуса.
+                  </p>
+                )}
+              </div>
+              <label className="flex items-center gap-3">
+                <input
+                  type="checkbox"
+                  className="h-4 w-4"
+                  checked={presenceHidden}
+                  onChange={e => onSetPresenceHidden(e.target.checked)}
+                />
+                <span className="text-sm text-text-secondary">Скрыть мой онлайн-статус</span>
+              </label>
             </div>
           </section>
 

@@ -5,14 +5,17 @@ import React from 'react';
 import { Room } from '@matrix-messenger/core';
 import Avatar from './Avatar';
 import { formatDistanceToNow } from 'date-fns';
+import type { PresenceSummary } from '../utils/presence';
+import { presenceStatusToClass } from '../utils/presence';
 
 interface RoomListItemProps {
     room: Room;
     isSelected: boolean;
     onSelect: () => void;
+    presenceSummary?: PresenceSummary;
 }
 
-const RoomListItem: React.FC<RoomListItemProps> = ({ room, isSelected, onSelect }) => {
+const RoomListItem: React.FC<RoomListItemProps> = ({ room, isSelected, onSelect, presenceSummary }) => {
     const lastMessage = room.lastMessage;
     const isSpace = room.isSpace;
     const timestamp = !isSpace && lastMessage
@@ -47,6 +50,29 @@ const RoomListItem: React.FC<RoomListItemProps> = ({ room, isSelected, onSelect 
         }
 
         return 'No messages yet';
+    };
+
+    const renderPresenceDetails = () => {
+        if (!presenceSummary) return null;
+        if (presenceSummary.status === 'hidden') {
+            return (
+                <span className="flex items-center gap-2 text-xs text-text-tertiary" title="Presence is hidden">
+                    <span className={`h-2 w-2 rounded-full ${presenceStatusToClass(presenceSummary.status)}`} aria-hidden="true" />
+                    <span className="truncate">Presence hidden</span>
+                </span>
+            );
+        }
+
+        const label = presenceSummary.formattedUserId
+            ? `${presenceSummary.formattedUserId} • ${presenceSummary.label}`
+            : presenceSummary.label;
+
+        return (
+            <span className="flex items-center gap-2 text-xs text-text-secondary truncate" title={presenceSummary.label}>
+                <span className={`h-2 w-2 rounded-full ${presenceStatusToClass(presenceSummary.status)}`} aria-hidden="true" />
+                <span className="truncate">{label}</span>
+            </span>
+        );
     };
 
     const renderAvatar = () => {

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useCallback, useRef, useMemo, useReducer } from 'react';
 // FIX: Import MatrixRoom to correctly type room objects from the SDK.
 import { Room as UIRoom, Message, MatrixEvent, Reaction, ReplyInfo, MatrixClient, MatrixRoom, ActiveThread, MatrixUser, Poll, PollResult, Folder, ScheduledMessage, ScheduledMessageScheduleUpdate, ScheduledMessageUpdatePayload, MatrixCall, LinkPreviewData, Sticker, Gif, RoomNotificationMode } from '@matrix-messenger/core';
 import RoomList from './RoomList';
@@ -68,6 +68,15 @@ import { GROUP_CALL_STATE_EVENT_TYPE } from '../services/webrtc/groupCallConstan
 import type { CallLayout } from './CallView';
 import { useAccountStore } from '../services/accountManager';
 import { getAppLockSnapshot, unlockWithPin, unlockWithBiometric, isSessionUnlocked, ensureAppLockConsistency } from '../services/appLockService';
+import { presenceReducer, PresenceEventContent } from '../state/presenceReducer';
+import {
+    describePresence,
+    canSharePresenceInRoom,
+    buildRestrictedPresenceSummary,
+    buildHiddenPresenceSummary,
+    formatMatrixIdForDisplay,
+    type PresenceSummary,
+} from '../utils/presence';
 
 interface ChatPageProps {
     client?: MatrixClient;
@@ -86,9 +95,20 @@ const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, s
     const setAccountRoomNotificationMode = useAccountStore(state => state.setRoomNotificationMode);
     const accountRoomNotificationModes = useAccountStore(state => (state.activeKey ? (state.accounts[state.activeKey]?.roomNotificationModes ?? {}) : {}));
     const client = (providedClient ?? activeRuntime?.client)!;
+    const [presenceState, dispatchPresence] = useReducer(presenceReducer, new Map<string, PresenceEventContent>());
+    const currentUserId = client.getUserId?.() ?? null;
     const savedMessagesRoomId = savedRoomIdProp ?? activeRuntime?.savedMessagesRoomId ?? '';
     const logout = onLogout ?? (() => { void removeAccount(); });
     const { accounts: accountList, activeKey: activeAccountKey, setActiveKey: switchAccount, openAddAccount } = useAccountListSnapshot();
+    const [isPresenceHidden, setIsPresenceHidden] = useState<boolean>(() => {
+        if (!currentUserId) return false;
+        try {
+            return localStorage.getItem(`matrix-presence-hidden:${currentUserId}`) === 'true';
+        } catch (err) {
+            console.warn('Failed to read presence preference', err);
+            return false;
+        }
+    });
     const [rooms, setRooms] = useState<UIRoom[]>([]);
     const [isRoomsLoading, setIsRoomsLoading] = useState(true);
     const [selectedRoomId, setSelectedRoomId] = useState<string | null>(null);
@@ -137,11 +157,90 @@ const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, s
     const previousParticipantIdsRef = useRef<Set<string>>(new Set());
     const [groupCallPermissionError, setGroupCallPermissionError] = useState<string | null>(null);
 
+    const normalisePresenceContent = useCallback((content: PresenceEventContent): PresenceEventContent => {
+        const enriched: PresenceEventContent = { ...content };
+        if (typeof enriched.last_active_ts !== 'number' && typeof enriched.last_active_ago === 'number') {
+            enriched.last_active_ts = Date.now() - enriched.last_active_ago;
+        }
+        if (typeof enriched.user_id !== 'string' && typeof (content as { user_id?: string })?.user_id === 'string') {
+            enriched.user_id = (content as { user_id?: string }).user_id;
+        }
+        return enriched;
+    }, []);
+
+    const upsertPresence = useCallback((userId: string | undefined, content: PresenceEventContent | undefined) => {
+        if (!userId || !content) return;
+        if (userId === currentUserId) {
+            if (isPresenceHidden) {
+                dispatchPresence({ type: 'remove', userId });
+            }
+            return;
+        }
+        dispatchPresence({ type: 'replace', userId, content: normalisePresenceContent(content) });
+    }, [currentUserId, dispatchPresence, isPresenceHidden, normalisePresenceContent]);
+
     useEffect(() => {
         if (!groupCallPermissionError) return;
         const timer = window.setTimeout(() => setGroupCallPermissionError(null), 5000);
         return () => window.clearTimeout(timer);
     }, [groupCallPermissionError]);
+
+    useEffect(() => {
+        if (!currentUserId) {
+            dispatchPresence({ type: 'clear' });
+            setIsPresenceHidden(false);
+            return;
+        }
+        try {
+            const stored = localStorage.getItem(`matrix-presence-hidden:${currentUserId}`) === 'true';
+            setIsPresenceHidden(prev => (prev === stored ? prev : stored));
+        } catch (err) {
+            console.warn('Failed to synchronise presence preference', err);
+            setIsPresenceHidden(false);
+        }
+        dispatchPresence({ type: 'clear' });
+    }, [currentUserId, dispatchPresence]);
+
+    useEffect(() => {
+        if (!currentUserId) return;
+        try {
+            localStorage.setItem(`matrix-presence-hidden:${currentUserId}`, isPresenceHidden ? 'true' : 'false');
+        } catch (err) {
+            console.warn('Failed to persist presence preference', err);
+        }
+    }, [currentUserId, isPresenceHidden]);
+
+    useEffect(() => {
+        if (!currentUserId) return;
+        if (!isPresenceHidden) return;
+        dispatchPresence({ type: 'remove', userId: currentUserId });
+    }, [currentUserId, isPresenceHidden, dispatchPresence]);
+
+    useEffect(() => {
+        if (!currentUserId) return;
+        const applyPresence = async () => {
+            if (typeof (client as any).setPresence !== 'function') return;
+            try {
+                await (client as any).setPresence(isPresenceHidden ? 'offline' : 'online');
+            } catch (err) {
+                console.warn('Failed to apply presence preference', err);
+            }
+        };
+        void applyPresence();
+    }, [client, currentUserId, isPresenceHidden]);
+
+    useEffect(() => {
+        const onPresence = (event: MatrixEvent, user?: MatrixUser) => {
+            const content = event.getContent() as PresenceEventContent | undefined;
+            const sender = user?.userId ?? event.getSender?.() ?? (content?.user_id as string | undefined);
+            upsertPresence(sender, content);
+        };
+
+        client.on(UserEvent.Presence, onPresence as any);
+        return () => {
+            client.removeListener(UserEvent.Presence, onPresence as any);
+        };
+    }, [client, upsertPresence]);
     const [incomingCall, setIncomingCall] = useState<MatrixCall | null>(null);
     const [translatedMessages, setTranslatedMessages] = useState<Record<string, { text: string; isLoading: boolean }>>({});
     const [chatBackground, setChatBackground] = useState<string>('');
@@ -936,21 +1035,37 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
     }, [activeGroupCall]);
 
 
-    const participantViews = useMemo(() => groupParticipants.map(participant => ({
-        id: participant.userId,
-        name: participant.displayName ?? participant.userId,
-        isMuted: participant.isMuted,
-        isVideoMuted: participant.isVideoMuted,
-        isScreenSharing: participant.isScreensharing,
-        isCoWatching: participant.isCoWatching,
-        avatarUrl: participant.avatarUrl ?? null,
-        role: participant.role ?? 'participant',
-        isLocal: participant.userId === (client.getUserId() || ''),
-        lastActive: participant.lastActive,
-        stream: participant.stream ?? null,
-        screenshareStream: participant.screenshareStream ?? null,
-        dominant: Boolean(spotlightParticipantId && participant.userId === spotlightParticipantId),
-    })), [groupParticipants, client, spotlightParticipantId]);
+    const participantViews = useMemo(() => {
+        const roomForPresence = activeGroupCall
+            ? client.getRoom(activeGroupCall.roomId)
+            : selectedRoomId
+                ? client.getRoom(selectedRoomId)
+                : null;
+        const presenceAllowed = !isPresenceHidden && canSharePresenceInRoom(roomForPresence, currentUserId);
+        return groupParticipants.map(participant => {
+            const summary = presenceAllowed
+                ? describePresence(participant.userId, presenceState.get(participant.userId), client)
+                : undefined;
+            return {
+                id: participant.userId,
+                name: participant.displayName ?? participant.userId,
+                isMuted: participant.isMuted,
+                isVideoMuted: participant.isVideoMuted,
+                isScreenSharing: participant.isScreensharing,
+                isCoWatching: participant.isCoWatching,
+                avatarUrl: participant.avatarUrl ?? null,
+                role: participant.role ?? 'participant',
+                isLocal: participant.userId === (client.getUserId() || ''),
+                lastActive: participant.lastActive,
+                stream: participant.stream ?? null,
+                screenshareStream: participant.screenshareStream ?? null,
+                dominant: Boolean(spotlightParticipantId && participant.userId === spotlightParticipantId),
+                presenceSummary: summary
+                    ? { ...summary, formattedUserId: formatMatrixIdForDisplay(participant.userId) }
+                    : undefined,
+            };
+        });
+    }, [groupParticipants, client, spotlightParticipantId, activeGroupCall, selectedRoomId, presenceState, isPresenceHidden, currentUserId]);
 
     const handleSetChatBackground = (bgUrl: string) => {
         setChatBackground(bgUrl);
@@ -1478,7 +1593,7 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
     useEffect(() => {
         loadRooms();
 
-        const onSync = (state: string) => {
+        const onSync = (state: string, _prev?: string | null, data?: { presence?: { events?: Array<{ content?: PresenceEventContent; sender?: string }> } }) => {
             if (state === 'ERROR' || state === 'STOPPED') {
                 setIsOffline(true);
             } else if (state === 'SYNCING' || state === 'PREPARED') {
@@ -1490,6 +1605,22 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
                 if (selectedRoomId) {
                     loadRoomMessages(selectedRoomId);
                     loadPinnedMessage(selectedRoomId);
+                }
+            }
+
+            const presenceEvents = data?.presence?.events ?? [];
+            if (presenceEvents.length > 0) {
+                const updates = presenceEvents
+                    .map(event => {
+                        const userId = event?.sender ?? event?.content?.user_id;
+                        if (!userId || (isPresenceHidden && userId === currentUserId)) return null;
+                        const content = event?.content;
+                        if (!content) return null;
+                        return { userId, content: normalisePresenceContent(content) };
+                    })
+                    .filter((entry): entry is { userId: string; content: PresenceEventContent } => Boolean(entry));
+                if (updates.length > 0) {
+                    dispatchPresence({ type: 'bulk', updates });
                 }
             }
         };
@@ -1562,7 +1693,7 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
             setUserProfileVersion(v => v + 1);
         };
 
-        client.on(ClientEvent.Sync, onSync);
+        client.on(ClientEvent.Sync, onSync as any);
         client.on(RoomEvent.Timeline, onRoomEvent);
         client.on("Room.state" as any, onRoomStateEvent);
         client.on('Room.typing' as any, onTyping);
@@ -1571,7 +1702,7 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
         client.on(UserEvent.AvatarUrl, onUserProfileChange);
 
         return () => {
-            client.removeListener(ClientEvent.Sync, onSync);
+            client.removeListener(ClientEvent.Sync, onSync as any);
             client.removeListener(RoomEvent.Timeline, onRoomEvent);
             client.removeListener("Room.state" as any, onRoomStateEvent);
             client.removeListener('Room.typing' as any, onTyping);
@@ -1579,7 +1710,7 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
             client.removeListener(UserEvent.DisplayName, onUserProfileChange);
             client.removeListener(UserEvent.AvatarUrl, onUserProfileChange);
         };
-    }, [client, selectedRoomId, parseMatrixEvent, loadRoomMessages, activeThread, loadPinnedMessage, notificationsEnabled, savedMessagesRoomId, loadRooms]);
+    }, [client, selectedRoomId, parseMatrixEvent, loadRoomMessages, activeThread, loadPinnedMessage, notificationsEnabled, savedMessagesRoomId, loadRooms, isPresenceHidden, currentUserId, normalisePresenceContent, dispatchPresence]);
 
     useEffect(() => {
         const onCallIncoming = (call: MatrixCall) => {
@@ -2506,6 +2637,47 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
         ? Object.values(sharedMediaData.countsByCategory).reduce((acc, value) => acc + value, 0)
         : 0;
 
+    const roomPresenceSummaries = useMemo(() => {
+        const summaries = new Map<string, PresenceSummary>();
+        rooms.forEach(room => {
+            if (room.isHidden && appLockState.enabled && !appLockState.unlocked) {
+                summaries.set(room.roomId, buildHiddenPresenceSummary());
+                return;
+            }
+            if (!room.isDirectMessageRoom) return;
+            const matrixRoom = client.getRoom(room.roomId);
+            if (!matrixRoom) return;
+            if (isPresenceHidden) {
+                summaries.set(room.roomId, buildHiddenPresenceSummary());
+                return;
+            }
+            if (!canSharePresenceInRoom(matrixRoom, currentUserId)) {
+                summaries.set(room.roomId, buildRestrictedPresenceSummary());
+                return;
+            }
+            const joinedMembers = (matrixRoom.getJoinedMembers?.() ?? []) as Array<{ userId: string; name?: string; rawDisplayName?: string; user?: MatrixUser }>;
+            const counterpart = joinedMembers.find(member => member.userId !== currentUserId);
+            if (!counterpart) return;
+            const summary = describePresence(counterpart.userId, presenceState.get(counterpart.userId), client);
+            summaries.set(room.roomId, {
+                ...summary,
+                displayName: counterpart.user?.displayName ?? counterpart.name ?? counterpart.userId,
+                formattedUserId: formatMatrixIdForDisplay(counterpart.userId),
+            });
+        });
+        return summaries;
+    }, [rooms, appLockState.enabled, appLockState.unlocked, client, isPresenceHidden, currentUserId, presenceState]);
+
+    const selectedRoomPresence = selectedRoomId ? roomPresenceSummaries.get(selectedRoomId) : undefined;
+
+    const hasPresenceRestriction = useMemo(() => {
+        return rooms.some(room => {
+            const matrixRoom = client.getRoom(room.roomId);
+            if (!matrixRoom) return false;
+            return !canSharePresenceInRoom(matrixRoom, currentUserId);
+        });
+    }, [rooms, client, currentUserId]);
+
     return (
         <div className="flex h-screen">
             <RoomList
@@ -2535,6 +2707,7 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
                     setIsPinPromptOpen(true);
                 }}
                 isHiddenUnlocked={appLockState.unlocked || !appLockState.enabled}
+                presenceSummaries={roomPresenceSummaries}
             />
             <main
                 style={{ backgroundImage: chatBackground ? `url(${chatBackground})` : 'none' }}
@@ -2571,6 +2744,8 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
                             isHiddenRoom={selectedRoom.isHidden ?? false}
                             onToggleHiddenRoom={handleToggleHiddenRoom}
                             appLockEnabled={appLockState.enabled}
+                            presenceSummary={selectedRoomPresence}
+                            presenceHidden={isPresenceHidden}
                         />
                         {isSecureCloudActive && (
                             <div className="px-4 pt-3 space-y-3">
@@ -2800,6 +2975,9 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
                     onResetChatBackground={handleResetChatBackground}
                     sendKeyBehavior={sendKeyBehavior}
                     onSetSendKeyBehavior={handleSendKeyBehaviorChange}
+                    isPresenceHidden={isPresenceHidden}
+                    onSetPresenceHidden={setIsPresenceHidden}
+                    presenceRestricted={hasPresenceRestriction}
                 />
             )}
 
