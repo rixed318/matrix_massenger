@@ -772,7 +772,17 @@ const MessageInput: React.FC<MessageInputProps> = ({
                 <StickerGifPicker
                     onClose={() => setPickerOpen(false)}
                     onSendSticker={(sticker) => {
-                        onSendSticker(sticker);
+                        if (sticker.isCustomEmoji) {
+                            const shortcode = sticker.shortcodes?.[0] ?? sticker.body ?? '';
+                            setContent(prev => {
+                                const needsSpace = prev && !prev.endsWith(' ');
+                                const insertion = needsSpace ? `${prev} ${shortcode} ` : `${prev}${shortcode} `;
+                                return prev ? insertion : `${shortcode} `;
+                            });
+                            requestAnimationFrame(() => inputRef.current?.focus());
+                        } else {
+                            onSendSticker(sticker);
+                        }
                         setPickerOpen(false);
                     }}
                     onSendGif={(gif) => {

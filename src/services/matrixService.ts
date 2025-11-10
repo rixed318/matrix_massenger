@@ -185,6 +185,455 @@ const setContentPath = (target: any, path: string | undefined, value: any) => {
     current[segments[segments.length - 1]] = value;
 };
 
+// ===== Sticker pack management (MSC2545) =====
+
+type StickerPackListener = (state: StickerLibraryState) => void;
+
+const STICKER_PACK_EVENT_TYPES = ['m.stickerpack', 'org.matrix.msc2545.stickerpack'];
+const STICKER_FAVORITES_STORAGE_KEY = 'econix.stickers.favorites';
+const STICKER_ENABLED_STORAGE_KEY = 'econix.stickers.enabled';
+
+const stickerPackCache = new Map<string, StickerPack>();
+const stickerPackFingerprints = new Map<string, string>();
+const stickerPackListeners = new Set<StickerPackListener>();
+let stickerFavorites = new Set<string>();
+let enabledStickerPacks = new Set<string>();
+let stickerWatcherCleanup: (() => void) | null = null;
+
+const readStringSet = (storageKey: string): Set<string> => {
+    try {
+        const storage = (globalThis as any).localStorage;
+        if (!storage) return new Set();
+        const raw = storage.getItem(storageKey);
+        if (!raw) return new Set();
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+            return new Set(parsed.filter(item => typeof item === 'string'));
+        }
+    } catch (err) {
+        console.warn('Failed to read sticker storage', storageKey, err);
+    }
+    return new Set();
+};
+
+const writeStringSet = (storageKey: string, values: Set<string>) => {
+    try {
+        const storage = (globalThis as any).localStorage;
+        if (!storage) return;
+        storage.setItem(storageKey, JSON.stringify(Array.from(values)));
+    } catch (err) {
+        console.warn('Failed to persist sticker storage', storageKey, err);
+    }
+};
+
+const ensureStickerPreferencesLoaded = () => {
+    if (stickerFavorites.size === 0 && enabledStickerPacks.size === 0) {
+        stickerFavorites = readStringSet(STICKER_FAVORITES_STORAGE_KEY);
+        enabledStickerPacks = readStringSet(STICKER_ENABLED_STORAGE_KEY);
+    }
+};
+
+const makePackId = (source: StickerPack['source'], baseId: string, roomId?: string, userId?: string) => {
+    switch (source) {
+        case 'room':
+            return `room:${roomId ?? 'unknown'}:${baseId}`;
+        case 'user':
+            return `user:${userId ?? 'unknown'}:${baseId}`;
+        case 'account_data':
+            return `account:${baseId}`;
+        case 'local':
+        default:
+            return baseId.startsWith('local') ? baseId : `local:${baseId}`;
+    }
+};
+
+const assignStickerDefaults = (packId: string, pack: StickerPack): StickerPack => {
+    const stickers = (pack.stickers ?? []).map((sticker, index) => {
+        const id = sticker.id || `${packId}/sticker/${index}`;
+        const body = sticker.body || sticker.shortcodes?.[0] || sticker.emoji?.[0] || 'Sticker';
+        const isCustomEmoji = sticker.isCustomEmoji ?? !!pack.isEmojiPack;
+        return {
+            ...sticker,
+            id,
+            body,
+            packId,
+            isCustomEmoji,
+        } as Sticker;
+    });
+    return {
+        ...pack,
+        stickers,
+    };
+};
+
+const fingerprintStickerPack = (pack: StickerPack): string => {
+    return JSON.stringify({
+        name: pack.name,
+        description: pack.description,
+        avatarUrl: pack.avatarUrl,
+        attribution: pack.attribution,
+        isEmojiPack: pack.isEmojiPack,
+        source: pack.source,
+        stickers: pack.stickers.map(sticker => ({
+            id: sticker.id,
+            url: sticker.url,
+            body: sticker.body,
+            info: sticker.info,
+            emoji: sticker.emoji,
+            shortcodes: sticker.shortcodes,
+            isCustomEmoji: sticker.isCustomEmoji,
+        })),
+    });
+};
+
+const notifyStickerListeners = () => {
+    const state = getStickerLibraryState();
+    stickerPackListeners.forEach(listener => {
+        try {
+            listener(state);
+        } catch (err) {
+            console.warn('Sticker pack listener threw', err);
+        }
+    });
+};
+
+const persistStickerEnabled = () => writeStringSet(STICKER_ENABLED_STORAGE_KEY, enabledStickerPacks);
+const persistStickerFavorites = () => writeStringSet(STICKER_FAVORITES_STORAGE_KEY, stickerFavorites);
+
+const upsertStickerPack = (pack: StickerPack) => {
+    ensureStickerPreferencesLoaded();
+    const normalised = assignStickerDefaults(pack.id, pack);
+    if (normalised.isEnabled === undefined) {
+        normalised.isEnabled = normalised.source === 'local' || enabledStickerPacks.has(normalised.id);
+    }
+
+    if (normalised.isEnabled) {
+        enabledStickerPacks.add(normalised.id);
+    } else {
+        enabledStickerPacks.delete(normalised.id);
+    }
+
+    const fingerprint = fingerprintStickerPack(normalised);
+    const current = stickerPackFingerprints.get(normalised.id);
+    const existing = stickerPackCache.get(normalised.id);
+    if (existing && current === fingerprint && existing.isEnabled === normalised.isEnabled) {
+        return;
+    }
+
+    stickerPackFingerprints.set(normalised.id, fingerprint);
+    stickerPackCache.set(normalised.id, { ...normalised, lastUpdated: Date.now() });
+    persistStickerEnabled();
+    notifyStickerListeners();
+};
+
+const removeStickerPack = (packId: string) => {
+    const removed = stickerPackCache.delete(packId);
+    stickerPackFingerprints.delete(packId);
+    if (removed) {
+        enabledStickerPacks.delete(packId);
+        const before = stickerFavorites.size;
+        stickerFavorites = new Set(Array.from(stickerFavorites).filter(key => !key.startsWith(`${packId}/`)));
+        if (stickerFavorites.size !== before) {
+            persistStickerFavorites();
+        }
+        persistStickerEnabled();
+        notifyStickerListeners();
+    }
+};
+
+const mapStickerEntries = (stickers: any): any[] => {
+    if (!stickers) return [];
+    if (Array.isArray(stickers)) return stickers;
+    if (typeof stickers === 'object') {
+        return Object.entries(stickers).map(([id, value]) => ({ id, ...(value as any) }));
+    }
+    return [];
+};
+
+const buildStickerPackFromContent = (
+    client: MatrixClient,
+    source: StickerPack['source'],
+    baseId: string,
+    content: any,
+    meta: { roomId?: string; userId?: string } = {},
+): StickerPack | null => {
+    if (!content || typeof content !== 'object') {
+        return null;
+    }
+
+    const packContent = content.pack && typeof content.pack === 'object' ? content.pack : content;
+    const name = packContent.displayname || packContent.name || content.name || baseId || 'Stickers';
+    const description = packContent.description || packContent.short_description || content.description;
+    const attribution = packContent.attribution || content.attribution;
+    const avatarUrlRaw = packContent.avatar_url || content.avatar_url || null;
+    const avatarUrl = avatarUrlRaw ? mxcToHttp(client, avatarUrlRaw) : null;
+    const isEmojiPack = Boolean(packContent.is_emojipack ?? content.is_emojipack);
+    const enabled = packContent.enabled ?? content.enabled;
+    const stickersRaw = content.stickers ?? content.images ?? packContent.stickers;
+    const stickers = mapStickerEntries(stickersRaw).map((entry: any, index: number) => {
+        const url = entry.url || entry.image || entry.file?.url || entry.mxc || entry.mxc_url;
+        if (!url) return null;
+        const info = entry.info || {
+            w: entry.w,
+            h: entry.h,
+            mimetype: entry.mimetype,
+            size: entry.size,
+        };
+        const shortcodes: string[] | undefined = entry.shortcodes
+            ? Array.isArray(entry.shortcodes) ? entry.shortcodes : [entry.shortcodes]
+            : entry.shortcode ? [entry.shortcode] : undefined;
+        const emoji: string[] | undefined = entry.emoji
+            ? Array.isArray(entry.emoji) ? entry.emoji : [entry.emoji]
+            : entry.emoticon ? [entry.emoticon] : undefined;
+        return {
+            id: entry.id || entry.guid || entry.shortcode || `sticker_${index}`,
+            body: entry.body || shortcodes?.[0] || emoji?.[0] || `Sticker ${index + 1}`,
+            url: mxcToHttp(client, url) ?? url,
+            info,
+            emoji,
+            shortcodes,
+            isCustomEmoji: entry.is_custom_emoji,
+        } as Sticker;
+    }).filter((sticker: Sticker | null): sticker is Sticker => Boolean(sticker?.url));
+
+    const packId = makePackId(source, baseId, meta.roomId, meta.userId);
+
+    const pack: StickerPack = {
+        id: packId,
+        name,
+        description,
+        avatarUrl,
+        attribution,
+        isEmojiPack,
+        source,
+        roomId: meta.roomId,
+        creatorUserId: meta.userId,
+        stickers,
+    };
+
+    if (enabled !== undefined) {
+        pack.isEnabled = Boolean(enabled);
+    }
+
+    if (stickers.length === 0 && enabled === false) {
+        removeStickerPack(packId);
+        return null;
+    }
+
+    return pack;
+};
+
+const extractAccountDataPacks = (content: any): Array<{ id: string; content: any }> => {
+    if (!content || typeof content !== 'object') return [];
+    const packs: Array<{ id: string; content: any }> = [];
+    if (Array.isArray(content.packs)) {
+        content.packs.forEach((item: any, index: number) => {
+            if (item && typeof item === 'object') {
+                packs.push({ id: item.id || `pack_${index}`, content: item });
+            }
+        });
+    }
+    if (content.packs && typeof content.packs === 'object' && !Array.isArray(content.packs)) {
+        Object.entries(content.packs).forEach(([id, value]) => {
+            if (value && typeof value === 'object') {
+                packs.push({ id, content: value });
+            }
+        });
+    }
+    if (packs.length === 0) {
+        packs.push({ id: content.id || content.pack_id || 'default', content });
+    }
+    return packs;
+};
+
+const handleStickerAccountData = (client: MatrixClient, event: MatrixEvent) => {
+    try {
+        const content = event.getContent?.() ?? {};
+        extractAccountDataPacks(content).forEach(({ id, content: packContent }) => {
+            const pack = buildStickerPackFromContent(client, 'account_data', id, packContent, {
+                userId: client.getUserId() || undefined,
+            });
+            if (pack) {
+                upsertStickerPack(pack);
+            }
+        });
+    } catch (err) {
+        console.warn('Failed to handle sticker account data', err);
+    }
+};
+
+const attachRoomStickerWatcher = (client: MatrixClient, room: MatrixRoom) => {
+    const roomId = room.roomId;
+    const existingCleanup = (room as any).__econixStickerCleanup as (() => void) | undefined;
+    existingCleanup?.();
+
+    const processEvent = (event: MatrixEvent) => {
+        if (!STICKER_PACK_EVENT_TYPES.includes(event.getType())) return;
+        const stateKey = typeof (event as any).getStateKey === 'function' ? (event as any).getStateKey() : undefined;
+        const packId = stateKey || event.getId?.() || 'default';
+        const pack = buildStickerPackFromContent(client, 'room', packId, event.getContent(), { roomId });
+        if (pack) {
+            upsertStickerPack(pack);
+        }
+    };
+
+    const currentState = (room as any).currentState;
+    if (currentState?.getStateEvents) {
+        STICKER_PACK_EVENT_TYPES.forEach(type => {
+            const events = currentState.getStateEvents(type);
+            if (Array.isArray(events)) {
+                events.forEach(ev => ev && processEvent(ev));
+            } else if (events) {
+                processEvent(events);
+            }
+        });
+    }
+
+    room.on(RoomEvent.State, processEvent as any);
+
+    const cleanup = () => {
+        room.removeListener(RoomEvent.State, processEvent as any);
+        const idsToRemove = Array.from(stickerPackCache.values())
+            .filter(pack => pack.source === 'room' && pack.roomId === roomId)
+            .map(pack => pack.id);
+        idsToRemove.forEach(removeStickerPack);
+    };
+
+    (room as any).__econixStickerCleanup = cleanup;
+};
+
+const detachRoomStickerWatcher = (room: MatrixRoom) => {
+    const cleanup = (room as any).__econixStickerCleanup as (() => void) | undefined;
+    if (cleanup) {
+        cleanup();
+        delete (room as any).__econixStickerCleanup;
+    }
+};
+
+export const registerLocalStickerPacks = (packs: StickerPack[]): void => {
+    ensureStickerPreferencesLoaded();
+    packs.forEach(pack => {
+        const id = pack.id || makePackId('local', pack.name || 'local');
+        const merged: StickerPack = {
+            ...pack,
+            id,
+            source: 'local',
+            isEnabled: true,
+        };
+        upsertStickerPack(merged);
+    });
+    persistStickerEnabled();
+};
+
+export const getStickerLibraryState = (): StickerLibraryState => {
+    ensureStickerPreferencesLoaded();
+    const packs = Array.from(stickerPackCache.values()).sort((a, b) => {
+        const aEnabled = a.isEnabled ? 1 : 0;
+        const bEnabled = b.isEnabled ? 1 : 0;
+        if (aEnabled !== bEnabled) {
+            return bEnabled - aEnabled;
+        }
+        return a.name.localeCompare(b.name);
+    });
+    return {
+        packs,
+        favorites: Array.from(stickerFavorites),
+        enabledPackIds: Array.from(enabledStickerPacks),
+    };
+};
+
+export const subscribeStickerLibrary = (listener: StickerPackListener): (() => void) => {
+    ensureStickerPreferencesLoaded();
+    stickerPackListeners.add(listener);
+    try {
+        listener(getStickerLibraryState());
+    } catch (err) {
+        console.warn('Sticker listener initial emit failed', err);
+    }
+    return () => {
+        stickerPackListeners.delete(listener);
+    };
+};
+
+export const setStickerPackEnabled = (packId: string, enabled: boolean): void => {
+    ensureStickerPreferencesLoaded();
+    if (enabled) {
+        enabledStickerPacks.add(packId);
+    } else {
+        enabledStickerPacks.delete(packId);
+    }
+    const pack = stickerPackCache.get(packId);
+    if (pack) {
+        stickerPackCache.set(packId, { ...pack, isEnabled: enabled });
+    }
+    persistStickerEnabled();
+    notifyStickerListeners();
+};
+
+export const toggleStickerFavorite = (packId: string, stickerId: string, favorite?: boolean): boolean => {
+    ensureStickerPreferencesLoaded();
+    const key = `${packId}/${stickerId}`;
+    const shouldFavorite = favorite ?? !stickerFavorites.has(key);
+    if (shouldFavorite) {
+        stickerFavorites.add(key);
+    } else {
+        stickerFavorites.delete(key);
+    }
+    persistStickerFavorites();
+    notifyStickerListeners();
+    return shouldFavorite;
+};
+
+export const bindStickerPackWatcher = (client: MatrixClient): void => {
+    ensureStickerPreferencesLoaded();
+    stickerWatcherCleanup?.();
+
+    const handleAccountData = (event: MatrixEvent) => {
+        if (STICKER_PACK_EVENT_TYPES.includes(event.getType())) {
+            handleStickerAccountData(client, event);
+        }
+    };
+
+    const handleRoom = (room: MatrixRoom) => {
+        attachRoomStickerWatcher(client, room);
+    };
+
+    const rooms = client.getRooms?.();
+    if (Array.isArray(rooms)) {
+        rooms.forEach(room => attachRoomStickerWatcher(client, room));
+    }
+
+    client.on(ClientEvent.AccountData as any, handleAccountData as any);
+    client.on(ClientEvent.Room as any, handleRoom as any);
+
+    stickerWatcherCleanup = () => {
+        client.removeListener(ClientEvent.AccountData as any, handleAccountData as any);
+        client.removeListener(ClientEvent.Room as any, handleRoom as any);
+        const allRooms = client.getRooms?.();
+        if (Array.isArray(allRooms)) {
+            allRooms.forEach(detachRoomStickerWatcher);
+        }
+        stickerWatcherCleanup = null;
+    };
+
+    notifyStickerListeners();
+};
+
+export const __resetStickerLibraryForTests = () => {
+    if (typeof process !== 'undefined' && process.env?.NODE_ENV !== 'test') {
+        console.warn('__resetStickerLibraryForTests should only be used in tests.');
+    }
+    stickerWatcherCleanup?.();
+    stickerWatcherCleanup = null;
+    stickerPackCache.clear();
+    stickerPackFingerprints.clear();
+    stickerPackListeners.clear();
+    stickerFavorites = new Set();
+    enabledStickerPacks = new Set();
+    persistStickerEnabled();
+    persistStickerFavorites();
+};
+
 let _boundClient: MatrixClient | null = null;
 let _isSyncing = false;
 
@@ -849,6 +1298,11 @@ const bootstrapAuthenticatedClient = async (client: MatrixClient, secureProfile?
         bindSelfDestructWatcher(client);
     } catch (e) {
         console.warn('bindSelfDestructWatcher failed', e);
+    }
+    try {
+        bindStickerPackWatcher(client);
+    } catch (e) {
+        console.warn('bindStickerPackWatcher failed', e);
     }
     if (secureProfile) {
         setSecureCloudProfileForClient(client, secureProfile);
@@ -2487,13 +2941,25 @@ export const sendFileMessage = async (client: MatrixClient, roomId: string, file
     }
 };
 
-export const sendStickerMessage = async (client: MatrixClient, roomId: string, stickerUrl: string, body: string, info: Sticker['info']): Promise<{ event_id: string }> => {
-    const content = {
+export const sendStickerMessage = async (
+    client: MatrixClient,
+    roomId: string,
+    stickerUrl: string,
+    body: string,
+    info: Sticker['info'],
+): Promise<{ event_id: string }> => {
+    const safeInfo = info ? { ...info } : {};
+    if (safeInfo && typeof safeInfo.mimetype === 'number') {
+        safeInfo.mimetype = String(safeInfo.mimetype);
+    }
+    const content: Record<string, any> = {
         body,
-        info,
         url: stickerUrl,
         msgtype: 'm.sticker',
     };
+    if (safeInfo && Object.keys(safeInfo).length > 0) {
+        content.info = safeInfo;
+    }
     // The matrix-js-sdk doesn't have m.sticker in its standard event types, so we cast to any.
     if (isOffline()) {
         const localId = await enqueueOutbox(roomId, 'm.sticker', content);
