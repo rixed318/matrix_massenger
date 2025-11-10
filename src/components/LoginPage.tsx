@@ -1,5 +1,5 @@
 import React, { useState, FormEvent, useEffect } from 'react';
-import type { MatrixClient, SecureCloudProfile } from '@matrix-messenger/core';
+import type { MatrixClient, SecureCloudProfile, SecureCloudDetector } from '@matrix-messenger/core';
 import {
   login,
   resolveHomeserverBaseUrl,
@@ -7,6 +7,7 @@ import {
   register as registerAccount,
   TotpRequiredError,
   type LoginOptions,
+  getSecureCloudDetectorCatalog,
 } from '@matrix-messenger/core';
 import ServerDeploymentWizard from './ServerDeploymentWizard';
 import { useAccountStore } from '../services/accountManager';
@@ -78,6 +79,22 @@ const LoginForm: React.FC<{
 
 
   // Secure Cloud controls
+  const detectorCatalog = React.useMemo<SecureCloudDetector[]>(() => {
+    try {
+      return getSecureCloudDetectorCatalog().filter((detector) => detector.type === 'ml' || detector.type === 'llm');
+    } catch {
+      return [];
+    }
+  }, []);
+  const defaultModelMapping = React.useMemo<Record<string, string>>(() => {
+    const mapping: Record<string, string> = {};
+    detectorCatalog.forEach((detector) => {
+      if (Array.isArray(detector.models) && detector.models.length > 0) {
+        mapping[detector.id] = detector.models[0].id;
+      }
+    });
+    return mapping;
+  }, [detectorCatalog]);
   const [useSecureCloud, setUseSecureCloud] = useState(connectionType === 'secure');
   const [secureApiUrl, setSecureApiUrl] = useState(getDefaultHomeserver(connectionType));
   const [metadataToken, setMetadataToken] = useState('');
@@ -85,6 +102,10 @@ const LoginForm: React.FC<{
   const [enableAnalytics, setEnableAnalytics] = useState(false);
   const [analyticsToken, setAnalyticsToken] = useState('');
   const [riskThreshold, setRiskThreshold] = useState('0.6');
+  const [retentionDays, setRetentionDays] = useState('30');
+  const [selectedModels, setSelectedModels] = useState<Record<string, string>>(defaultModelMapping);
+  const [userSensitivity, setUserSensitivity] = useState<'low' | 'medium' | 'high'>('medium');
+  const [organizationSensitivity, setOrganizationSensitivity] = useState<'low' | 'medium' | 'high'>('medium');
 
   // Reset form fields when connection type changes
   useEffect(() => {
@@ -98,8 +119,12 @@ const LoginForm: React.FC<{
     setEnableAnalytics(false);
     setAnalyticsToken('');
     setRiskThreshold('0.6');
+    setRetentionDays('30');
+    setSelectedModels(defaultModelMapping);
+    setUserSensitivity('medium');
+    setOrganizationSensitivity('medium');
     onResetTotp();
-  }, [connectionType]);
+  }, [connectionType, defaultModelMapping, onResetTotp]);
 
   // Load saved Secure Cloud settings on mount or connectionType change.
   // Ignore for public servers.
@@ -113,6 +138,16 @@ const LoginForm: React.FC<{
       if (typeof data !== 'object' || data === null) return;
       const getBool = (v, d=false) => typeof v === 'boolean' ? v : d;
       const getStr = (v, d='') => typeof v === 'string' ? v : d;
+      const parseSensitivity = (value: unknown): 'low' | 'medium' | 'high' => {
+        if (value === 'low' || value === 'medium' || value === 'high') return value;
+        if (typeof value === 'string') {
+          const lowered = value.toLowerCase();
+          if (lowered === 'low' || lowered === 'medium' || lowered === 'high') {
+            return lowered as 'low' | 'medium' | 'high';
+          }
+        }
+        return 'medium';
+      };
       const next = {
         useSecureCloud: getBool(data.useSecureCloud, connectionType === 'secure'),
         secureApiUrl: getStr(data.secureApiUrl, getDefaultHomeserver(connectionType)),
@@ -125,6 +160,25 @@ const LoginForm: React.FC<{
           if (typeof data.riskThreshold === 'string' && data.riskThreshold.trim()) return data.riskThreshold.trim();
           return '0.6';
         })(),
+        retentionDays: (() => {
+          if (typeof data.retentionDays === 'number' && Number.isFinite(data.retentionDays)) {
+            return String(data.retentionDays);
+          }
+          if (typeof data.retentionDays === 'string' && data.retentionDays.trim()) {
+            return data.retentionDays.trim();
+          }
+          return '30';
+        })(),
+        selectedModels: (() => {
+          if (typeof data.selectedModels === 'object' && data.selectedModels) {
+            const entries = Object.entries(data.selectedModels as Record<string, unknown>)
+              .filter(([key, value]) => typeof key === 'string' && typeof value === 'string');
+            return Object.fromEntries(entries) as Record<string, string>;
+          }
+          return {} as Record<string, string>;
+        })(),
+        userSensitivity: parseSensitivity((data as any).userSensitivity),
+        organizationSensitivity: parseSensitivity((data as any).organizationSensitivity),
       };
       setUseSecureCloud(next.useSecureCloud);
       setSecureApiUrl(next.secureApiUrl);
@@ -133,14 +187,21 @@ const LoginForm: React.FC<{
       setEnableAnalytics(next.enableAnalytics);
       setAnalyticsToken(next.analyticsToken);
       setRiskThreshold(next.riskThreshold);
+      setRetentionDays(next.retentionDays);
+      setSelectedModels({ ...defaultModelMapping, ...next.selectedModels });
+      setUserSensitivity(next.userSensitivity);
+      setOrganizationSensitivity(next.organizationSensitivity);
     } catch {
       // Ignore malformed JSON
     }
-  }, [connectionType]);
+  }, [connectionType, defaultModelMapping]);
 
   // Persist settings when they change. Skip for public servers.
   useEffect(() => {
     if (connectionType === 'public') return;
+    const persistedModels = Object.fromEntries(
+      Object.entries(selectedModels).filter(([_, value]) => typeof value === 'string' && value.length > 0),
+    );
     const payload = {
       useSecureCloud,
       secureApiUrl,
@@ -149,19 +210,26 @@ const LoginForm: React.FC<{
       enableAnalytics,
       analyticsToken,
       riskThreshold,
+      retentionDays,
+      selectedModels: persistedModels,
+      userSensitivity,
+      organizationSensitivity,
     };
     try {
       localStorage.setItem('secure-cloud-settings', JSON.stringify(payload));
     } catch {
       // Storage may be unavailable (private mode). Ignore.
     }
-  }, [connectionType, useSecureCloud, secureApiUrl, metadataToken, enablePremium, enableAnalytics, analyticsToken, riskThreshold]);
+  }, [connectionType, useSecureCloud, secureApiUrl, metadataToken, enablePremium, enableAnalytics, analyticsToken, riskThreshold, retentionDays, selectedModels, userSensitivity, organizationSensitivity]);
 
 
   
   // Persist current Secure Cloud settings to localStorage
   function persistSecureSettings() {
     if (connectionType === 'public') return;
+    const persistedModels = Object.fromEntries(
+      Object.entries(selectedModels).filter(([_, value]) => typeof value === 'string' && value.length > 0),
+    );
     const payload = {
       useSecureCloud,
       secureApiUrl,
@@ -170,6 +238,10 @@ const LoginForm: React.FC<{
       enableAnalytics,
       analyticsToken,
       riskThreshold,
+      retentionDays,
+      selectedModels: persistedModels,
+      userSensitivity,
+      organizationSensitivity,
     };
     try {
       localStorage.setItem('secure-cloud-settings', JSON.stringify(payload));
@@ -181,6 +253,13 @@ const handleSubmit = (e: FormEvent) => {
     const normalisedThreshold = Number.isFinite(thresholdValue)
       ? Math.min(1, Math.max(0, thresholdValue))
       : 0.6;
+    const retentionValue = (() => {
+      const parsed = Number.parseInt(retentionDays, 10);
+      return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
+    })();
+    const modelOverrides = Object.fromEntries(
+      Object.entries(selectedModels).filter(([_, value]) => typeof value === 'string' && value.length > 0),
+    );
 
     const shouldAttachSecure = connectionType === 'secure' || useSecureCloud;
     const secureProfile: SecureCloudProfile | undefined = shouldAttachSecure
@@ -192,6 +271,10 @@ const handleSubmit = (e: FormEvent) => {
           enablePremium,
           enableAnalytics,
           riskThreshold: normalisedThreshold,
+          retentionPeriodDays: retentionValue,
+          detectorModels: Object.keys(modelOverrides).length > 0 ? modelOverrides : undefined,
+          userSensitivity,
+          organizationSensitivity,
         }
       : undefined;
 
@@ -380,6 +463,77 @@ const handleSubmit = (e: FormEvent) => {
                     onChange={(e) => setRiskThreshold(e.target.value)}
                   />
                 </div>
+                <div>
+                  <label htmlFor="retention-days" className="block text-xs font-medium text-text-secondary uppercase">Политика хранения предупреждений</label>
+                  <select
+                    id="retention-days"
+                    name="retention-days"
+                    className="mt-1 block w-full rounded-md border border-border-primary bg-bg-secondary px-3 py-2 text-sm text-text-primary focus:outline-none focus:ring-ring-focus focus:border-ring-focus"
+                    value={retentionDays}
+                    onChange={(e) => setRetentionDays(e.target.value)}
+                  >
+                    <option value="0">Не хранить</option>
+                    <option value="7">7 дней</option>
+                    <option value="30">30 дней</option>
+                    <option value="90">90 дней</option>
+                    <option value="180">180 дней</option>
+                  </select>
+                </div>
+                <div className="grid gap-2 md:grid-cols-2">
+                  <div>
+                    <label htmlFor="user-sensitivity" className="block text-xs font-medium text-text-secondary uppercase">Чувствительность пользователя</label>
+                    <select
+                      id="user-sensitivity"
+                      className="mt-1 block w-full rounded-md border border-border-primary bg-bg-secondary px-3 py-2 text-sm text-text-primary focus:outline-none focus:ring-ring-focus focus:border-ring-focus"
+                      value={userSensitivity}
+                      onChange={(e) => setUserSensitivity(e.target.value as 'low' | 'medium' | 'high')}
+                    >
+                      <option value="low">Низкая</option>
+                      <option value="medium">Средняя</option>
+                      <option value="high">Высокая</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label htmlFor="org-sensitivity" className="block text-xs font-medium text-text-secondary uppercase">Чувствительность организации</label>
+                    <select
+                      id="org-sensitivity"
+                      className="mt-1 block w-full rounded-md border border-border-primary bg-bg-secondary px-3 py-2 text-sm text-text-primary focus:outline-none focus:ring-ring-focus focus:border-ring-focus"
+                      value={organizationSensitivity}
+                      onChange={(e) => setOrganizationSensitivity(e.target.value as 'low' | 'medium' | 'high')}
+                    >
+                      <option value="low">Низкая</option>
+                      <option value="medium">Средняя</option>
+                      <option value="high">Высокая</option>
+                    </select>
+                  </div>
+                </div>
+                {detectorCatalog.length > 0 && (
+                  <div className="space-y-2">
+                    <p className="text-xs font-semibold uppercase text-text-secondary">Модели детекторов</p>
+                    {detectorCatalog.map((detector) => (
+                      <div key={detector.id} className="space-y-1">
+                        <label className="block text-xs font-medium text-text-secondary uppercase" htmlFor={`detector-model-${detector.id}`}>
+                          {detector.displayName}
+                        </label>
+                        <select
+                          id={`detector-model-${detector.id}`}
+                          className="block w-full rounded-md border border-border-primary bg-bg-secondary px-3 py-2 text-sm text-text-primary focus:outline-none focus:ring-ring-focus focus:border-ring-focus"
+                          value={selectedModels[detector.id] ?? ''}
+                          onChange={(e) => setSelectedModels((prev) => ({ ...prev, [detector.id]: e.target.value }))}
+                        >
+                          {(detector.models ?? []).map((model) => (
+                            <option key={model.id} value={model.id}>
+                              {model.label} ({model.provider})
+                            </option>
+                          ))}
+                          {(!detector.models || detector.models.length === 0) && (
+                            <option value="">Нет доступных моделей</option>
+                          )}
+                        </select>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             )}
           </div>

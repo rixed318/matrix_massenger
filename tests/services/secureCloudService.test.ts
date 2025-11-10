@@ -208,5 +208,64 @@ describe('startSecureCloudSession detector aggregation', () => {
             (globalThis as any).fetch = originalFetch;
         }
     });
+
+    it('incorporates attachment OCR signals into ML scoring', async () => {
+        const modelDefinition = readFileSync(
+            resolvePath(__dirname, '../../src/assets/secure-cloud/lite-model.json'),
+            'utf-8',
+        );
+        const originalFetch = globalThis.fetch;
+        const mockFetch = vi.fn(async (input: RequestInfo | URL) => {
+            const urlString = typeof input === 'string' ? input : input instanceof URL ? input.href : '';
+            if (urlString.includes('lite-model.json')) {
+                return new Response(modelDefinition, {
+                    headers: { 'Content-Type': 'application/json' },
+                });
+            }
+            if (typeof originalFetch === 'function') {
+                return originalFetch(input as any);
+            }
+            throw new Error(`Unexpected fetch call for ${urlString}`);
+        });
+        (globalThis as any).fetch = mockFetch as any;
+
+        const notices: SuspiciousEventNotice[] = [];
+        const profile: SecureCloudProfile = {
+            mode: 'managed',
+            apiBaseUrl: '',
+            enablePremium: true,
+            riskThreshold: 0.5,
+            userSensitivity: 'medium',
+        };
+
+        const session = startSecureCloudSession(client, normaliseSecureCloudProfile(profile), {
+            onSuspiciousEvent: notice => notices.push(notice),
+        });
+
+        const eventWithAttachment = createMatrixEvent('$ml-attachment', 'FREE bonus verify account now');
+        (eventWithAttachment as any).getContent = () => ({
+            body: 'FREE bonus verify your account now',
+            msgtype: 'm.text',
+            file: {
+                id: 'file1',
+                url: 'mxc://example.org/file1',
+                hashes: { sha256: 'deadbeef' },
+                info: { ocr: 'Подозрительный счёт на оплату' },
+            },
+            info: { mimetype: 'image/png' },
+        });
+
+        emitTimeline(eventWithAttachment);
+
+        await new Promise(resolve => setTimeout(resolve, 40));
+
+        expect(notices).toHaveLength(1);
+        const reasons = notices[0].reasons;
+        expect(reasons.some(reason => reason.includes('ml_attachment_ocr'))).toBe(true);
+        expect(notices[0].keywords.some(keyword => keyword === 'attachment#file1')).toBe(true);
+
+        session.stop();
+        (globalThis as any).fetch = originalFetch;
+    });
 });
 

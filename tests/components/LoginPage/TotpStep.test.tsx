@@ -23,6 +23,14 @@ vi.mock('@matrix-messenger/core', () => {
     register: vi.fn(),
     HomeserverDiscoveryError,
     TotpRequiredError,
+    getSecureCloudDetectorCatalog: vi.fn(() => [
+      {
+        id: 'secure-cloud-lite-ml',
+        displayName: 'Локальная ML модель (lite)',
+        type: 'ml',
+        models: [{ id: 'lite-json', label: 'Lite JSON', provider: 'onnx' }],
+      },
+    ]),
   };
 });
 

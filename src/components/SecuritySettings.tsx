@@ -26,9 +26,11 @@ import {
   subscribeSecureCloudAggregatedStats,
   setSecureCloudRetentionPolicy,
   SECURE_CLOUD_RETENTION_BUCKETS,
+  getSecureCloudDetectorCatalog,
   type SecureCloudAggregatedStats,
   type SecureCloudLogFormat,
   type SecureCloudProfile,
+  type SecureCloudDetector,
 } from '../services/secureCloudService';
 
 interface SecuritySettingsProps {
@@ -135,6 +137,26 @@ const SecuritySettings: React.FC<SecuritySettingsProps> = ({ client, isOpen, onC
   const [secureCloudMetadataConsent, setSecureCloudMetadataConsent] = useState(true);
   const [secureCloudRetentionDays, setSecureCloudRetentionDays] = useState<number>(30);
   const [secureCloudExportFormat, setSecureCloudExportFormat] = useState<SecureCloudLogFormat>('json');
+  const [secureCloudPremiumEnabled, setSecureCloudPremiumEnabled] = useState(false);
+  const [secureCloudUserSensitivity, setSecureCloudUserSensitivity] = useState<'low' | 'medium' | 'high'>('medium');
+  const [secureCloudOrgSensitivity, setSecureCloudOrgSensitivity] = useState<'low' | 'medium' | 'high'>('medium');
+  const [secureCloudModelOverrides, setSecureCloudModelOverrides] = useState<Record<string, string>>({});
+  const secureCloudDetectorCatalog = useMemo<SecureCloudDetector[]>(() => {
+    try {
+      return getSecureCloudDetectorCatalog().filter((detector) => detector.type === 'ml' || detector.type === 'llm');
+    } catch {
+      return [];
+    }
+  }, []);
+  const secureCloudDefaultModels = useMemo<Record<string, string>>(() => {
+    const mapping: Record<string, string> = {};
+    secureCloudDetectorCatalog.forEach((detector) => {
+      if (Array.isArray(detector.models) && detector.models.length > 0) {
+        mapping[detector.id] = detector.models[0].id;
+      }
+    });
+    return mapping;
+  }, [secureCloudDetectorCatalog]);
   const isTauriRuntime = typeof window !== 'undefined' && Boolean((window as any).__TAURI__);
 
   const refreshAppLock = useCallback(async () => {
@@ -298,11 +320,36 @@ const SecuritySettings: React.FC<SecuritySettingsProps> = ({ client, isOpen, onC
     }
     let active = true;
     const profile = getSecureCloudProfileForClient(client);
+    const parseSensitivity = (value: unknown): 'low' | 'medium' | 'high' => {
+      if (value === 'low' || value === 'medium' || value === 'high') return value;
+      if (typeof value === 'string') {
+        const lowered = value.toLowerCase();
+        if (lowered === 'low' || lowered === 'medium' || lowered === 'high') {
+          return lowered as 'low' | 'medium' | 'high';
+        }
+      }
+      if (typeof value === 'number') {
+        if (value <= 0.25) return 'low';
+        if (value >= 0.75) return 'high';
+      }
+      return 'medium';
+    };
     if (active) {
       setSecureCloudProfile(profile);
       setSecureCloudAnalyticsConsent(Boolean(profile?.enableAnalytics));
       setSecureCloudMetadataConsent(profile ? profile.metadataConsent !== false : false);
       setSecureCloudRetentionDays(profile?.retentionPeriodDays ?? 30);
+      setSecureCloudPremiumEnabled(Boolean(profile?.enablePremium));
+      setSecureCloudUserSensitivity(parseSensitivity(profile?.userSensitivity));
+      setSecureCloudOrgSensitivity(parseSensitivity(profile?.organizationSensitivity));
+      const overrides = profile?.detectorModels ?? {};
+      const merged = {
+        ...secureCloudDefaultModels,
+        ...Object.fromEntries(
+          Object.entries(overrides).filter(([_, value]) => typeof value === 'string' && value.length > 0),
+        ),
+      };
+      setSecureCloudModelOverrides(merged);
     }
     setSecureCloudRetentionPolicy(client, profile?.retentionPeriodDays);
     const snapshot = getSecureCloudAggregatedStats(client);
@@ -318,7 +365,7 @@ const SecuritySettings: React.FC<SecuritySettingsProps> = ({ client, isOpen, onC
       unsubscribe();
       setSecureCloudStats(null);
     };
-  }, [client, isOpen]);
+  }, [client, isOpen, secureCloudDefaultModels]);
 
   useEffect(() => () => {
     autoBackupStopper?.();
@@ -573,6 +620,63 @@ const SecuritySettings: React.FC<SecuritySettingsProps> = ({ client, isOpen, onC
       setFeedback('Политика хранения Secure Cloud обновлена.');
     },
     [client, ensureSecureCloudActive, updateSecureCloudProfile],
+  );
+
+  const handleSecureCloudPremiumToggle = useCallback(
+    (checked: boolean) => {
+      setError(null);
+      setFeedback(null);
+      if (!ensureSecureCloudActive()) {
+        return;
+      }
+      setSecureCloudPremiumEnabled(checked);
+      updateSecureCloudProfile((current) => ({
+        ...current,
+        enablePremium: checked,
+      }));
+      setFeedback(checked ? 'Secure Cloud Premium включён.' : 'Secure Cloud Premium отключён.');
+    },
+    [ensureSecureCloudActive, updateSecureCloudProfile],
+  );
+
+  const handleSecureCloudSensitivityChange = useCallback(
+    (scope: 'user' | 'org', value: 'low' | 'medium' | 'high') => {
+      setError(null);
+      setFeedback(null);
+      if (!ensureSecureCloudActive()) {
+        return;
+      }
+      if (scope === 'user') {
+        setSecureCloudUserSensitivity(value);
+      } else {
+        setSecureCloudOrgSensitivity(value);
+      }
+      updateSecureCloudProfile((current) => ({
+        ...current,
+        userSensitivity: scope === 'user' ? value : current.userSensitivity,
+        organizationSensitivity: scope === 'org' ? value : current.organizationSensitivity,
+      }));
+      setFeedback('Чувствительность Secure Cloud обновлена.');
+    },
+    [ensureSecureCloudActive, updateSecureCloudProfile],
+  );
+
+  const handleSecureCloudModelChange = useCallback(
+    (detectorId: string, modelId: string) => {
+      setError(null);
+      setFeedback(null);
+      if (!ensureSecureCloudActive()) {
+        return;
+      }
+      const next = { ...secureCloudModelOverrides, [detectorId]: modelId };
+      setSecureCloudModelOverrides(next);
+      updateSecureCloudProfile((current) => ({
+        ...current,
+        detectorModels: next,
+      }));
+      setFeedback('Модель детектора обновлена.');
+    },
+    [ensureSecureCloudActive, secureCloudModelOverrides, updateSecureCloudProfile],
   );
 
   const handleSecureCloudExport = useCallback(() => {
@@ -931,6 +1035,21 @@ const SecuritySettings: React.FC<SecuritySettingsProps> = ({ client, isOpen, onC
                         <input
                           type="checkbox"
                           className="mt-1 h-4 w-4"
+                          checked={secureCloudPremiumEnabled}
+                          onChange={(e) => handleSecureCloudPremiumToggle(e.target.checked)}
+                          disabled={!secureCloudEnabled}
+                        />
+                        <div>
+                          <div className="font-medium text-text-primary">Secure Cloud Premium</div>
+                          <p className="text-xs text-text-secondary">
+                            Включает расширенные детекторы, очереди обработки и OCR вложений.
+                          </p>
+                        </div>
+                      </label>
+                      <label className="flex items-start gap-3">
+                        <input
+                          type="checkbox"
+                          className="mt-1 h-4 w-4"
                           checked={secureCloudMetadataConsent}
                           onChange={(e) => handleSecureCloudMetadataToggle(e.target.checked)}
                           disabled={!secureCloudEnabled}
@@ -988,6 +1107,68 @@ const SecuritySettings: React.FC<SecuritySettingsProps> = ({ client, isOpen, onC
                           ))}
                         </select>
                       </div>
+                      <div className="grid gap-3 md:grid-cols-2">
+                        <div>
+                          <label htmlFor="secure-sensitivity-user" className="block text-xs font-medium uppercase text-text-secondary">
+                            Чувствительность пользователя
+                          </label>
+                          <select
+                            id="secure-sensitivity-user"
+                            value={secureCloudUserSensitivity}
+                            onChange={(e) => handleSecureCloudSensitivityChange('user', e.target.value as 'low' | 'medium' | 'high')}
+                            disabled={!secureCloudEnabled}
+                            className="mt-1 w-full rounded-md border border-border-primary bg-bg-secondary px-3 py-2 text-sm text-text-primary focus:outline-none focus:ring-2 focus:ring-accent/50 disabled:opacity-50"
+                          >
+                            <option value="low">Низкая</option>
+                            <option value="medium">Средняя</option>
+                            <option value="high">Высокая</option>
+                          </select>
+                        </div>
+                        <div>
+                          <label htmlFor="secure-sensitivity-org" className="block text-xs font-medium uppercase text-text-secondary">
+                            Чувствительность организации
+                          </label>
+                          <select
+                            id="secure-sensitivity-org"
+                            value={secureCloudOrgSensitivity}
+                            onChange={(e) => handleSecureCloudSensitivityChange('org', e.target.value as 'low' | 'medium' | 'high')}
+                            disabled={!secureCloudEnabled}
+                            className="mt-1 w-full rounded-md border border-border-primary bg-bg-secondary px-3 py-2 text-sm text-text-primary focus:outline-none focus:ring-2 focus:ring-accent/50 disabled:opacity-50"
+                          >
+                            <option value="low">Низкая</option>
+                            <option value="medium">Средняя</option>
+                            <option value="high">Высокая</option>
+                          </select>
+                        </div>
+                      </div>
+                      {secureCloudDetectorCatalog.length > 0 && (
+                        <div className="space-y-2">
+                          <div className="text-xs uppercase text-text-secondary font-semibold">Модели детекторов</div>
+                          {secureCloudDetectorCatalog.map((detector) => (
+                            <div key={detector.id} className="space-y-1">
+                              <label htmlFor={`secure-model-${detector.id}`} className="block text-xs font-medium uppercase text-text-secondary">
+                                {detector.displayName}
+                              </label>
+                              <select
+                                id={`secure-model-${detector.id}`}
+                                value={secureCloudModelOverrides[detector.id] ?? ''}
+                                onChange={(e) => handleSecureCloudModelChange(detector.id, e.target.value)}
+                                disabled={!secureCloudEnabled || !detector.models || detector.models.length === 0}
+                                className="block w-full rounded-md border border-border-primary bg-bg-secondary px-3 py-2 text-sm text-text-primary focus:outline-none focus:ring-2 focus:ring-accent/50 disabled:opacity-50"
+                              >
+                                {(detector.models ?? []).map((model) => (
+                                  <option key={model.id} value={model.id}>
+                                    {model.label} ({model.provider})
+                                  </option>
+                                ))}
+                                {(!detector.models || detector.models.length === 0) && (
+                                  <option value="">Нет доступных моделей</option>
+                                )}
+                              </select>
+                            </div>
+                          ))}
+                        </div>
+                      )}
                       <div>
                         <label htmlFor="secure-export-format" className="block text-xs font-medium uppercase text-text-secondary">
                           Формат экспорта
