@@ -1,6 +1,6 @@
 import React from 'react';
 import MessageInput from './MessageInput';
-import { Gif, MatrixClient, MatrixUser, Message, Sticker, DraftContent, SendKeyBehavior } from '../types';
+import { Gif, MatrixClient, MatrixUser, Message, Sticker, DraftContent, SendKeyBehavior, VideoMessageMetadata } from '../types';
 
 interface PendingQueueEntry {
     id: string;
@@ -16,6 +16,7 @@ interface MessageComposerProps {
     onSendMessage: (content: { body: string; formattedBody?: string }, threadRootId?: string) => Promise<void> | void;
     onSendFile: (file: File) => Promise<void> | void;
     onSendAudio: (file: Blob, duration: number) => Promise<void> | void;
+    onSendVideo: (file: Blob, metadata: VideoMessageMetadata) => Promise<void> | void;
     onSendSticker: (sticker: Sticker) => Promise<void> | void;
     onSendGif: (gif: Gif) => Promise<void> | void;
     onOpenCreatePoll: () => void;
@@ -39,6 +40,7 @@ const MessageComposer: React.FC<MessageComposerProps> = ({
     onSendMessage,
     onSendFile,
     onSendAudio,
+    onSendVideo,
     onSendSticker,
     onSendGif,
     onOpenCreatePoll,
@@ -122,6 +124,7 @@ const MessageComposer: React.FC<MessageComposerProps> = ({
                 onSendMessage={payload => onSendMessage(payload)}
                 onSendFile={onSendFile}
                 onSendAudio={onSendAudio}
+                onSendVideo={onSendVideo}
                 onSendSticker={onSendSticker}
                 onSendGif={onSendGif}
                 onOpenCreatePoll={onOpenCreatePoll}
