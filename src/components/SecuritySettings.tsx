@@ -10,6 +10,8 @@ import {
   startManagedKeyBackup,
   stopManagedKeyBackup,
   restoreRoomKeysFromBackup,
+  getSecureCloudProfileForClient,
+  setSecureCloudProfileForClient,
 } from '../services/matrixService';
 import { requestSelfVerification } from '../services/e2eeService';
 import {
@@ -18,6 +20,16 @@ import {
   disableAppLock,
   AppLockSnapshot,
 } from '../services/appLockService';
+import {
+  exportSuspiciousEventsLog,
+  getSecureCloudAggregatedStats,
+  subscribeSecureCloudAggregatedStats,
+  setSecureCloudRetentionPolicy,
+  SECURE_CLOUD_RETENTION_BUCKETS,
+  type SecureCloudAggregatedStats,
+  type SecureCloudLogFormat,
+  type SecureCloudProfile,
+} from '../services/secureCloudService';
 
 interface SecuritySettingsProps {
   client: MatrixClient;
@@ -117,6 +129,12 @@ const SecuritySettings: React.FC<SecuritySettingsProps> = ({ client, isOpen, onC
   const [pinConfirm, setPinConfirm] = useState('');
   const [appLockBiometric, setAppLockBiometric] = useState(false);
   const [appLockLoading, setAppLockLoading] = useState(false);
+  const [secureCloudStats, setSecureCloudStats] = useState<SecureCloudAggregatedStats | null>(null);
+  const [secureCloudProfile, setSecureCloudProfile] = useState<SecureCloudProfile | null>(null);
+  const [secureCloudAnalyticsConsent, setSecureCloudAnalyticsConsent] = useState(false);
+  const [secureCloudMetadataConsent, setSecureCloudMetadataConsent] = useState(true);
+  const [secureCloudRetentionDays, setSecureCloudRetentionDays] = useState<number>(30);
+  const [secureCloudExportFormat, setSecureCloudExportFormat] = useState<SecureCloudLogFormat>('json');
   const isTauriRuntime = typeof window !== 'undefined' && Boolean((window as any).__TAURI__);
 
   const refreshAppLock = useCallback(async () => {
@@ -129,6 +147,63 @@ const SecuritySettings: React.FC<SecuritySettingsProps> = ({ client, isOpen, onC
     } catch (err) {
       console.warn('Failed to load app lock snapshot', err);
     }
+  }, []);
+
+  const secureCloudEnabled = useMemo(
+    () => Boolean(secureCloudProfile && secureCloudProfile.mode !== 'disabled'),
+    [secureCloudProfile],
+  );
+
+  const secureCloudRetentionOptions = useMemo(() => [0, 7, 30, 90, 180], []);
+
+  const secureCloudRetentionSelectOptions = useMemo(() => {
+    const values = new Set<number>(secureCloudRetentionOptions);
+    if (Number.isFinite(secureCloudRetentionDays)) {
+      values.add(secureCloudRetentionDays);
+    }
+    return Array.from(values).sort((a, b) => a - b);
+  }, [secureCloudRetentionOptions, secureCloudRetentionDays]);
+
+  const updateSecureCloudProfile = useCallback(
+    (updater: (current: SecureCloudProfile) => SecureCloudProfile) => {
+      setSecureCloudProfile((prev) => {
+        if (!prev) {
+          return prev;
+        }
+        const nextProfile = updater(prev);
+        setSecureCloudProfileForClient(client, nextProfile);
+        return nextProfile;
+      });
+    },
+    [client],
+  );
+
+  const formatDuration = useCallback((value: number | null) => {
+    if (value == null || Number.isNaN(value)) {
+      return '—';
+    }
+    const seconds = Math.round(value / 1000);
+    if (seconds < 60) {
+      return `${seconds} с`;
+    }
+    const minutes = Math.round(seconds / 60);
+    if (minutes < 60) {
+      return `${minutes} мин`;
+    }
+    const hours = Math.round(minutes / 60);
+    if (hours < 24) {
+      return `${hours} ч`;
+    }
+    const days = Math.round(hours / 24);
+    if (days < 30) {
+      return `${days} д`;
+    }
+    const months = Math.round(days / 30);
+    if (months < 12) {
+      return `${months} мес`;
+    }
+    const years = Math.round(days / 365);
+    return `${years} г`;
   }, []);
 
   const refreshDevices = useCallback(async () => {
@@ -216,6 +291,34 @@ const SecuritySettings: React.FC<SecuritySettingsProps> = ({ client, isOpen, onC
     if (!isOpen) return;
     void refreshAppLock();
   }, [isOpen, refreshAppLock]);
+
+  useEffect(() => {
+    if (!isOpen) {
+      return;
+    }
+    let active = true;
+    const profile = getSecureCloudProfileForClient(client);
+    if (active) {
+      setSecureCloudProfile(profile);
+      setSecureCloudAnalyticsConsent(Boolean(profile?.enableAnalytics));
+      setSecureCloudMetadataConsent(profile ? profile.metadataConsent !== false : false);
+      setSecureCloudRetentionDays(profile?.retentionPeriodDays ?? 30);
+    }
+    setSecureCloudRetentionPolicy(client, profile?.retentionPeriodDays);
+    const snapshot = getSecureCloudAggregatedStats(client);
+    if (active) {
+      setSecureCloudStats(snapshot);
+    }
+    const unsubscribe = subscribeSecureCloudAggregatedStats(client, (stats) => {
+      if (!active) return;
+      setSecureCloudStats(stats);
+    });
+    return () => {
+      active = false;
+      unsubscribe();
+      setSecureCloudStats(null);
+    };
+  }, [client, isOpen]);
 
   useEffect(() => () => {
     autoBackupStopper?.();
@@ -409,6 +512,108 @@ const SecuritySettings: React.FC<SecuritySettingsProps> = ({ client, isOpen, onC
     setBackupStatus(getKeyBackupStatus());
     setFeedback('Фоновое резервное копирование включено.');
   };
+
+  const ensureSecureCloudActive = useCallback(() => {
+    if (!secureCloudEnabled || !secureCloudProfile) {
+      setError('Secure Cloud не активирован для текущего клиента.');
+      return false;
+    }
+    return true;
+  }, [secureCloudEnabled, secureCloudProfile]);
+
+  const handleSecureCloudMetadataToggle = useCallback(
+    (checked: boolean) => {
+      setError(null);
+      setFeedback(null);
+      if (!ensureSecureCloudActive()) {
+        return;
+      }
+      setSecureCloudMetadataConsent(checked);
+      updateSecureCloudProfile((current) => ({
+        ...current,
+        metadataConsent: checked,
+      }));
+      setFeedback(checked ? 'Отправка метаданных Secure Cloud включена.' : 'Отправка метаданных Secure Cloud отключена.');
+    },
+    [ensureSecureCloudActive, updateSecureCloudProfile],
+  );
+
+  const handleSecureCloudAnalyticsToggle = useCallback(
+    (checked: boolean) => {
+      setError(null);
+      setFeedback(null);
+      if (!ensureSecureCloudActive()) {
+        return;
+      }
+      setSecureCloudAnalyticsConsent(checked);
+      updateSecureCloudProfile((current) => ({
+        ...current,
+        enableAnalytics: checked,
+        analyticsToken: checked ? current.analyticsToken : undefined,
+      }));
+      setFeedback(checked ? 'Аналитика Secure Cloud включена.' : 'Аналитика Secure Cloud отключена.');
+    },
+    [ensureSecureCloudActive, updateSecureCloudProfile],
+  );
+
+  const handleSecureCloudRetentionSelect = useCallback(
+    (days: number) => {
+      setError(null);
+      setFeedback(null);
+      if (!ensureSecureCloudActive()) {
+        return;
+      }
+      const safeDays = Number.isFinite(days) ? Math.max(0, days) : 0;
+      setSecureCloudRetentionDays(safeDays);
+      updateSecureCloudProfile((current) => ({
+        ...current,
+        retentionPeriodDays: safeDays,
+      }));
+      setSecureCloudRetentionPolicy(client, safeDays);
+      setFeedback('Политика хранения Secure Cloud обновлена.');
+    },
+    [client, ensureSecureCloudActive, updateSecureCloudProfile],
+  );
+
+  const handleSecureCloudExport = useCallback(() => {
+    setError(null);
+    setFeedback(null);
+    try {
+      const payload = exportSuspiciousEventsLog(client, { format: secureCloudExportFormat });
+      if (typeof window === 'undefined') {
+        console.info('Secure Cloud export:\n', payload);
+        setFeedback('Логи Secure Cloud сформированы в консоли.');
+        return;
+      }
+      const extension = secureCloudExportFormat === 'csv' ? 'csv' : 'json';
+      const blob = new Blob([payload], {
+        type: secureCloudExportFormat === 'csv' ? 'text/csv;charset=utf-8' : 'application/json;charset=utf-8',
+      });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      link.download = `secure-cloud-log-${timestamp}.${extension}`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+      setFeedback('Логи Secure Cloud экспортированы.');
+    } catch (err: any) {
+      console.error('Failed to export Secure Cloud logs', err);
+      setError(`Не удалось экспортировать логи Secure Cloud: ${err?.message ?? err}`);
+    }
+  }, [client, secureCloudExportFormat]);
+
+  const secureCloudFlagEntries = useMemo(() => {
+    if (!secureCloudStats) return [] as Array<[string, number]>;
+    return Object.entries(secureCloudStats.flags).sort((a, b) => b[1] - a[1]);
+  }, [secureCloudStats]);
+
+  const secureCloudActionEntries = useMemo(() => {
+    if (!secureCloudStats) return [] as Array<[string, number]>;
+    return Object.entries(secureCloudStats.actions).sort((a, b) => b[1] - a[1]);
+  }, [secureCloudStats]);
 
   const handleEnableAppLock = async () => {
     if (!isTauriRuntime) {
@@ -686,6 +891,197 @@ const SecuritySettings: React.FC<SecuritySettingsProps> = ({ client, isOpen, onC
                 <div className="px-4 py-2 text-xs text-text-secondary">{devicesStatus}</div>
               )}
             </div>
+          </section>
+
+          <section>
+            <h3 className="text-lg font-semibold text-text-primary mb-4">Secure Cloud отчётность</h3>
+            {secureCloudStats ? (
+              <div className="space-y-4">
+                <div className="grid gap-3 md:grid-cols-3">
+                  <div className="border border-border-primary rounded-md p-4">
+                    <div className="text-xs uppercase text-text-secondary tracking-wide">Всего флагов</div>
+                    <div className="text-2xl font-semibold text-text-primary">{secureCloudStats.totalFlagged}</div>
+                    <div className="text-xs text-text-secondary mt-1">
+                      Обновлено {formatDistanceToNow(secureCloudStats.updatedAt, { addSuffix: true })}
+                    </div>
+                  </div>
+                  <div className="border border-border-primary rounded-md p-4">
+                    <div className="text-xs uppercase text-text-secondary tracking-wide">Открытые инциденты</div>
+                    <div className="text-2xl font-semibold text-text-primary">{secureCloudStats.openNotices}</div>
+                    <div className="text-xs text-text-secondary mt-1">Включая необработанные предупреждения.</div>
+                  </div>
+                  <div className="border border-border-primary rounded-md p-4">
+                    <div className="text-xs uppercase text-text-secondary tracking-wide">Средний срок хранения</div>
+                    <div className="text-2xl font-semibold text-text-primary">
+                      {formatDuration(secureCloudStats.retention.averageMs ?? null)}
+                    </div>
+                    <div className="text-xs text-text-secondary mt-1">
+                      Политика: {secureCloudStats.retention.policyDays != null ? `${secureCloudStats.retention.policyDays} д` : 'по умолчанию'}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="grid gap-4 md:grid-cols-2">
+                  <div className="border border-border-primary rounded-md overflow-hidden">
+                    <div className="px-4 py-2 border-b border-border-primary text-sm font-semibold text-text-primary">
+                      Согласия и телеметрия
+                    </div>
+                    <div className="p-4 space-y-4">
+                      <label className="flex items-start gap-3">
+                        <input
+                          type="checkbox"
+                          className="mt-1 h-4 w-4"
+                          checked={secureCloudMetadataConsent}
+                          onChange={(e) => handleSecureCloudMetadataToggle(e.target.checked)}
+                          disabled={!secureCloudEnabled}
+                        />
+                        <div>
+                          <div className="font-medium text-text-primary">Отправлять метаданные событий</div>
+                          <p className="text-xs text-text-secondary">
+                            Используется для уведомлений и серверных отчётов. Данные не содержат содержимого сообщений.
+                          </p>
+                        </div>
+                      </label>
+                      <label className="flex items-start gap-3">
+                        <input
+                          type="checkbox"
+                          className="mt-1 h-4 w-4"
+                          checked={secureCloudAnalyticsConsent}
+                          onChange={(e) => handleSecureCloudAnalyticsToggle(e.target.checked)}
+                          disabled={!secureCloudEnabled}
+                        />
+                        <div>
+                          <div className="font-medium text-text-primary">Анонимная аналитика Secure Cloud</div>
+                          <p className="text-xs text-text-secondary">
+                            Помогает улучшать локальные детекторы и агрегированную статистику безопасности.
+                          </p>
+                        </div>
+                      </label>
+                      {!secureCloudEnabled && (
+                        <p className="text-xs text-text-secondary">
+                          Активируйте Secure Cloud в настройках подключения, чтобы управлять согласиями.
+                        </p>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="border border-border-primary rounded-md overflow-hidden">
+                    <div className="px-4 py-2 border-b border-border-primary text-sm font-semibold text-text-primary">
+                      Политика хранения и экспорт логов
+                    </div>
+                    <div className="p-4 space-y-4">
+                      <div>
+                        <label htmlFor="secure-retention" className="block text-xs font-medium uppercase text-text-secondary">
+                          Срок хранения предупреждений
+                        </label>
+                        <select
+                          id="secure-retention"
+                          value={secureCloudRetentionDays}
+                          onChange={(e) => handleSecureCloudRetentionSelect(Number(e.target.value))}
+                          disabled={!secureCloudEnabled}
+                          className="mt-1 w-full rounded-md border border-border-primary bg-bg-secondary px-3 py-2 text-sm text-text-primary focus:outline-none focus:ring-2 focus:ring-accent/50 disabled:opacity-50"
+                        >
+                          {secureCloudRetentionSelectOptions.map((option) => (
+                            <option key={option} value={option}>
+                              {option === 0 ? 'Не хранить' : `${option} дн.`}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                      <div>
+                        <label htmlFor="secure-export-format" className="block text-xs font-medium uppercase text-text-secondary">
+                          Формат экспорта
+                        </label>
+                        <select
+                          id="secure-export-format"
+                          value={secureCloudExportFormat}
+                          onChange={(e) => setSecureCloudExportFormat(e.target.value as SecureCloudLogFormat)}
+                          className="mt-1 w-full rounded-md border border-border-primary bg-bg-secondary px-3 py-2 text-sm text-text-primary focus:outline-none focus:ring-2 focus:ring-accent/50"
+                        >
+                          <option value="json">JSON</option>
+                          <option value="csv">CSV</option>
+                        </select>
+                      </div>
+                      <button
+                        onClick={handleSecureCloudExport}
+                        className="inline-flex items-center justify-center rounded-md bg-accent px-4 py-2 text-sm font-medium text-white hover:bg-accent/90"
+                      >
+                        Экспорт логов Secure Cloud
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="grid gap-4 md:grid-cols-2">
+                  <div className="border border-border-primary rounded-md overflow-hidden">
+                    <div className="px-4 py-2 border-b border-border-primary text-sm font-semibold text-text-primary">
+                      Наиболее частые флаги
+                    </div>
+                    <ul className="divide-y divide-border-primary">
+                      {secureCloudFlagEntries.length > 0 ? (
+                        secureCloudFlagEntries.map(([reason, count]) => (
+                          <li key={reason} className="flex items-center justify-between px-4 py-2 text-sm">
+                            <span className="text-text-secondary">{reason}</span>
+                            <span className="font-semibold text-text-primary">{count}</span>
+                          </li>
+                        ))
+                      ) : (
+                        <li className="px-4 py-3 text-sm text-text-secondary">Флаги ещё не фиксировались.</li>
+                      )}
+                    </ul>
+                  </div>
+                  <div className="border border-border-primary rounded-md overflow-hidden">
+                    <div className="px-4 py-2 border-b border-border-primary text-sm font-semibold text-text-primary">
+                      Действия операторов
+                    </div>
+                    <ul className="divide-y divide-border-primary">
+                      {secureCloudActionEntries.length > 0 ? (
+                        secureCloudActionEntries.map(([action, count]) => (
+                          <li key={action} className="flex items-center justify-between px-4 py-2 text-sm">
+                            <span className="text-text-secondary">{action}</span>
+                            <span className="font-semibold text-text-primary">{count}</span>
+                          </li>
+                        ))
+                      ) : (
+                        <li className="px-4 py-3 text-sm text-text-secondary">Действий по событиям ещё не выполнялось.</li>
+                      )}
+                    </ul>
+                  </div>
+                </div>
+
+                <div className="border border-border-primary rounded-md overflow-hidden">
+                  <div className="px-4 py-2 border-b border-border-primary text-sm font-semibold text-text-primary">
+                    Распределение сроков хранения
+                  </div>
+                  <div className="grid gap-3 px-4 py-3 text-xs text-text-secondary md:grid-cols-3">
+                    <div>
+                      Средний срок: <span className="font-semibold text-text-primary">{formatDuration(secureCloudStats.retention.averageMs ?? null)}</span>
+                    </div>
+                    <div>
+                      Минимум: <span className="font-semibold text-text-primary">{formatDuration(secureCloudStats.retention.minMs ?? null)}</span>
+                    </div>
+                    <div>
+                      Максимум: <span className="font-semibold text-text-primary">{formatDuration(secureCloudStats.retention.maxMs ?? null)}</span>
+                    </div>
+                    <div className="md:col-span-3">
+                      Обработано событий: <span className="font-semibold text-text-primary">{secureCloudStats.retention.count}</span>
+                    </div>
+                  </div>
+                  <ul className="divide-y divide-border-primary">
+                    {SECURE_CLOUD_RETENTION_BUCKETS.map((bucket) => (
+                      <li key={bucket.id} className="flex items-center justify-between px-4 py-2 text-sm">
+                        <span className="text-text-secondary">{bucket.label}</span>
+                        <span className="font-semibold text-text-primary">{secureCloudStats.retention.buckets[bucket.id] ?? 0}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              </div>
+            ) : (
+              <p className="text-sm text-text-secondary">
+                Данные Secure Cloud отсутствуют. Подключите Secure Cloud, чтобы начать сбор статистики и управлять политиками.
+              </p>
+            )}
           </section>
 
           <section>
