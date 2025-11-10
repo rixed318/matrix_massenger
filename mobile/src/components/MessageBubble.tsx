@@ -1,6 +1,6 @@
 import React from 'react';
 import { Image, Linking, Pressable, StyleSheet, Text, View } from 'react-native';
-import { Message } from '@matrix-messenger/core';
+import { Message, MAP_ZOOM_DEFAULT, buildStaticMapUrl, buildExternalNavigationUrl, formatCoordinate, sanitizeZoom } from '@matrix-messenger/core';
 
 interface MessageBubbleProps {
   message: Message;
@@ -18,7 +18,48 @@ const openLink = async (url: string) => {
   }
 };
 
+const renderLocationAttachment = (message: Message) => {
+  const location = message.location;
+  if (!location) {
+    return null;
+  }
+  const latitude = location.latitude ?? 0;
+  const longitude = location.longitude ?? 0;
+  const zoom = sanitizeZoom(location.zoom ?? MAP_ZOOM_DEFAULT);
+  const mapUrl = location.thumbnailUrl ?? buildStaticMapUrl(latitude, longitude, zoom, 640, 360);
+  const navigationUrl = location.externalUrl ?? buildExternalNavigationUrl(latitude, longitude, zoom);
+  const accuracy = location.accuracy;
+  const description = location.description || message.content.body || 'Поделился локацией';
+
+  const handleOpen = () => {
+    void openLink(navigationUrl);
+  };
+
+  return (
+    <View style={styles.locationContainer}>
+      <Text style={styles.locationTitle}>{description}</Text>
+      <Pressable onPress={handleOpen} accessibilityRole="imagebutton" style={styles.mapPreview}>
+        <Image source={{ uri: mapUrl }} style={styles.mapImage} />
+      </Pressable>
+      <View style={styles.locationMetaRow}>
+        <Text style={styles.metaText}>Широта: {formatCoordinate(latitude)}</Text>
+        <Text style={styles.metaText}>Долгота: {formatCoordinate(longitude)}</Text>
+      </View>
+      {typeof accuracy === 'number' && Number.isFinite(accuracy) && (
+        <Text style={styles.metaText}>Точность: ±{Math.round(accuracy)} м</Text>
+      )}
+      <Pressable onPress={handleOpen} accessibilityRole="button" style={styles.locationButton}>
+        <Text style={styles.locationButtonText}>Открыть в навигаторе</Text>
+      </Pressable>
+    </View>
+  );
+};
+
 const renderAttachment = (message: Message) => {
+  if (message.content.msgtype === 'm.location' && message.location) {
+    return renderLocationAttachment(message);
+  }
+
   const content = message.content;
   if (!content.url) {
     return null;
@@ -37,6 +78,27 @@ const renderAttachment = (message: Message) => {
 };
 
 export const MessageBubble: React.FC<MessageBubbleProps> = ({ message, isOwn }) => {
+  const renderTranscript = () => {
+    const transcript = message.transcript;
+    if (!transcript) return null;
+    if (message.content.msgtype !== 'm.audio' && message.content.msgtype !== 'm.video') return null;
+    const languageLabel = transcript.language ? ` (${transcript.language.toUpperCase()})` : '';
+    return (
+      <View style={styles.transcriptContainer}>
+        <Text style={styles.transcriptTitle}>Транскрипт{languageLabel}</Text>
+        {transcript.status === 'pending' && (
+          <Text style={styles.transcriptPending}>Обработка аудио...</Text>
+        )}
+        {transcript.status === 'error' && (
+          <Text style={styles.transcriptError}>Ошибка: {transcript.error ?? 'Не удалось получить транскрипт'}</Text>
+        )}
+        {transcript.status === 'completed' && transcript.text && (
+          <Text style={styles.transcriptBody}>{transcript.text}</Text>
+        )}
+      </View>
+    );
+  };
+
   return (
     <View style={[styles.container, isOwn ? styles.ownContainer : styles.otherContainer]}>
       <View style={[styles.bubble, isOwn ? styles.ownBubble : styles.otherBubble]}>
@@ -44,6 +106,7 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({ message, isOwn }) 
           {message.content.body}
         </Text>
         {renderAttachment(message)}
+        {renderTranscript()}
         <Text style={[styles.timestamp, isOwn ? styles.ownTimestamp : styles.otherTimestamp]}>
           {new Date(message.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
         </Text>
@@ -106,5 +169,45 @@ const styles = StyleSheet.create({
   link: {
     color: '#88aaff',
     textDecorationLine: 'underline',
+  },
+  locationContainer: {
+    gap: 8,
+  },
+  locationTitle: {
+    fontSize: 15,
+    fontWeight: '600',
+    color: '#d0ddf5',
+  },
+  mapPreview: {
+    borderRadius: 12,
+    overflow: 'hidden',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.1)',
+  },
+  mapImage: {
+    width: '100%',
+    height: 160,
+  },
+  locationMetaRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 12,
+  },
+  metaText: {
+    fontSize: 12,
+    color: '#9ba9c5',
+  },
+  locationButton: {
+    marginTop: 4,
+    alignSelf: 'flex-start',
+    backgroundColor: '#3A7EFB',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 8,
+  },
+  locationButtonText: {
+    color: '#fff',
+    fontSize: 13,
+    fontWeight: '600',
   },
 });

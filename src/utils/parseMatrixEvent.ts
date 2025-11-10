@@ -1,6 +1,7 @@
 import { MatrixClient, MatrixEvent, Message, Reaction, Poll, PollResult, ReplyInfo, LinkPreviewData } from '../types';
 import { EventType, RelationType } from 'matrix-js-sdk';
 import { mxcToHttp } from '../services/matrixService';
+import { buildExternalNavigationUrl, MAP_ZOOM_DEFAULT, parseGeoUri, sanitizeZoom } from './location';
 
 export function parseMatrixEvent(client: MatrixClient, event: MatrixEvent): Message {
     const sender = event.sender;
@@ -129,6 +130,34 @@ export function parseMatrixEvent(client: MatrixClient, event: MatrixEvent): Mess
     const isSticker = event.getType() === 'm.sticker';
     const isGif = content.msgtype === 'm.image' && content.info?.['xyz.amorgan.is_gif'];
 
+    let location: Message['location'] = null;
+    if (content.msgtype === 'm.location') {
+        const geoUri = typeof content.geo_uri === 'string'
+            ? content.geo_uri
+            : (typeof content?.['m.location']?.uri === 'string' ? content['m.location'].uri : null);
+        const parsedGeo = parseGeoUri(geoUri);
+        if (parsedGeo) {
+            const zoomValue = sanitizeZoom((content as any)?.['com.matrix_messenger.map_zoom']);
+            const thumbnailUrlRaw = content?.info?.thumbnail_url
+                || content?.info?.thumbnail_file?.url
+                || null;
+            const thumbnailUrl = thumbnailUrlRaw ? mxcToHttp(client, thumbnailUrlRaw, 512) : null;
+            const externalUrl = typeof content?.external_url === 'string'
+                ? content.external_url
+                : buildExternalNavigationUrl(parsedGeo.latitude, parsedGeo.longitude, zoomValue ?? MAP_ZOOM_DEFAULT);
+            location = {
+                latitude: parsedGeo.latitude,
+                longitude: parsedGeo.longitude,
+                accuracy: parsedGeo.accuracy,
+                description: typeof content.body === 'string' ? content.body : undefined,
+                zoom: zoomValue,
+                geoUri: geoUri ?? '',
+                externalUrl,
+                thumbnailUrl,
+            };
+        }
+    }
+
     const destructContent = content['com.matrix_messenger.self_destruct'];
     let selfDestruct: Message['selfDestruct'] = null;
     if (destructContent && typeof destructContent === 'object') {
@@ -140,6 +169,13 @@ export function parseMatrixEvent(client: MatrixClient, event: MatrixEvent): Mess
                 ttlMs,
             };
         }
+    }
+
+    let transcript = null;
+    const eventId = event.getId();
+    if (eventId && room) {
+        const related = (room as any).getRelatedEventsForEvent?.(eventId, RelationType.Annotation, EventType.RoomMessage) as MatrixEvent[] | undefined;
+        transcript = pickLatestTranscript(related);
     }
 
     return {
@@ -169,5 +205,6 @@ export function parseMatrixEvent(client: MatrixClient, event: MatrixEvent): Mess
         isSticker,
         isGif,
         selfDestruct,
+        location,
     };
 }

@@ -1,7 +1,8 @@
-import { MatrixClient, MatrixEvent, MatrixRoom, MatrixUser, Sticker, Gif, RoomCreationOptions, VideoMessageMetadata, MatrixCall } from '../types';
+import { MatrixClient, MatrixEvent, MatrixRoom, MatrixUser, Sticker, Gif, RoomCreationOptions, VideoMessageMetadata, LocationContentPayload } from '../types';
 import type { SecureCloudProfile } from './secureCloudService';
 import { normaliseSecureCloudProfile } from './secureCloudService';
 import GroupCallCoordinator, { GroupCallParticipant as CoordinatorParticipant } from './webrtc/groupCallCoordinator';
+import { buildGeoUri, buildStaticMapUrl, buildExternalNavigationUrl, MAP_ZOOM_DEFAULT, STATIC_MAP_HEIGHT, STATIC_MAP_WIDTH, sanitizeZoom } from '../utils/location';
 import {
     GROUP_CALL_CONTROL_EVENT_TYPE,
     GROUP_CALL_PARTICIPANTS_EVENT_TYPE,
@@ -24,9 +25,23 @@ import {
     Visibility,
     AutoDiscovery,
     AutoDiscoveryAction,
-    AutoDiscoveryError, 
-    IndexedDBStore, IndexedDBCryptoStore, ClientEvent, MemoryStore, MatrixScheduler, Preset, RoomEvent} from 'matrix-js-sdk';
+    AutoDiscoveryError,
+    IndexedDBStore,
+    IndexedDBCryptoStore,
+    ClientEvent,
+    MemoryStore,
+    MatrixScheduler,
+    Preset,
+    RoomEvent,
+} from 'matrix-js-sdk';
 import type { HierarchyRoom } from 'matrix-js-sdk';
+import {
+    enqueueTranscriptionJob,
+    confirmTranscriptionJob,
+    cancelTranscriptionJob,
+    getTranscriptionRuntimeConfig,
+} from './transcriptionService';
+import type { TranscriptionSettings as ServiceTranscriptionSettings } from './transcriptionService';
 
 
 // ===== Offline Outbox Queue (IndexedDB/SQLite) =====
@@ -1347,6 +1362,697 @@ export const __resetStickerLibraryForTests = () => {
     persistStickerFavorites();
 };
 
+// ===== Stories (account data) =====
+
+export const STORY_EVENT_TYPE = 'econix.story';
+export const STORY_READ_EVENT_TYPE = 'econix.story.read';
+
+export type StoryMediaKind = 'image' | 'video';
+
+export interface StoryMedia {
+    kind: StoryMediaKind;
+    mxcUrl: string;
+    thumbnailMxcUrl?: string;
+    mimeType?: string;
+    width?: number;
+    height?: number;
+    durationMs?: number;
+    sizeBytes?: number;
+    blurhash?: string;
+}
+
+export interface StoryReaction {
+    key: string;
+    count: number;
+    senders: string[];
+    selfReacted: boolean;
+}
+
+export interface Story {
+    id: string;
+    authorId: string;
+    authorDisplayName?: string;
+    createdAt: number;
+    expiresAt?: number;
+    caption?: string;
+    media: StoryMedia;
+    reactions: StoryReaction[];
+    seenBy: string[];
+    seenCount: number;
+    hasSeen: boolean;
+    raw?: Record<string, any> | null;
+}
+
+export interface StoryReadReceipt {
+    storyId: string;
+    userId: string;
+    timestamp: number;
+}
+
+export interface StorySyncState {
+    stories: Story[];
+    reads: Record<string, StoryReadReceipt>;
+}
+
+export interface CreateStoryPayload {
+    id?: string;
+    caption?: string;
+    createdAt?: number;
+    expiresAt?: number;
+    media: StoryMedia;
+    reactions?: Record<string, string[]>;
+    seenBy?: string[];
+    raw?: Record<string, any> | null;
+}
+
+type StoryListener = (state: StorySyncState) => void;
+
+const storyStateByClient = new WeakMap<MatrixClient, StorySyncState>();
+const storyListenersByClient = new WeakMap<MatrixClient, Set<StoryListener>>();
+const storyCleanupByClient = new WeakMap<MatrixClient, () => void>();
+
+const getNumber = (value: unknown): number | undefined => {
+    if (typeof value === 'number' && Number.isFinite(value)) {
+        return value;
+    }
+    if (typeof value === 'string') {
+        const parsed = Number.parseFloat(value);
+        if (Number.isFinite(parsed)) {
+            return parsed;
+        }
+    }
+    return undefined;
+};
+
+const cloneStoryState = (state: StorySyncState): StorySyncState => ({
+    stories: state.stories.map(story => ({
+        ...story,
+        reactions: story.reactions.map(reaction => ({
+            ...reaction,
+            senders: [...reaction.senders],
+        })),
+        seenBy: [...story.seenBy],
+        raw: story.raw ? { ...story.raw } : null,
+    })),
+    reads: { ...state.reads },
+});
+
+const ensureStoryListenerSet = (client: MatrixClient): Set<StoryListener> => {
+    let listeners = storyListenersByClient.get(client);
+    if (!listeners) {
+        listeners = new Set();
+        storyListenersByClient.set(client, listeners);
+    }
+    return listeners;
+};
+
+const parseStoryMedia = (source: any): StoryMedia | null => {
+    if (!source || typeof source !== 'object') {
+        return null;
+    }
+    const mxcUrl =
+        (typeof source.mxcUrl === 'string' && source.mxcUrl)
+        || (typeof source.mxc_url === 'string' && source.mxc_url)
+        || (typeof source.url === 'string' && source.url)
+        || (typeof source.content_uri === 'string' && source.content_uri)
+        || null;
+    if (!mxcUrl) {
+        return null;
+    }
+    const mimeType =
+        (typeof source.mimeType === 'string' && source.mimeType)
+        || (typeof source.mimetype === 'string' && source.mimetype)
+        || undefined;
+    let kind: StoryMediaKind | undefined;
+    const rawKind =
+        (typeof source.kind === 'string' && source.kind)
+        || (typeof source.type === 'string' && source.type)
+        || (typeof source.msgtype === 'string' && source.msgtype)
+        || undefined;
+    if (rawKind) {
+        if (rawKind.toLowerCase().includes('video')) {
+            kind = 'video';
+        } else if (rawKind.toLowerCase().includes('image') || rawKind.toLowerCase().includes('photo')) {
+            kind = 'image';
+        }
+    }
+    if (!kind && mimeType) {
+        if (mimeType.startsWith('video')) {
+            kind = 'video';
+        } else if (mimeType.startsWith('image')) {
+            kind = 'image';
+        }
+    }
+    const thumbnail =
+        (typeof source.thumbnailMxcUrl === 'string' && source.thumbnailMxcUrl)
+        || (typeof source.thumbnail_url === 'string' && source.thumbnail_url)
+        || (typeof source.thumbnailUrl === 'string' && source.thumbnailUrl)
+        || undefined;
+    const preview = (typeof source.previewUrl === 'string' && source.previewUrl) || undefined;
+    const width = getNumber((source as any).width ?? (source as any).w);
+    const height = getNumber((source as any).height ?? (source as any).h);
+    const duration = getNumber((source as any).durationMs ?? (source as any).duration ?? (source as any).length);
+    const sizeBytes = getNumber((source as any).size ?? (source as any).filesize);
+    const blurhash = typeof source.blurhash === 'string' ? source.blurhash : undefined;
+    return {
+        kind: kind ?? 'image',
+        mxcUrl,
+        thumbnailMxcUrl: thumbnail ?? preview,
+        mimeType,
+        width,
+        height,
+        durationMs: duration,
+        sizeBytes,
+        blurhash,
+    } satisfies StoryMedia;
+};
+
+const parseStoryReactions = (source: any, userId?: string | null): StoryReaction[] => {
+    if (!source || typeof source !== 'object') {
+        return [];
+    }
+    const reactionEntries: Array<[string, string[]]> = [];
+    if (Array.isArray(source)) {
+        source.forEach(entry => {
+            if (!entry || typeof entry !== 'object') {
+                return;
+            }
+            const key =
+                (typeof entry.key === 'string' && entry.key)
+                || (typeof entry.emoji === 'string' && entry.emoji)
+                || undefined;
+            if (!key) {
+                return;
+            }
+            const senders = Array.isArray(entry.senders)
+                ? entry.senders.filter((sender: unknown): sender is string => typeof sender === 'string')
+                : [];
+            reactionEntries.push([key, senders]);
+        });
+    } else {
+        Object.entries(source).forEach(([key, value]) => {
+            if (!key) {
+                return;
+            }
+            const senders = Array.isArray(value)
+                ? value.filter((sender: unknown): sender is string => typeof sender === 'string')
+                : [];
+            reactionEntries.push([key, senders]);
+        });
+    }
+    return reactionEntries.map(([key, senders]) => ({
+        key,
+        count: senders.length,
+        senders,
+        selfReacted: Boolean(userId && senders.includes(userId)),
+    }));
+};
+
+const parseStory = (content: any, currentUserId?: string | null): Story | null => {
+    if (!content || typeof content !== 'object') {
+        return null;
+    }
+    const mediaSource = (content as any).media ?? content;
+    const media = parseStoryMedia(mediaSource);
+    if (!media) {
+        return null;
+    }
+    const id =
+        (typeof content.id === 'string' && content.id)
+        || (typeof content.story_id === 'string' && content.story_id)
+        || (typeof content.guid === 'string' && content.guid)
+        || (typeof content.local_id === 'string' && content.local_id)
+        || `story_${Math.random().toString(36).slice(2, 10)}_${Date.now()}`;
+    const authorId =
+        (typeof content.author === 'string' && content.author)
+        || (typeof content.user_id === 'string' && content.user_id)
+        || (typeof content.sender === 'string' && content.sender)
+        || currentUserId
+        || 'unknown';
+    const authorDisplayName =
+        (typeof content.authorDisplayName === 'string' && content.authorDisplayName)
+        || (typeof content.author_display_name === 'string' && content.author_display_name)
+        || undefined;
+    const createdAt =
+        getNumber((content as any).createdAt ?? (content as any).created_at ?? (content as any).timestamp ?? (content as any).ts)
+        ?? Date.now();
+    const expiresAt = getNumber((content as any).expiresAt ?? (content as any).expires_at ?? (content as any).expiry_ts);
+    const caption =
+        (typeof content.caption === 'string' && content.caption)
+        || (typeof content.body === 'string' && content.body)
+        || (typeof content.text === 'string' && content.text)
+        || undefined;
+    const seenBy = Array.isArray((content as any).seenBy ?? (content as any).seen_by)
+        ? ((content as any).seenBy ?? (content as any).seen_by).filter((value: unknown): value is string => typeof value === 'string')
+        : [];
+    const seenCount =
+        getNumber((content as any).seenCount ?? (content as any).seen_count ?? (content as any).views)
+        ?? seenBy.length;
+    const reactions = parseStoryReactions((content as any).reactions, currentUserId);
+    return {
+        id,
+        authorId,
+        authorDisplayName,
+        createdAt,
+        expiresAt,
+        caption,
+        media,
+        reactions,
+        seenBy,
+        seenCount,
+        hasSeen: false,
+        raw: { ...content },
+    } satisfies Story;
+};
+
+const parseStoryReads = (content: any, userId?: string | null): Record<string, StoryReadReceipt> => {
+    if (!content || typeof content !== 'object') {
+        return {};
+    }
+    const payload = (content as any).seen ?? (content as any).reads ?? content;
+    const reads: Record<string, StoryReadReceipt> = {};
+    if (Array.isArray(payload)) {
+        payload.forEach(entry => {
+            if (!entry || typeof entry !== 'object') {
+                return;
+            }
+            const id = (typeof (entry as any).id === 'string' && (entry as any).id)
+                || (typeof (entry as any).storyId === 'string' && (entry as any).storyId);
+            if (!id) {
+                return;
+            }
+            const timestamp = getNumber((entry as any).ts ?? (entry as any).timestamp ?? (entry as any).time) ?? Date.now();
+            const uid = (typeof (entry as any).userId === 'string' && (entry as any).userId)
+                || (typeof (entry as any).user_id === 'string' && (entry as any).user_id)
+                || userId
+                || 'unknown';
+            reads[id] = { storyId: id, timestamp, userId: uid };
+        });
+        return reads;
+    }
+    Object.entries(payload).forEach(([id, value]) => {
+        if (!id) {
+            return;
+        }
+        if (typeof value === 'number') {
+            reads[id] = { storyId: id, timestamp: value, userId: userId ?? 'unknown' };
+            return;
+        }
+        if (typeof value === 'object' && value) {
+            const timestamp = getNumber((value as any).ts ?? (value as any).timestamp ?? (value as any).time) ?? Date.now();
+            const uid = (typeof (value as any).userId === 'string' && (value as any).userId)
+                || (typeof (value as any).user_id === 'string' && (value as any).user_id)
+                || userId
+                || 'unknown';
+            reads[id] = { storyId: id, timestamp, userId: uid };
+        }
+    });
+    return reads;
+};
+
+const applyReadsToStories = (stories: Story[], reads: Record<string, StoryReadReceipt>, currentUserId?: string | null): Story[] => {
+    const now = Date.now();
+    return stories
+        .filter(story => (typeof story.expiresAt === 'number' ? story.expiresAt > now : true))
+        .map(story => {
+            const read = reads[story.id];
+            const seenSet = new Set(story.seenBy);
+            if (read?.userId) {
+                seenSet.add(read.userId);
+            }
+            const seenCount = Math.max(story.seenCount, seenSet.size);
+            const hasSeen = Boolean(
+                (currentUserId && seenSet.has(currentUserId))
+                || (currentUserId && read && read.userId === currentUserId)
+            );
+            return {
+                ...story,
+                seenBy: Array.from(seenSet),
+                seenCount,
+                hasSeen,
+                reactions: story.reactions.map(reaction => ({
+                    ...reaction,
+                    selfReacted: Boolean(currentUserId && reaction.senders.includes(currentUserId)),
+                })),
+            } satisfies Story;
+        })
+        .sort((a, b) => b.createdAt - a.createdAt);
+};
+
+const readStoryAccountData = (client: MatrixClient): StorySyncState => {
+    const storyEvent = client.getAccountData(STORY_EVENT_TYPE as any);
+    const readEvent = client.getAccountData(STORY_READ_EVENT_TYPE as any);
+    const userId = client.getUserId?.() ?? null;
+    const rawStories: any[] = Array.isArray((storyEvent as any)?.getContent?.()?.stories)
+        ? (storyEvent as any).getContent().stories
+        : Array.isArray((storyEvent as any)?.getContent?.()?.items)
+            ? (storyEvent as any).getContent().items
+            : Array.isArray((storyEvent as any)?.getContent?.())
+                ? (storyEvent as any).getContent()
+                : [];
+    const parsedStories = rawStories
+        .map(entry => parseStory(entry, userId))
+        .filter((story): story is Story => Boolean(story));
+    const reads = parseStoryReads((readEvent as any)?.getContent?.(), userId);
+    const stories = applyReadsToStories(parsedStories, reads, userId);
+    return { stories, reads } satisfies StorySyncState;
+};
+
+const serializeStoryMedia = (media: StoryMedia): Record<string, any> => {
+    const payload: Record<string, any> = {
+        kind: media.kind,
+        url: media.mxcUrl,
+        mxcUrl: media.mxcUrl,
+    };
+    if (media.thumbnailMxcUrl) payload.thumbnail_url = media.thumbnailMxcUrl;
+    if (media.mimeType) payload.mimeType = media.mimeType;
+    if (typeof media.width === 'number') payload.width = media.width;
+    if (typeof media.height === 'number') payload.height = media.height;
+    if (typeof media.durationMs === 'number') payload.durationMs = media.durationMs;
+    if (typeof media.sizeBytes === 'number') payload.size = media.sizeBytes;
+    if (media.blurhash) payload.blurhash = media.blurhash;
+    return payload;
+};
+
+const serializeStoryReactions = (reactions: StoryReaction[]): Record<string, string[]> => {
+    return reactions.reduce<Record<string, string[]>>((acc, reaction) => {
+        acc[reaction.key] = [...reaction.senders];
+        return acc;
+    }, {});
+};
+
+const serializeStoryReads = (reads: Record<string, StoryReadReceipt>): Record<string, any> => {
+    const entries: Record<string, { ts: number; user_id?: string }> = {};
+    Object.values(reads).forEach(receipt => {
+        entries[receipt.storyId] = {
+            ts: receipt.timestamp,
+            user_id: receipt.userId,
+        };
+    });
+    return { seen: entries, updated_at: Date.now() };
+};
+
+const serializeStories = (stories: Story[]): Record<string, any> => ({
+    stories: stories.map(story => {
+        const base: Record<string, any> = { ...(story.raw ?? {}) };
+        base.id = story.id;
+        base.author = story.authorId;
+        if (story.authorDisplayName) {
+            base.author_display_name = story.authorDisplayName;
+        }
+        base.created_at = story.createdAt;
+        if (story.expiresAt) {
+            base.expires_at = story.expiresAt;
+        }
+        if (story.caption) {
+            base.caption = story.caption;
+        }
+        base.media = serializeStoryMedia(story.media);
+        base.reactions = serializeStoryReactions(story.reactions);
+        base.seen_by = Array.from(new Set(story.seenBy));
+        base.seen_count = story.seenCount;
+        return base;
+    }),
+    updated_at: Date.now(),
+});
+
+const notifyStoryListeners = (client: MatrixClient) => {
+    const state = storyStateByClient.get(client);
+    if (!state) {
+        return;
+    }
+    const listeners = storyListenersByClient.get(client);
+    if (!listeners || listeners.size === 0) {
+        return;
+    }
+    const snapshot = cloneStoryState(state);
+    listeners.forEach(listener => {
+        try {
+            listener(snapshot);
+        } catch (error) {
+            console.warn('story listener failed', error);
+        }
+    });
+};
+
+const updateStoryState = (client: MatrixClient, nextState: StorySyncState): void => {
+    storyStateByClient.set(client, nextState);
+    notifyStoryListeners(client);
+};
+
+const ensureStoryState = (client: MatrixClient): StorySyncState => {
+    let state = storyStateByClient.get(client);
+    if (!state) {
+        try {
+            state = readStoryAccountData(client);
+        } catch (error) {
+            console.warn('Failed to read story account data', error);
+            state = { stories: [], reads: {} };
+        }
+        storyStateByClient.set(client, state);
+    }
+    return state;
+};
+
+const handleStoryAccountDataEvent = (client: MatrixClient, content: any): void => {
+    const previous = ensureStoryState(client);
+    const previousIds = new Set(previous.stories.map(story => story.id));
+    const next = readStoryAccountData(client);
+    storyStateByClient.set(client, next);
+    notifyStoryListeners(client);
+    const userId = client.getUserId?.() ?? null;
+    const newStories = next.stories.filter(story => !previousIds.has(story.id) && story.authorId !== userId);
+    newStories.forEach(story => {
+        const title = story.authorDisplayName
+            ? `${story.authorDisplayName} обновил(а) сторис`
+            : 'Новая сторис';
+        const body = story.caption
+            ? story.caption
+            : 'Откройте, чтобы посмотреть свежую историю.';
+        void sendNotification(title, body, {
+            type: 'story',
+            storyId: story.id,
+            authorId: story.authorId,
+        });
+    });
+};
+
+const handleStoryReadAccountDataEvent = (client: MatrixClient): void => {
+    const current = ensureStoryState(client);
+    const nextReads = parseStoryReads(client.getAccountData(STORY_READ_EVENT_TYPE as any)?.getContent?.(), client.getUserId?.());
+    const nextStories = applyReadsToStories(current.stories, nextReads, client.getUserId?.());
+    storyStateByClient.set(client, { stories: nextStories, reads: nextReads });
+    notifyStoryListeners(client);
+};
+
+export const loadStoriesFromAccountData = (client: MatrixClient): StorySyncState => {
+    const state = readStoryAccountData(client);
+    storyStateByClient.set(client, state);
+    return cloneStoryState(state);
+};
+
+export const getStoriesForClient = (client: MatrixClient): Story[] => {
+    const state = ensureStoryState(client);
+    return cloneStoryState(state).stories;
+};
+
+export const subscribeToStoryUpdates = (
+    client: MatrixClient,
+    listener: StoryListener,
+): (() => void) => {
+    const listeners = ensureStoryListenerSet(client);
+    listeners.add(listener);
+    const state = ensureStoryState(client);
+    try {
+        listener(cloneStoryState(state));
+    } catch (error) {
+        console.warn('story listener initial emission failed', error);
+    }
+    return () => {
+        const set = storyListenersByClient.get(client);
+        set?.delete(listener);
+    };
+};
+
+export const bindStoryAccountData = (client: MatrixClient): void => {
+    const cleanup = storyCleanupByClient.get(client);
+    cleanup?.();
+    try {
+        const initial = readStoryAccountData(client);
+        storyStateByClient.set(client, initial);
+    } catch (error) {
+        console.warn('Failed to bootstrap story account data', error);
+        storyStateByClient.set(client, { stories: [], reads: {} });
+    }
+    const handler = (event: MatrixEvent) => {
+        const type = event.getType?.();
+        if (type === STORY_EVENT_TYPE) {
+            handleStoryAccountDataEvent(client, event.getContent?.());
+        } else if (type === STORY_READ_EVENT_TYPE) {
+            handleStoryReadAccountDataEvent(client);
+        }
+    };
+    client.on(ClientEvent.AccountData as any, handler as any);
+    storyCleanupByClient.set(client, () => {
+        client.removeListener(ClientEvent.AccountData as any, handler as any);
+        storyListenersByClient.delete(client);
+    });
+};
+
+export const unbindStoryAccountData = (client: MatrixClient): void => {
+    const cleanup = storyCleanupByClient.get(client);
+    cleanup?.();
+    storyCleanupByClient.delete(client);
+    storyListenersByClient.delete(client);
+    storyStateByClient.delete(client);
+};
+
+const updateStoryCollection = (client: MatrixClient, updater: (state: StorySyncState, userId: string | null) => StorySyncState): StorySyncState => {
+    const current = ensureStoryState(client);
+    const userId = client.getUserId?.() ?? null;
+    const next = updater(current, userId);
+    storyStateByClient.set(client, next);
+    notifyStoryListeners(client);
+    return next;
+};
+
+export const markStoryAsRead = async (
+    client: MatrixClient,
+    storyId: string,
+    timestamp: number = Date.now(),
+): Promise<void> => {
+    if (!storyId) {
+        return;
+    }
+    const state = updateStoryCollection(client, (current, userId) => {
+        const reads = { ...current.reads };
+        const existing = reads[storyId];
+        const nextTimestamp = Math.max(existing?.timestamp ?? 0, timestamp);
+        reads[storyId] = {
+            storyId,
+            userId: userId ?? existing?.userId ?? 'unknown',
+            timestamp: nextTimestamp,
+        } satisfies StoryReadReceipt;
+        const stories = applyReadsToStories(current.stories, reads, userId);
+        return { stories, reads } satisfies StorySyncState;
+    });
+    try {
+        await client.setAccountData(STORY_READ_EVENT_TYPE as any, serializeStoryReads(state.reads) as any);
+    } catch (error) {
+        console.warn('Failed to persist story read receipts', error);
+    }
+};
+
+const updateStoryReactionsInState = (
+    story: Story,
+    emoji: string,
+    userId: string,
+    shouldReact: boolean,
+): StoryReaction[] => {
+    const reactions = story.reactions.map(reaction => ({
+        ...reaction,
+        senders: [...reaction.senders],
+    }));
+    const existingIndex = reactions.findIndex(reaction => reaction.key === emoji);
+    const existing = existingIndex >= 0 ? reactions[existingIndex] : null;
+    const senders = new Set(existing?.senders ?? []);
+    if (shouldReact) {
+        senders.add(userId);
+    } else {
+        senders.delete(userId);
+    }
+    const updated: StoryReaction = {
+        key: emoji,
+        senders: Array.from(senders),
+        count: senders.size,
+        selfReacted: senders.has(userId),
+    };
+    if (existingIndex >= 0) {
+        if (updated.count === 0 && !updated.selfReacted) {
+            reactions.splice(existingIndex, 1);
+        } else {
+            reactions[existingIndex] = updated;
+        }
+    } else if (updated.count > 0 || updated.selfReacted) {
+        reactions.push(updated);
+    }
+    return reactions;
+};
+
+export const toggleStoryReaction = async (
+    client: MatrixClient,
+    storyId: string,
+    emoji: string,
+    force?: boolean,
+): Promise<void> => {
+    if (!storyId || !emoji) {
+        return;
+    }
+    const userId = client.getUserId?.() ?? 'unknown';
+    let persistedState: StorySyncState | null = null;
+    const nextState = updateStoryCollection(client, (current, currentUserId) => {
+        const story = current.stories.find(item => item.id === storyId);
+        if (!story) {
+            return current;
+        }
+        const shouldReact =
+            typeof force === 'boolean'
+                ? force
+                : !story.reactions.some(reaction => reaction.key === emoji && reaction.senders.includes(userId));
+        const reactions = updateStoryReactionsInState(story, emoji, userId, shouldReact);
+        const updatedStory: Story = {
+            ...story,
+            reactions,
+        };
+        const stories = current.stories
+            .map(item => (item.id === storyId ? updatedStory : item))
+            .sort((a, b) => b.createdAt - a.createdAt);
+        const appliedStories = applyReadsToStories(stories, current.reads, currentUserId);
+        const next = { stories: appliedStories, reads: current.reads } satisfies StorySyncState;
+        persistedState = next;
+        return next;
+    });
+    if (!persistedState) {
+        return;
+    }
+    try {
+        await client.setAccountData(STORY_EVENT_TYPE as any, serializeStories(nextState.stories) as any);
+    } catch (error) {
+        console.warn('Failed to persist story reactions', error);
+    }
+};
+
+export const publishStory = async (client: MatrixClient, payload: CreateStoryPayload): Promise<Story> => {
+    const userId = client.getUserId?.() ?? 'unknown';
+    const createdAt = payload.createdAt ?? Date.now();
+    const storyId = payload.id ?? `story_${Math.random().toString(36).slice(2, 10)}_${createdAt}`;
+    const story: Story = {
+        id: storyId,
+        authorId: userId,
+        authorDisplayName: payload.raw?.authorDisplayName ?? payload.raw?.author_display_name,
+        createdAt,
+        expiresAt: payload.expiresAt,
+        caption: payload.caption,
+        media: payload.media,
+        reactions: parseStoryReactions(payload.reactions ?? {}, userId),
+        seenBy: payload.seenBy ? Array.from(new Set(payload.seenBy)) : [userId],
+        seenCount: payload.seenBy ? new Set(payload.seenBy).size : 1,
+        hasSeen: true,
+        raw: payload.raw ?? null,
+    } satisfies Story;
+    const nextState = updateStoryCollection(client, (current, currentUserId) => {
+        const filtered = current.stories.filter(existing => existing.id !== storyId);
+        const stories = applyReadsToStories([story, ...filtered], current.reads, currentUserId ?? userId);
+        return { stories, reads: current.reads } satisfies StorySyncState;
+    });
+    try {
+        await client.setAccountData(STORY_EVENT_TYPE as any, serializeStories(nextState.stories) as any);
+    } catch (error) {
+        console.warn('Failed to persist story payload', error);
+    }
+    return nextState.stories.find(entry => entry.id === storyId) ?? story;
+};
+
 let _boundClient: MatrixClient | null = null;
 let _isSyncing = false;
 
@@ -1465,6 +2171,11 @@ export const flushOutbox = async () => {
                 }
             }
             const sendRes = await _boundClient.sendEvent(item.roomId, item.type as any, baseContent);
+            try {
+                confirmTranscriptionJob(item.id, { eventId: sendRes.event_id, client: _boundClient, roomId: item.roomId, content: baseContent });
+            } catch (error) {
+                console.warn('Failed to schedule transcription for outbox item', error);
+            }
             await idbDelete(item.id);
             if (Array.isArray(workingItem.attachments)) {
                 for (const attachment of workingItem.attachments) {
@@ -1511,6 +2222,11 @@ export const enqueueOutbox = async (
 
 export const cancelOutboxItem = async (id: string) => {
     await idbDelete(id);
+    try {
+        cancelTranscriptionJob(id);
+    } catch (error) {
+        console.warn('Failed to cancel transcription job', error);
+    }
     _outboxEmitter.emit({ kind: 'cancelled', id });
     await updateServiceWorkerOutboxState();
 };
@@ -1827,6 +2543,10 @@ const GIF_FAVORITES_ACCOUNT_EVENT = 'com.econix.gif_favorites';
 
 let _translationSettingsCache: TranslationSettings | null = null;
 
+const TRANSCRIPTION_ACCOUNT_EVENT = 'com.econix.transcription.settings';
+const TRANSCRIPTION_LOCAL_KEY = 'econix.transcription.settings';
+let _transcriptionSettingsCache: ServiceTranscriptionSettings | null = null;
+
 /**
  * Read translation settings from Matrix account data or localStorage.
  * Account data has priority if present.
@@ -1872,6 +2592,87 @@ export async function setTranslationSettings(client: MatrixClient | null | undef
         }
     } catch (e) {
         console.warn('Failed to persist translation settings to account data', e);
+    }
+}
+
+const sanitizeTranscriptionSettings = (value: ServiceTranscriptionSettings | null | undefined): ServiceTranscriptionSettings | null => {
+    if (!value || typeof value !== 'object') return null;
+    const result: ServiceTranscriptionSettings = {};
+    if (typeof value.enabled === 'boolean') {
+        result.enabled = value.enabled;
+    }
+    if (typeof value.language === 'string' && value.language.trim().length) {
+        result.language = value.language.trim();
+    }
+    if (typeof value.maxDurationSec === 'number' && Number.isFinite(value.maxDurationSec)) {
+        result.maxDurationSec = Math.max(0, value.maxDurationSec);
+    }
+    return result;
+};
+
+const mergeTranscriptionSettings = (
+    defaults: ServiceTranscriptionSettings,
+    local: ServiceTranscriptionSettings | null,
+    remote: ServiceTranscriptionSettings | null,
+): ServiceTranscriptionSettings => {
+    const merged: ServiceTranscriptionSettings = { ...defaults };
+    const sources = [local, remote];
+    for (const source of sources) {
+        if (!source) continue;
+        if (typeof source.enabled === 'boolean') merged.enabled = source.enabled;
+        if (typeof source.language === 'string') merged.language = source.language;
+        if (typeof source.maxDurationSec === 'number') merged.maxDurationSec = source.maxDurationSec;
+    }
+    return merged;
+};
+
+export function getTranscriptionSettings(client?: MatrixClient | null): ServiceTranscriptionSettings {
+    try {
+        const defaults = (() => {
+            const runtime = getTranscriptionRuntimeConfig();
+            const base: ServiceTranscriptionSettings = { enabled: runtime.enabled };
+            if (runtime.defaultLanguage) base.language = runtime.defaultLanguage;
+            if (typeof runtime.maxDurationSec === 'number') base.maxDurationSec = runtime.maxDurationSec;
+            return base;
+        })();
+
+        const localRaw = (globalThis as any).localStorage?.getItem(TRANSCRIPTION_LOCAL_KEY);
+        const local = localRaw ? sanitizeTranscriptionSettings(JSON.parse(localRaw)) : null;
+        let remote: ServiceTranscriptionSettings | null = null;
+        if (client) {
+            const ev: any = (client as any).getAccountData?.(TRANSCRIPTION_ACCOUNT_EVENT as any);
+            const content = ev?.getContent?.();
+            if (content && typeof content === 'object') {
+                remote = sanitizeTranscriptionSettings({
+                    enabled: typeof content.enabled === 'boolean' ? content.enabled : undefined,
+                    language: typeof content.language === 'string' ? content.language : undefined,
+                    maxDurationSec: typeof content.maxDurationSec === 'number' ? content.maxDurationSec : undefined,
+                });
+            }
+        }
+        const merged = mergeTranscriptionSettings(defaults, local, remote);
+        _transcriptionSettingsCache = merged;
+        return merged;
+    } catch (error) {
+        console.warn('Failed to read transcription settings', error);
+        return _transcriptionSettingsCache || { enabled: false };
+    }
+}
+
+export async function setTranscriptionSettings(client: MatrixClient | null | undefined, settings: ServiceTranscriptionSettings): Promise<void> {
+    const sanitized = sanitizeTranscriptionSettings(settings) ?? {};
+    try {
+        (globalThis as any).localStorage?.setItem(TRANSCRIPTION_LOCAL_KEY, JSON.stringify(sanitized));
+    } catch (error) {
+        console.warn('Failed to persist transcription settings to localStorage', error);
+    }
+    _transcriptionSettingsCache = mergeTranscriptionSettings(getTranscriptionSettings(client), sanitized, null);
+    try {
+        if (client) {
+            await (client as any).setAccountData?.(TRANSCRIPTION_ACCOUNT_EVENT as any, sanitized as any);
+        }
+    } catch (error) {
+        console.warn('Failed to persist transcription settings to account data', error);
     }
 }
 
@@ -2432,9 +3233,9 @@ const bootstrapAuthenticatedClient = async (client: MatrixClient, secureProfile?
         console.warn('bindStickerPackWatcher failed', e);
     }
     try {
-        bindCallStateStore(client);
+        bindStoryAccountData(client);
     } catch (e) {
-        console.warn('bindCallStateStore failed', e);
+        console.warn('bindStoryAccountData failed', e);
     }
     if (secureProfile) {
         setSecureCloudProfileForClient(client, secureProfile);
@@ -2500,6 +3301,109 @@ export interface LoginOptions {
     secureProfile?: SecureCloudProfile;
     totpCode?: string;
     totpSessionId?: string;
+    onPasskeyAssertion?: (details: PasskeyAssertionDetails) => void;
+}
+
+export interface RegisterOptions {
+    onPasskeyAttestation?: (details: PasskeyAttestationDetails) => void;
+    onPasskeyAssertion?: (details: PasskeyAssertionDetails) => void;
+}
+
+interface WebAuthnPublicKeyOptions {
+    publicKey?: PublicKeyCredentialRequestOptions | PublicKeyCredentialCreationOptions;
+    public_key?: PublicKeyCredentialRequestOptions | PublicKeyCredentialCreationOptions;
+}
+
+const isPasskeyStage = (stage: string | undefined): stage is 'm.login.webauthn' | 'm.login.passkey' =>
+    stage === 'm.login.webauthn' || stage === 'm.login.passkey';
+
+const toBase64Url = (buffer: ArrayBuffer | Uint8Array): string => {
+    const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+    let binary = '';
+    for (let i = 0; i < bytes.byteLength; i += 1) {
+        binary += String.fromCharCode(bytes[i]);
+    }
+    return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/u, '');
+};
+
+const fromBase64Url = (input: string): Uint8Array => {
+    const normalized = input.replace(/-/g, '+').replace(/_/g, '/');
+    const padded = normalized + '==='.slice((normalized.length + 3) % 4);
+    const binary = atob(padded);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) {
+        bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes;
+};
+
+const normaliseRequestOptions = (raw: WebAuthnPublicKeyOptions | undefined): PublicKeyCredentialRequestOptions => {
+    const source = raw?.publicKey ?? raw?.public_key ?? raw;
+    if (!source || typeof source !== 'object') {
+        throw new Error('Сервер не предоставил параметры passkey для входа.');
+    }
+    const cloner: typeof structuredClone = typeof structuredClone === 'function'
+        ? structuredClone
+        : ((value: any) => JSON.parse(JSON.stringify(value)));
+    const options = cloner(source) as PublicKeyCredentialRequestOptions;
+    if (typeof options.challenge === 'string') {
+        options.challenge = fromBase64Url(options.challenge);
+    }
+    if (Array.isArray(options.allowCredentials)) {
+        options.allowCredentials = options.allowCredentials.map((cred) => {
+            const next = { ...cred } as PublicKeyCredentialDescriptor;
+            if (typeof next.id === 'string') {
+                next.id = fromBase64Url(next.id).buffer;
+            }
+            return next;
+        });
+    }
+    return options;
+};
+
+const normaliseCreationOptions = (raw: WebAuthnPublicKeyOptions | undefined): PublicKeyCredentialCreationOptions => {
+    const source = raw?.publicKey ?? raw?.public_key ?? raw;
+    if (!source || typeof source !== 'object') {
+        throw new Error('Сервер не предоставил параметры passkey для регистрации.');
+    }
+    const cloner: typeof structuredClone = typeof structuredClone === 'function'
+        ? structuredClone
+        : ((value: any) => JSON.parse(JSON.stringify(value)));
+    const options = cloner(source) as PublicKeyCredentialCreationOptions;
+    if (typeof options.challenge === 'string') {
+        options.challenge = fromBase64Url(options.challenge);
+    }
+    if (options.user && typeof options.user.id === 'string') {
+        options.user = { ...options.user, id: fromBase64Url(options.user.id) };
+    }
+    if (Array.isArray(options.excludeCredentials)) {
+        options.excludeCredentials = options.excludeCredentials.map((cred) => {
+            const next = { ...cred } as PublicKeyCredentialDescriptor;
+            if (typeof next.id === 'string') {
+                next.id = fromBase64Url(next.id).buffer;
+            }
+            return next;
+        });
+    }
+    return options;
+};
+
+const requireWebAuthnAvailability = () => {
+    if (typeof navigator === 'undefined' || typeof navigator.credentials?.get !== 'function') {
+        throw new Error('В этой среде недоступна аппаратная проверка passkey.');
+    }
+};
+
+export interface PasskeyAssertionDetails {
+    credentialId: string;
+    stage: 'm.login.webauthn' | 'm.login.passkey';
+    transports?: AuthenticatorTransport[];
+}
+
+export interface PasskeyAttestationDetails {
+    credentialId: string;
+    stage: 'm.login.webauthn' | 'm.login.passkey';
+    transports?: AuthenticatorTransport[];
 }
 
 export class TotpRequiredError extends Error {
@@ -2547,31 +3451,25 @@ export const login = async (
     } as const;
 
     const trimmedTotp = typeof options.totpCode === 'string' ? options.totpCode.trim() : undefined;
-    let authPayload: { type: string; code: string; session?: string } | undefined = undefined;
     let totpAttempted = false;
     let sessionHint = options.totpSessionId ?? undefined;
+    let nextAuthPayload: Record<string, any> | undefined;
+    let passkeyAttempts = 0;
+    let pendingPasskeyDetails: PasskeyAssertionDetails | null = null;
 
     const performLogin = async () => {
         const payload: Record<string, any> = {
             identifier,
             password,
         };
-        if (authPayload) {
-            payload.auth = authPayload;
+        if (nextAuthPayload) {
+            payload.auth = nextAuthPayload;
+            nextAuthPayload = undefined;
         }
         return await client.login('m.login.password', payload);
     };
 
     while (true) {
-        if (trimmedTotp && !totpAttempted && !authPayload) {
-            authPayload = {
-                type: 'm.login.totp',
-                code: trimmedTotp,
-                ...(sessionHint ? { session: sessionHint } : {}),
-            };
-            totpAttempted = true;
-        }
-
         try {
             await performLogin();
             break;
@@ -2581,41 +3479,98 @@ export const login = async (
                 ? matrixError.data.flows
                 : [];
             const sessionId = matrixError?.data?.session ?? sessionHint;
-            const requiresTotp = flows.some((flow) => Array.isArray(flow?.stages) && flow.stages.includes('m.login.totp'));
+            const completed = new Set<string>(
+                Array.isArray(matrixError?.data?.completed) ? matrixError.data.completed.filter(Boolean) : [],
+            );
+            const requiresTotp =
+                flows.some((flow) => Array.isArray(flow?.stages) && flow.stages.includes('m.login.totp')) &&
+                !completed.has('m.login.totp');
+            const passkeyStage = flows
+                .flatMap((flow) => flow.stages ?? [])
+                .find((stage) => isPasskeyStage(stage) && !completed.has(stage));
+            sessionHint = sessionId ?? sessionHint;
 
             if (matrixError?.errcode === 'M_FORBIDDEN' && requiresTotp) {
-                sessionHint = sessionId ?? sessionHint;
-                if (trimmedTotp) {
-                    if (totpAttempted && authPayload) {
-                        throw new TotpRequiredError(
-                            matrixError?.data?.error || matrixError?.message || 'Неверный одноразовый код или код истёк.',
-                            {
-                                sessionId: sessionHint,
-                                flows,
-                                validationError: true,
-                                cause: error,
-                            },
-                        );
-                    }
-
-                    authPayload = {
-                        type: 'm.login.totp',
-                        code: trimmedTotp,
-                        ...(sessionHint ? { session: sessionHint } : {}),
-                    };
-                    totpAttempted = true;
-                    continue;
+                if (!trimmedTotp) {
+                    throw new TotpRequiredError(
+                        'Эта учётная запись защищена двухфакторной аутентификацией. Введите код из приложения TOTP.',
+                        {
+                            sessionId: sessionHint,
+                            flows,
+                            validationError: false,
+                            cause: error,
+                        },
+                    );
                 }
 
-                throw new TotpRequiredError(
-                    'Эта учётная запись защищена двухфакторной аутентификацией. Введите код из приложения TOTP.',
-                    {
-                        sessionId: sessionHint,
-                        flows,
-                        validationError: false,
-                        cause: error,
+                if (totpAttempted) {
+                    throw new TotpRequiredError(
+                        matrixError?.data?.error || matrixError?.message || 'Неверный одноразовый код или код истёк.',
+                        {
+                            sessionId: sessionHint,
+                            flows,
+                            validationError: true,
+                            cause: error,
+                        },
+                    );
+                }
+
+                nextAuthPayload = {
+                    type: 'm.login.totp',
+                    code: trimmedTotp,
+                    ...(sessionHint ? { session: sessionHint } : {}),
+                };
+                totpAttempted = true;
+                continue;
+            }
+
+            if (matrixError?.errcode === 'M_FORBIDDEN' && passkeyStage && isPasskeyStage(passkeyStage)) {
+                if (passkeyAttempts > 0 && matrixError?.data?.error) {
+                    throw new Error(matrixError.data.error);
+                }
+
+                requireWebAuthnAvailability();
+                const rawParams =
+                    typeof matrixError?.data?.params === 'object' && matrixError?.data?.params !== null
+                        ? (matrixError.data.params?.[passkeyStage] ?? matrixError.data.params)
+                        : undefined;
+                const publicKey = normaliseRequestOptions(rawParams);
+
+                let credential: PublicKeyCredential | null = null;
+                try {
+                    credential = (await navigator.credentials.get({ publicKey })) as PublicKeyCredential | null;
+                } catch (getError: any) {
+                    throw new Error(getError?.message || 'Проверка passkey отменена.');
+                }
+
+                if (!credential) {
+                    throw new Error('Проверка passkey отменена пользователем.');
+                }
+
+                const response = credential.response as AuthenticatorAssertionResponse;
+                nextAuthPayload = {
+                    type: passkeyStage,
+                    session: sessionHint,
+                    response: {
+                        id: credential.id,
+                        rawId: toBase64Url(credential.rawId),
+                        type: credential.type,
+                        response: {
+                            clientDataJSON: toBase64Url(response.clientDataJSON),
+                            authenticatorData: toBase64Url(response.authenticatorData),
+                            signature: toBase64Url(response.signature),
+                            userHandle: response.userHandle ? toBase64Url(response.userHandle) : undefined,
+                        },
+                        extensions: credential.getClientExtensionResults?.() ?? undefined,
                     },
-                );
+                };
+                pendingPasskeyDetails = {
+                    credentialId: toBase64Url(credential.rawId),
+                    stage: passkeyStage,
+                    transports: undefined,
+                };
+                passkeyAttempts += 1;
+                continue;
             }
 
             throw new Error(matrixError?.data?.error || matrixError?.message || 'Вход не выполнен.');
@@ -2624,14 +3579,30 @@ export const login = async (
 
     await bootstrapAuthenticatedClient(client, options.secureProfile);
 
+    if (pendingPasskeyDetails) {
+        try {
+            options.onPasskeyAssertion?.(pendingPasskeyDetails);
+        } catch (err) {
+            console.warn('Passkey assertion handler failed', err);
+        }
+    }
+
     return client;
 };
 
-export const register = async (homeserverUrl: string, username: string, password: string): Promise<MatrixClient> => {
+export const register = async (
+    homeserverUrl: string,
+    username: string,
+    password: string,
+    options: RegisterOptions = {},
+): Promise<MatrixClient> => {
     const client = await initClient(homeserverUrl);
     let sessionId: string | null = null;
     let hasAttemptedDummy = false;
     let registerResponse: Awaited<ReturnType<typeof client.register>> | null = null;
+    let nextAuthPayload: Record<string, any> | undefined;
+    let passkeyAttempts = 0;
+    let pendingPasskeyDetails: PasskeyAttestationDetails | null = null;
 
     while (true) {
         try {
@@ -2639,11 +3610,12 @@ export const register = async (homeserverUrl: string, username: string, password
                 username,
                 password,
                 sessionId,
-                sessionId ? { type: "m.login.dummy", session: sessionId } : { type: "m.login.dummy" },
+                nextAuthPayload ?? (sessionId ? { type: "m.login.dummy", session: sessionId } : { type: "m.login.dummy" }),
                 undefined,
                 undefined,
                 true,
             );
+            nextAuthPayload = undefined;
             break;
         } catch (error: any) {
             const matrixError = error ?? {};
@@ -2651,11 +3623,64 @@ export const register = async (homeserverUrl: string, username: string, password
                 ? matrixError.data.flows
                 : [];
             const stages = flows.flatMap((flow) => flow.stages ?? []);
+            const completed = new Set<string>(
+                Array.isArray(matrixError?.data?.completed) ? matrixError.data.completed.filter(Boolean) : [],
+            );
 
             if (!hasAttemptedDummy && matrixError?.data?.session && flows.length > 0) {
                 if (stages.every((stage) => stage === "m.login.dummy") && stages.includes("m.login.dummy")) {
                     sessionId = matrixError.data.session;
                     hasAttemptedDummy = true;
+                    continue;
+                }
+
+                const passkeyStage = stages.find((stage) => isPasskeyStage(stage) && !completed.has(stage));
+                if (matrixError?.errcode === 'M_FORBIDDEN' && passkeyStage && isPasskeyStage(passkeyStage)) {
+                    if (passkeyAttempts > 0 && matrixError?.data?.error) {
+                        throw new Error(matrixError.data.error);
+                    }
+
+                    requireWebAuthnAvailability();
+                    sessionId = matrixError?.data?.session ?? sessionId;
+                    const rawParams =
+                        typeof matrixError?.data?.params === 'object' && matrixError?.data?.params !== null
+                            ? (matrixError.data.params?.[passkeyStage] ?? matrixError.data.params)
+                            : undefined;
+                    const publicKey = normaliseCreationOptions(rawParams);
+
+                    let credential: PublicKeyCredential | null = null;
+                    try {
+                        credential = (await navigator.credentials.create({ publicKey })) as PublicKeyCredential | null;
+                    } catch (createError: any) {
+                        throw new Error(createError?.message || 'Регистрация passkey отменена.');
+                    }
+
+                    if (!credential) {
+                        throw new Error('Регистрация passkey отменена пользователем.');
+                    }
+
+                    const response = credential.response as AuthenticatorAttestationResponse;
+                    const transports = typeof response.getTransports === 'function' ? response.getTransports() : undefined;
+                    nextAuthPayload = {
+                        type: passkeyStage,
+                        session: matrixError?.data?.session,
+                        response: {
+                            id: credential.id,
+                            rawId: toBase64Url(credential.rawId),
+                            type: credential.type,
+                            response: {
+                                clientDataJSON: toBase64Url(response.clientDataJSON),
+                                attestationObject: toBase64Url(response.attestationObject),
+                            },
+                            transports,
+                        },
+                    };
+                    pendingPasskeyDetails = {
+                        credentialId: toBase64Url(credential.rawId),
+                        stage: passkeyStage,
+                        transports: transports ?? undefined,
+                    };
+                    passkeyAttempts += 1;
                     continue;
                 }
 
@@ -2702,7 +3727,19 @@ export const register = async (homeserverUrl: string, username: string, password
     }
 
     const userId = registerResponse?.user_id || username;
-    return await login(homeserverUrl, userId, password);
+    if (pendingPasskeyDetails) {
+        try {
+            options.onPasskeyAttestation?.(pendingPasskeyDetails);
+        } catch (err) {
+            console.warn('Passkey attestation handler failed', err);
+        }
+    }
+    const followupLoginOptions = options.onPasskeyAssertion
+        ? { onPasskeyAssertion: options.onPasskeyAssertion }
+        : undefined;
+    return followupLoginOptions
+        ? await login(homeserverUrl, userId, password, followupLoginOptions)
+        : await login(homeserverUrl, userId, password);
 };
 
 export const loginWithToken = async (homeserverUrl: string, loginToken: string): Promise<MatrixClient> => {
@@ -3894,12 +4931,16 @@ const applySelfDestructContent = async (client: MatrixClient, roomId: string, co
 };
 
 export const sendAudioMessage = async (client: MatrixClient, roomId: string, file: Blob, duration: number): Promise<{ event_id: string }> => {
+    const durationMs = Math.round(duration * 1000);
+    const transcriptionSettings = getTranscriptionSettings(client);
+    const runtimeConfig = getTranscriptionRuntimeConfig();
+    const shouldAttemptTranscription = (transcriptionSettings.enabled ?? runtimeConfig.enabled) && Boolean(runtimeConfig.endpoint);
     const content = {
         body: "Voice Message",
         info: {
             mimetype: file.type,
             size: file.size,
-            duration: Math.round(duration * 1000), // duration in milliseconds
+            duration: durationMs,
         },
         msgtype: MsgType.Audio,
         url: undefined as unknown as string,
@@ -3910,7 +4951,21 @@ export const sendAudioMessage = async (client: MatrixClient, roomId: string, fil
             name: "voice-message.ogg",
             type: file.type,
         });
-        return client.sendEvent(roomId, EventType.RoomMessage, { ...content, url: mxcUrl } as any);
+        const result = await client.sendEvent(roomId, EventType.RoomMessage, { ...content, url: mxcUrl } as any);
+        if (shouldAttemptTranscription && result?.event_id) {
+            enqueueTranscriptionJob({
+                client,
+                roomId,
+                eventId: result.event_id,
+                msgType: MsgType.Audio,
+                mimeType: file.type,
+                durationMs,
+                file,
+                mxcUrl,
+                settings: transcriptionSettings,
+            });
+        }
+        return result;
     };
 
     const queueOutbox = async () => {
@@ -3921,6 +4976,17 @@ export const sendAudioMessage = async (client: MatrixClient, roomId: string, fil
         });
         const localId = await enqueueOutbox(roomId, EventType.RoomMessage, content, { attachments: [attachment] });
         clearNextMessageTTL(roomId);
+        if (shouldAttemptTranscription) {
+            enqueueTranscriptionJob({
+                client,
+                roomId,
+                localId,
+                msgType: MsgType.Audio,
+                mimeType: file.type,
+                durationMs,
+                settings: transcriptionSettings,
+            });
+        }
         return { event_id: localId };
     };
 
@@ -3946,12 +5012,16 @@ export const sendVideoMessage = async (
     file: Blob,
     metadata: VideoMessageMetadata,
 ): Promise<{ event_id: string }> => {
+    const durationMs = Math.round(metadata.durationMs);
+    const transcriptionSettings = getTranscriptionSettings(client);
+    const runtimeConfig = getTranscriptionRuntimeConfig();
+    const shouldAttemptTranscription = (transcriptionSettings.enabled ?? runtimeConfig.enabled) && Boolean(runtimeConfig.endpoint);
     const content: any = {
         body: 'Video message',
         info: {
             mimetype: metadata.mimeType,
             size: file.size,
-            duration: Math.round(metadata.durationMs),
+            duration: durationMs,
             w: metadata.width,
             h: metadata.height,
             thumbnail_url: undefined as unknown as string,
@@ -3993,7 +5063,21 @@ export const sendVideoMessage = async (
         if (thumbMxc) {
             payload.info = { ...payload.info, thumbnail_url: thumbMxc };
         }
-        return client.sendEvent(roomId, EventType.RoomMessage, payload as any);
+        const result = await client.sendEvent(roomId, EventType.RoomMessage, payload as any);
+        if (shouldAttemptTranscription && result?.event_id) {
+            enqueueTranscriptionJob({
+                client,
+                roomId,
+                eventId: result.event_id,
+                msgType: MsgType.Video,
+                mimeType: metadata.mimeType,
+                durationMs,
+                file,
+                mxcUrl: videoMxc,
+                settings: transcriptionSettings,
+            });
+        }
+        return result;
     };
 
     const queueOutbox = async () => {
@@ -4011,6 +5095,17 @@ export const sendVideoMessage = async (
         });
         const localId = await enqueueOutbox(roomId, EventType.RoomMessage, content, { attachments: [videoAttachment, thumbAttachment] });
         clearNextMessageTTL(roomId);
+        if (shouldAttemptTranscription) {
+            enqueueTranscriptionJob({
+                client,
+                roomId,
+                localId,
+                msgType: MsgType.Video,
+                mimeType: metadata.mimeType,
+                durationMs,
+                settings: transcriptionSettings,
+            });
+        }
         return { event_id: localId };
     };
 
@@ -4065,6 +5160,72 @@ export const sendFileMessage = async (client: MatrixClient, roomId: string, file
 
     try {
         return await sendDirect();
+    } catch (error) {
+        if (shouldQueueFromError(error)) {
+            return queueOutbox();
+        }
+        throw error;
+    }
+};
+
+export const sendLocationMessage = async (
+    client: MatrixClient,
+    roomId: string,
+    payload: LocationContentPayload,
+): Promise<{ event_id: string }> => {
+    if (!Number.isFinite(payload.latitude) || !Number.isFinite(payload.longitude)) {
+        throw new Error('Invalid coordinates for location message');
+    }
+
+    const latitude = payload.latitude;
+    const longitude = payload.longitude;
+    const zoom = sanitizeZoom(payload.zoom ?? MAP_ZOOM_DEFAULT);
+    const geoUri = buildGeoUri(latitude, longitude, payload.accuracy);
+    const description = (payload.description ?? '').trim() || `📍 ${latitude.toFixed(5)}, ${longitude.toFixed(5)}`;
+    const thumbnailUrl = buildStaticMapUrl(latitude, longitude, zoom, STATIC_MAP_WIDTH, STATIC_MAP_HEIGHT);
+    const externalUrl = buildExternalNavigationUrl(latitude, longitude, zoom);
+
+    const content: Record<string, any> = {
+        body: description,
+        msgtype: MsgType.Location,
+        geo_uri: geoUri,
+        'm.location': {
+            uri: geoUri,
+            description,
+        },
+        info: {
+            thumbnail_url: thumbnailUrl,
+            thumbnail_info: {
+                mimetype: 'image/png',
+                w: STATIC_MAP_WIDTH,
+                h: STATIC_MAP_HEIGHT,
+            },
+        },
+        external_url: externalUrl,
+        'com.matrix_messenger.map_zoom': zoom,
+    };
+
+    if (typeof payload.accuracy === 'number' && Number.isFinite(payload.accuracy) && payload.accuracy > 0) {
+        content['m.location'].accuracy = Math.round(payload.accuracy);
+    }
+
+    await applySelfDestructContent(client, roomId, content);
+
+    const sendDirect = async () => client.sendEvent(roomId, EventType.RoomMessage, content as any);
+    const queueOutbox = async () => {
+        const localId = await enqueueOutbox(roomId, EventType.RoomMessage, content);
+        clearNextMessageTTL(roomId);
+        return { event_id: localId };
+    };
+
+    if (isOffline()) {
+        return queueOutbox();
+    }
+
+    try {
+        const result = await sendDirect();
+        clearNextMessageTTL(roomId);
+        return result;
     } catch (error) {
         if (shouldQueueFromError(error)) {
             return queueOutbox();

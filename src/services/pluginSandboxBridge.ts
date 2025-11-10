@@ -19,7 +19,9 @@ import {
   type SandboxLogMessage,
   type SerializedCommandDefinition,
   type SandboxInboundMessage,
+  type SandboxUiRenderMessage,
 } from './pluginSandboxProtocol';
+import { dispatchSurfaceRender, type PluginSurfaceDefinition } from './pluginUiRegistry';
 
 export interface SandboxManifest {
   id: string;
@@ -36,10 +38,18 @@ export interface PluginSandboxOptions {
   allowedActions: string[];
   allowStorage: boolean;
   allowScheduler: boolean;
+  allowUiPanel: boolean;
+  allowBackground: boolean;
+  surfaces: PluginSurfaceDefinition[];
   createWorker?: (url: URL) => Worker;
   configureAnimatedReactions?: (pluginId: string, payload: ConfigureAnimatedReactionsPayload) => Promise<unknown> | unknown;
   getAnimatedReactionsPreference?: () => boolean;
 }
+
+const COMMAND_TIMEOUT_MS = 15_000;
+const MAX_PENDING_COMMANDS = 25;
+const UI_RENDER_WINDOW_MS = 1_000;
+const MAX_UI_RENDER_EVENTS_PER_WINDOW = 30;
 
 class PluginSandboxBridge {
   private readonly options: PluginSandboxOptions;
@@ -53,7 +63,12 @@ class PluginSandboxBridge {
   private rejectReady: ((error: Error) => void) | null = null;
   private readonly eventDisposers = new Map<PluginEventName, () => void>();
   private readonly commandDisposers = new Map<number, () => void>();
-  private readonly pendingCommands = new Map<number, { resolve(value: SandboxCommandResult): void; reject(error: Error): void }>();
+  private readonly pendingCommands = new Map<
+    number,
+    { resolve(value: SandboxCommandResult): void; reject(error: Error): void; timeout: ReturnType<typeof setTimeout> }
+  >();
+  private readonly surfaces = new Map<string, PluginSurfaceDefinition>();
+  private readonly uiRenderTimestamps: number[] = [];
   private nextRequestId = 1;
 
   constructor(options: PluginSandboxOptions, ctx: PluginContext) {
@@ -61,6 +76,9 @@ class PluginSandboxBridge {
     this.ctx = ctx;
     this.allowedEvents = new Set(options.allowedEvents);
     this.allowedActions = new Set(options.allowedActions);
+    for (const surface of options.surfaces ?? []) {
+      this.surfaces.set(surface.id, surface);
+    }
   }
 
   async initialise(): Promise<void> {
@@ -91,6 +109,9 @@ class PluginSandboxBridge {
       allowedActions: Array.from(this.allowedActions),
       allowStorage: this.options.allowStorage,
       allowScheduler: this.options.allowScheduler,
+      allowUiPanel: this.options.allowUiPanel,
+      allowBackground: this.options.allowBackground,
+      surfaces: this.options.surfaces.map(surface => ({ id: surface.id, location: surface.location })),
     };
     this.worker.postMessage(initMessage);
     await this.readyPromise;
@@ -114,6 +135,9 @@ class PluginSandboxBridge {
       void Promise.resolve(disposer()).catch(error => console.warn('[plugin-sandbox] Failed to dispose command', error));
     }
     this.commandDisposers.clear();
+    for (const pending of this.pendingCommands.values()) {
+      clearTimeout(pending.timeout);
+    }
     this.pendingCommands.clear();
     if (this.options.configureAnimatedReactions) {
       try {
@@ -160,6 +184,9 @@ class PluginSandboxBridge {
       case SANDBOX_MESSAGE.LOG:
         this.handleLog(message as SandboxLogMessage);
         break;
+      case SANDBOX_MESSAGE.UI_RENDER:
+        this.handleUiRender(message as SandboxUiRenderMessage);
+        break;
       case SANDBOX_MESSAGE.ERROR:
         console.error('[plugin-sandbox] Worker error', message.error);
         break;
@@ -200,6 +227,36 @@ class PluginSandboxBridge {
     }
   }
 
+  private isUiRenderAllowed(): boolean {
+    const now = Date.now();
+    this.uiRenderTimestamps.push(now);
+    while (this.uiRenderTimestamps.length > 0 && now - this.uiRenderTimestamps[0] > UI_RENDER_WINDOW_MS) {
+      this.uiRenderTimestamps.shift();
+    }
+    return this.uiRenderTimestamps.length <= MAX_UI_RENDER_EVENTS_PER_WINDOW;
+  }
+
+  private handleUiRender(message: SandboxUiRenderMessage) {
+    if (!this.options.allowUiPanel) {
+      console.warn('[plugin-sandbox] UI render rejected: ui.panel permission not granted');
+      return;
+    }
+    if (!this.surfaces.has(message.surfaceId)) {
+      console.warn('[plugin-sandbox] UI render rejected: unknown surface', message.surfaceId);
+      return;
+    }
+    if (!this.isUiRenderAllowed()) {
+      console.warn('[plugin-sandbox] UI render throttled for plugin', this.options.manifest.id);
+      return;
+    }
+    dispatchSurfaceRender({
+      pluginId: this.options.manifest.id,
+      surfaceId: message.surfaceId,
+      payload: message.payload,
+      timestamp: Date.now(),
+    });
+  }
+
   private handleSubscription(message: SandboxEventSubscription) {
     if (!this.allowedEvents.has(message.event)) {
       console.warn('[plugin-sandbox] Plugin attempted to subscribe to disallowed event', message.event);
@@ -234,9 +291,27 @@ class PluginSandboxBridge {
       if (!this.worker) {
         throw new Error('Sandbox worker not available');
       }
+      if (this.pendingCommands.size >= MAX_PENDING_COMMANDS) {
+        throw new Error('Too many pending command invocations for plugin');
+      }
       const requestId = this.nextId();
       const pending = new Promise<SandboxCommandResult>((resolve, reject) => {
-        this.pendingCommands.set(requestId, { resolve, reject });
+        const timeout = window.setTimeout(() => {
+          if (this.pendingCommands.delete(requestId)) {
+            reject(new Error('Command execution timed out'));
+          }
+        }, COMMAND_TIMEOUT_MS);
+        this.pendingCommands.set(requestId, {
+          resolve: value => {
+            clearTimeout(timeout);
+            resolve(value);
+          },
+          reject: error => {
+            clearTimeout(timeout);
+            reject(error);
+          },
+          timeout,
+        });
       });
       const message: SandboxCommandInvoke = {
         type: SANDBOX_MESSAGE.COMMAND_INVOKE,

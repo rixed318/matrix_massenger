@@ -254,14 +254,29 @@ self.addEventListener('message', (event: any) => {
 self.addEventListener('push', (event: any) => {
   let data: any = {};
   try { data = event.data ? event.data.json() : {}; } catch {}
-  const title = data.title || 'New message';
   const options: any = {
     body: data.body || '',
     icon: data.icon || '/icon-192.png',
     tag: data.tag || 'econix-msg',
-    data: data.data || {}
+    data: { ...(data.data || {}) }
   };
-  const roomId = options.data?.roomId || data.roomId;
+  const eventType = options.data?.type ?? data.type;
+  const isStory = eventType === 'story';
+  const authorLabel = options.data?.authorDisplayName ?? data.authorDisplayName ?? data.author;
+  let title = data.title || (isStory ? (authorLabel ? `${authorLabel} обновил(а) сторис` : 'Новая сторис') : 'New message');
+  let body = data.body || options.body || (isStory ? 'Откройте, чтобы посмотреть историю.' : '');
+  if (isStory) {
+    const storyId = options.data?.storyId ?? data.storyId ?? `story-${Date.now()}`;
+    options.tag = data.tag || `econix-story-${storyId}`;
+    options.data = {
+      ...options.data,
+      type: 'story',
+      storyId,
+      authorId: options.data?.authorId ?? data.authorId,
+      url: options.data?.url || data.url || `/?story=${encodeURIComponent(storyId)}`,
+    };
+  }
+  const roomId = isStory ? undefined : (options.data?.roomId || data.roomId);
   const isMention = Boolean(options.data?.isMention ?? data.isMention ?? data.highlight);
   if (roomId) {
     const preference = roomNotificationPreferences[roomId];
@@ -275,6 +290,7 @@ self.addEventListener('push', (event: any) => {
   if (latestPushSubscription && typeof options.data === 'object' && options.data) {
     options.data.subscription = options.data.subscription || latestPushSubscription;
   }
+  options.body = body;
   event.waitUntil(self.registration.showNotification(title, options));
 });
 

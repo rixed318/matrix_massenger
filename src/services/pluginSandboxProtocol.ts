@@ -27,6 +27,7 @@ export const SANDBOX_MESSAGE = {
   LOG: 'sandbox:log',
   ERROR: 'sandbox:error',
   DISPOSE: 'sandbox:dispose',
+  UI_RENDER: 'sandbox:ui-render',
 } as const;
 
 export type SandboxMessageType = typeof SANDBOX_MESSAGE[keyof typeof SANDBOX_MESSAGE];
@@ -130,6 +131,9 @@ export type SandboxInitMessage = {
   allowedActions: SandboxActionName[];
   allowStorage: boolean;
   allowScheduler: boolean;
+  allowUiPanel: boolean;
+  allowBackground: boolean;
+  surfaces: Array<{ id: string; location: string }>;
 };
 
 export type SandboxReadyMessage = {
@@ -193,7 +197,8 @@ export type SandboxOutboundMessage =
   | SandboxStorageRequest
   | SandboxMatrixRequest
   | SandboxLogMessage
-  | SandboxErrorMessage;
+  | SandboxErrorMessage
+  | SandboxUiRenderMessage;
 
 export type SandboxInboundMessage =
   | SandboxInitMessage
@@ -203,3 +208,9 @@ export type SandboxInboundMessage =
   | SandboxStorageResponse
   | SandboxMatrixResponse
   | SandboxDisposeMessage;
+
+export type SandboxUiRenderMessage = {
+  type: typeof SANDBOX_MESSAGE.UI_RENDER;
+  surfaceId: string;
+  payload: unknown;
+};

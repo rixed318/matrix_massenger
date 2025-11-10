@@ -4,8 +4,10 @@ import { sendTypingIndicator, getRoomTTL, setRoomTTL, setNextMessageTTL } from '
 import type { GifFavorite } from '@matrix-messenger/core';
 import MentionSuggestions from './MentionSuggestions';
 import StickerGifPicker from './StickerGifPicker';
-import type { DraftAttachment, DraftContent, SendKeyBehavior, VideoMessageMetadata } from '../types';
+import type { DraftAttachment, DraftContent, LocationContentPayload, SendKeyBehavior, VideoMessageMetadata } from '../types';
 import { pickSupportedVideoMimeType, readVideoMetadata } from '../utils/media';
+import LocationPickerDialog from './LocationPickerDialog';
+import { DEFAULT_LOCATION } from '../utils/location';
 
 const VIDEO_MAX_DURATION_SECONDS = 30;
 
@@ -117,6 +119,7 @@ interface MessageInputProps {
     onSendVideo: (file: Blob, metadata: VideoMessageMetadata) => void;
     onSendSticker: (sticker: Sticker) => void;
     onSendGif: (gif: Gif) => void;
+    onSendLocation: (payload: LocationContentPayload) => void | Promise<void>;
     onOpenCreatePoll: () => void;
     onSchedule: (content: DraftContent) => void;
     isSending: boolean;
@@ -131,7 +134,7 @@ interface MessageInputProps {
 }
 
 const MessageInput: React.FC<MessageInputProps> = ({
-    onSendMessage, onSendFile, onSendAudio, onSendVideo, onSendSticker, onSendGif, onOpenCreatePoll, onSchedule,
+    onSendMessage, onSendFile, onSendAudio, onSendVideo, onSendSticker, onSendGif, onSendLocation, onOpenCreatePoll, onSchedule,
     isSending, client, roomId, replyingTo, onCancelReply, roomMembers, draftContent, onDraftChange,
     sendKeyBehavior
 }) => {
@@ -152,6 +155,10 @@ const MessageInput: React.FC<MessageInputProps> = ({
     const [roomTtlMs, setRoomTtlMs] = useState<number | null>(null);
     const [nextMessageTtlMs, setNextMessageTtlMs] = useState<number | null>(null);
     const [ttlMenuOpen, setTtlMenuOpen] = useState(false);
+    const [isLocationDialogOpen, setIsLocationDialogOpen] = useState(false);
+    const [locationDraft, setLocationDraft] = useState<{ latitude: number; longitude: number; accuracy?: number } | null>(null);
+    const [isLocating, setIsLocating] = useState(false);
+    const [locationError, setLocationError] = useState<string | null>(null);
     const ttlMenuRef = useRef<HTMLDivElement>(null);
 
 
@@ -181,6 +188,12 @@ const MessageInput: React.FC<MessageInputProps> = ({
         resetVideoRecordingState();
         discardVideoDraft();
     }, [discardVideoDraft, draftContent, resetVideoRecordingState, roomId]);
+
+    useEffect(() => {
+        if (isLocationDialogOpen && !locationDraft) {
+            setLocationDraft(DEFAULT_LOCATION);
+        }
+    }, [isLocationDialogOpen, locationDraft]);
 
     const formattedHtml = useMemo(() => renderMarkdown(content, roomMembers), [content, roomMembers]);
 
@@ -326,6 +339,67 @@ const MessageInput: React.FC<MessageInputProps> = ({
         document.addEventListener('mousedown', handleClickOutside);
         return () => document.removeEventListener('mousedown', handleClickOutside);
     }, []);
+
+    const handleOpenLocationDialog = () => {
+        if (!roomId) {
+            return;
+        }
+        setLocationError(null);
+        setIsLocationDialogOpen(true);
+        setIsLocating(false);
+        setLocationDraft(prev => prev ?? DEFAULT_LOCATION);
+
+        if (typeof navigator !== 'undefined' && navigator.geolocation) {
+            setIsLocating(true);
+            navigator.geolocation.getCurrentPosition(
+                position => {
+                    setIsLocating(false);
+                    setLocationDraft({
+                        latitude: position.coords.latitude,
+                        longitude: position.coords.longitude,
+                        accuracy: position.coords.accuracy,
+                    });
+                },
+                (error: GeolocationPositionError) => {
+                    setIsLocating(false);
+                    let message = 'Не удалось получить геолокацию.';
+                    if (error?.code === 1) {
+                        message = 'Доступ к геолокации запрещён.';
+                    } else if (error?.code === 2) {
+                        message = 'Службы геолокации недоступны.';
+                    } else if (error?.code === 3) {
+                        message = 'Истекло время ожидания геолокации.';
+                    }
+                    setLocationError(message);
+                },
+                { enableHighAccuracy: true, timeout: 10000, maximumAge: 60000 },
+            );
+        } else {
+            setLocationError('Геолокация не поддерживается в этом браузере.');
+        }
+    };
+
+    const handleConfirmLocation = (selection: { latitude: number; longitude: number; zoom: number; description?: string; accuracy?: number }) => {
+        const payload: LocationContentPayload = {
+            latitude: selection.latitude,
+            longitude: selection.longitude,
+            zoom: selection.zoom,
+            description: selection.description,
+            accuracy: selection.accuracy ?? locationDraft?.accuracy,
+        };
+        setLocationDraft({ latitude: selection.latitude, longitude: selection.longitude, accuracy: payload.accuracy });
+        setIsLocationDialogOpen(false);
+        setIsLocating(false);
+        setLocationError(null);
+        void Promise.resolve(onSendLocation(payload)).catch(error => {
+            console.error('Failed to send location message', error);
+        });
+    };
+
+    const handleCloseLocationDialog = () => {
+        setIsLocationDialogOpen(false);
+        setIsLocating(false);
+    };
 
     const adjustTextareaHeight = () => {
         const textarea = inputRef.current;
@@ -842,6 +916,15 @@ const MessageInput: React.FC<MessageInputProps> = ({
 
     return (
         <div className="p-4 bg-bg-primary border-t border-border-secondary relative">
+             <LocationPickerDialog
+                isOpen={isLocationDialogOpen}
+                initialPosition={locationDraft ?? DEFAULT_LOCATION}
+                accuracy={locationDraft?.accuracy ?? null}
+                isLocating={isLocating}
+                error={locationError}
+                onClose={handleCloseLocationDialog}
+                onConfirm={handleConfirmLocation}
+            />
              {isPickerOpen && (
                 <StickerGifPicker
                     onClose={() => setPickerOpen(false)}
@@ -923,6 +1006,12 @@ const MessageInput: React.FC<MessageInputProps> = ({
                     ))}
                 </div>
             )}
+            <PluginSurfaceHost
+                location="chat.composer"
+                roomId={roomId}
+                context={replyingTo ? { replyingToId: replyingTo.id } : undefined}
+                className="ml-1 mr-1 mb-3"
+            />
             {isVideoRecording && (
                 <div className="ml-1 mr-1 mb-2 flex items-center gap-4 bg-bg-secondary/70 border border-border-secondary rounded-lg p-3">
                     <div className="w-24 h-24 rounded-xl overflow-hidden bg-black/60 flex items-center justify-center">
@@ -1091,6 +1180,16 @@ const MessageInput: React.FC<MessageInputProps> = ({
                         )}
                     </div>
                 )}
+                <button
+                    onClick={handleOpenLocationDialog}
+                    disabled={isSending || !roomId || isAudioRecording || isVideoRecording}
+                    className="p-3 text-text-secondary hover:text-text-primary disabled:opacity-50 disabled:cursor-not-allowed"
+                    aria-label="Поделиться локацией"
+                >
+                    <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" viewBox="0 0 24 24" fill="currentColor">
+                        <path d="M12 2a7 7 0 0 0-7 7c0 4.912 5.653 11.18 6.281 11.875a1 1 0 0 0 1.438 0C13.347 20.18 19 13.912 19 9a7 7 0 0 0-7-7Zm0 2a5 5 0 0 1 5 5c0 3.154-3.3 7.569-5 9.552-1.7-1.983-5-6.398-5-9.552a5 5 0 0 1 5-5Zm0 3.5a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3Z" />
+                    </svg>
+                </button>
                 <div className="relative">
                     <button
                         onClick={() => setTtlMenuOpen(v => !v)}

@@ -7,8 +7,19 @@
       "description": "Отвечает на команды !echo в комнатах Matrix.",
       "entry": "./echo-bot.js",
       "integrity": "sha256-fh5RS0zokHjhkkfnsM/DobMuDqXIVkZSJqECpEhCSwY=",
-      "permissions": ["sendTextMessage"],
-      "requiredEvents": ["matrix.message"]
+      "permissions": ["sendTextMessage", "ui.panel"],
+      "capabilities": ["echo-panel"],
+      "requiredEvents": ["matrix.message", "ui.render", "ui.action"],
+      "surfaces": [
+        {
+          "id": "echo-control",
+          "location": "chat.panel",
+          "entry": "./echo-panel.html",
+          "label": "Echo Bot",
+          "description": "Мини-приложение для отправки тестовых команд.",
+          "csp": "default-src 'self'; script-src 'self'; frame-ancestors 'self'"
+        }
+      ]
     }
   ]
 }

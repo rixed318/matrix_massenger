@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <title>Echo Bot Panel</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      }
+      body {
+        margin: 0;
+        padding: 16px;
+        background: #0f172a;
+        color: #e2e8f0;
+      }
+      h1 {
+        font-size: 16px;
+        margin: 0 0 12px;
+      }
+      button {
+        background: #38bdf8;
+        color: #0f172a;
+        border: none;
+        border-radius: 6px;
+        padding: 8px 12px;
+        font-size: 14px;
+        cursor: pointer;
+      }
+      button:hover {
+        background: #0ea5e9;
+      }
+      .context {
+        margin-top: 12px;
+        font-size: 12px;
+        color: #94a3b8;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+      input[type="text"] {
+        width: 100%;
+        border-radius: 6px;
+        border: 1px solid #1e293b;
+        background: #0b1220;
+        color: inherit;
+        padding: 8px;
+        margin-bottom: 12px;
+      }
+    </style>
+    <script>
+      const SURFACE_ID = 'echo-control';
+      const postToHost = payload => {
+        window.parent?.postMessage({
+          type: 'ui.action',
+          surfaceId: SURFACE_ID,
+          action: payload.action,
+          payload: payload.payload ?? null,
+        }, '*');
+      };
+
+      const renderState = state => {
+        const contextEl = document.querySelector('.context');
+        if (!contextEl) return;
+        const { context } = state || {};
+        contextEl.textContent = JSON.stringify(context ?? {}, null, 2);
+      };
+
+      window.addEventListener('message', event => {
+        const data = event.data;
+        if (!data || data.surfaceId !== SURFACE_ID) {
+          return;
+        }
+        if (data.type === 'ui.render') {
+          renderState({ context: data.context, payload: data.payload });
+        }
+      });
+
+      window.addEventListener('DOMContentLoaded', () => {
+        window.parent?.postMessage({ type: 'ui.ready', surfaceId: SURFACE_ID }, '*');
+        const form = document.querySelector('form');
+        if (form) {
+          form.addEventListener('submit', event => {
+            event.preventDefault();
+            const input = form.querySelector('input[name="message"]');
+            const value = input?.value.trim();
+            if (!value) {
+              return;
+            }
+            postToHost({ action: 'send.echo', payload: { text: value } });
+            if (input) {
+              input.value = '';
+            }
+          });
+        }
+        const button = document.querySelector('button[data-action="ping"]');
+        button?.addEventListener('click', () => {
+          postToHost({ action: 'send.echo', payload: { text: 'Привет из панели!' } });
+        });
+      });
+    </script>
+  </head>
+  <body>
+    <h1>Echo Bot Panel</h1>
+    <p>Отправьте сообщение в текущую комнату от имени плагина.</p>
+    <form>
+      <input type="text" name="message" placeholder="Текст сообщения" autocomplete="off" />
+      <button type="submit">Отправить</button>
+      <button type="button" data-action="ping" style="margin-left: 8px;">Быстрый ping</button>
+    </form>
+    <div class="context" aria-live="polite">Контекст пока недоступен…</div>
+  </body>
+</html>

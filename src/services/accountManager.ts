@@ -19,6 +19,7 @@ import {
   type UniversalQuickFilterSummary,
   isUniversalQuickFilterId,
 } from '../utils/chatSelectors';
+import { attachStoriesToAccount, detachStoriesFromAccount, setActiveStoryAccount } from '../state/storyStore';
 import { SCHEDULED_MESSAGES_EVENT_TYPE, parseScheduledMessagesFromEvent, getCachedScheduledMessages } from './schedulerService';
 import { getSuspiciousEvents } from './secureCloudService';
 import { bindCallStateStore, CallSessionState, getCallSessionForAccount, subscribeCallState } from './matrixService';
@@ -401,7 +402,8 @@ export const createAccountStore = () => {
       try {
         const stored = await invoke<StoredAccount[]>('load_credentials');
         if (!stored || stored.length === 0) {
-        set({ accounts: {}, activeKey: null, activeCalls: {} });
+          set({ accounts: {}, activeKey: null });
+          setActiveStoryAccount(null);
           refreshAggregatedState();
           return;
         }
@@ -427,10 +429,21 @@ export const createAccountStore = () => {
           activeKey: firstKey,
           error: runtimes.length === 0 ? RESTORE_ERROR_MESSAGE : null,
         });
+        await Promise.all(
+          runtimes.map(async ([accountKey, runtime]) => {
+            try {
+              await attachStoriesToAccount(accountKey, runtime.client);
+            } catch (error) {
+              console.warn('attachStoriesToAccount failed during boot', error);
+            }
+          }),
+        );
+        setActiveStoryAccount(firstKey);
         refreshAggregatedState();
       } catch (error) {
         console.error('restore failed', error);
-        set({ accounts: {}, activeKey: null, error: RESTORE_ERROR_MESSAGE, activeCalls: {} });
+        set({ accounts: {}, activeKey: null, error: RESTORE_ERROR_MESSAGE });
+        setActiveStoryAccount(null);
         refreshAggregatedState();
       } finally {
         set({ isBooting: false });
@@ -459,6 +472,12 @@ export const createAccountStore = () => {
         isAddAccountOpen: false,
         error: null,
       }));
+      try {
+        await attachStoriesToAccount(key, client);
+      } catch (error) {
+        console.warn('attachStoriesToAccount failed', error);
+      }
+      setActiveStoryAccount(key);
       refreshAggregatedState();
     };
 
@@ -493,17 +512,21 @@ export const createAccountStore = () => {
           activeCalls: nextActiveCalls,
         };
       });
+      detachStoriesFromAccount(targetKey);
+      setActiveStoryAccount(get().activeKey);
       refreshAggregatedState();
     };
 
     const setActiveKey: AccountStoreState['setActiveKey'] = (key) => {
       if (!key) {
         set({ activeKey: null });
+        setActiveStoryAccount(null);
         return;
       }
       const runtime = get().accounts[key];
       if (runtime) {
         set({ activeKey: key });
+        setActiveStoryAccount(key);
       }
     };
 
