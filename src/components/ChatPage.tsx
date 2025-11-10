@@ -2733,6 +2733,7 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
                 isLoading={isSharedMediaLoading}
                 isPaginating={isSharedMediaPaginating}
                 onLoadMore={sharedMediaData?.hasMore ? handleLoadMoreMedia : undefined}
+                currentUserId={client.getUserId() || undefined}
             />
             {activeGroupCall && (
                 <CallView
