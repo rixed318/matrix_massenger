@@ -57,7 +57,7 @@ import {
     retryOutboxItem,
     OutboxPayload,
 } from '../services/matrixService';
-import { useAccountStore } from '../services/accountManager';
+import { useAccountStore, useAccountListSnapshot } from '../services/accountManager';
 
 interface ChatPageProps {
     client?: MatrixClient;
