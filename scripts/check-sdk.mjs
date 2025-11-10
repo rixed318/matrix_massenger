@@ -5,12 +5,15 @@ import { resolve } from 'node:path';
 const root = process.cwd();
 
 execSync('npm run build --workspace @matrix-messenger/sdk', { stdio: 'inherit' });
+execSync('npm run build --workspace @matrix-messenger/ui-tokens', { stdio: 'inherit' });
 
 const requiredFiles = [
   resolve(root, 'docs/plugin-api.md'),
   resolve(root, 'packages/sdk/dist/index.js'),
   resolve(root, 'examples/echo-bot/src/index.ts'),
   resolve(root, 'examples/reminder-bot/src/index.ts'),
+  resolve(root, 'packages/ui-tokens/dist/index.js'),
+  resolve(root, 'packages/ui-tokens/dist/tailwind.js'),
 ];
 
 for (const file of requiredFiles) {

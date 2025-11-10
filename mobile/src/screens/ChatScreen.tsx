@@ -16,6 +16,7 @@ import { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import * as DocumentPicker from 'expo-document-picker';
 import { Audio } from 'expo-av';
 import { useRoomTimeline } from '@matrix-messenger/core';
+import { getTheme, spacing, controls, radii, typography } from '@matrix-messenger/ui-tokens';
 import { MessageBubble } from '../components/MessageBubble';
 import { MatrixSessionWithAccount } from '../context/MatrixSessionContext';
 import { RootStackParamList } from '../types/navigation';
@@ -31,6 +32,12 @@ const fetchArrayBuffer = async (uri: string) => {
   const buffer = await blob.arrayBuffer();
   return { buffer, size: blob.size, mimeType: blob.type };
 };
+
+const chatTheme = getTheme('dark');
+const controlRadius = controls.md / 2;
+const sendControlRadius = controls.lg / 2;
+const inputVerticalPadding = spacing.sm + spacing.xs / 2;
+const inputMaxHeight = controls.lg * 2.5;
 
 export const ChatScreen: React.FC<ChatScreenProps> = ({ session, route }) => {
   const { roomId, roomName } = route.params;
@@ -130,6 +137,8 @@ export const ChatScreen: React.FC<ChatScreenProps> = ({ session, route }) => {
     navigation.navigate('Call', { roomId });
   }, [navigation, roomId]);
 
+  const placeholderColor = chatTheme.colors.text.placeholder;
+
   return (
     <SafeAreaView style={styles.container}>
       <KeyboardAvoidingView
@@ -148,7 +157,7 @@ export const ChatScreen: React.FC<ChatScreenProps> = ({ session, route }) => {
         </View>
         {isLoading ? (
           <View style={styles.loading}> 
-            <ActivityIndicator color="#fff" />
+            <ActivityIndicator color={chatTheme.colors.text.primary} />
           </View>
         ) : (
           <FlatList
@@ -177,7 +186,7 @@ export const ChatScreen: React.FC<ChatScreenProps> = ({ session, route }) => {
           <TextInput
             style={styles.input}
             placeholder="Сообщение"
-            placeholderTextColor="#6c7aa6"
+            placeholderTextColor={placeholderColor}
             value={input}
             onChangeText={setInput}
             multiline
@@ -199,7 +208,7 @@ export const ChatScreen: React.FC<ChatScreenProps> = ({ session, route }) => {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#0B1526',
+    backgroundColor: chatTheme.colors.background.primary,
   },
   inner: {
     flex: 1,
@@ -208,29 +217,30 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    paddingHorizontal: 16,
-    paddingTop: 16,
-    paddingBottom: 8,
+    paddingHorizontal: spacing.lg,
+    paddingTop: spacing.lg,
+    paddingBottom: spacing.md,
   },
   title: {
-    color: '#fff',
-    fontSize: 20,
-    fontWeight: '600',
+    color: chatTheme.colors.text.primary,
+    fontSize: typography.fontSize.lg,
+    fontWeight: typography.fontWeight.semibold,
   },
   subtitle: {
-    color: '#9ba9c5',
-    fontSize: 12,
+    color: chatTheme.colors.text.secondary,
+    fontSize: typography.fontSize.xs,
+    lineHeight: typography.lineHeight.snug,
   },
   callButton: {
-    backgroundColor: '#1f2a44',
-    borderRadius: 24,
-    width: 44,
-    height: 44,
+    backgroundColor: chatTheme.colors.controls.surface,
+    borderRadius: controlRadius,
+    width: controls.md,
+    height: controls.md,
     alignItems: 'center',
     justifyContent: 'center',
   },
   callText: {
-    fontSize: 20,
+    fontSize: typography.fontSize.lg,
   },
   loading: {
     flex: 1,
@@ -238,20 +248,20 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   messages: {
-    paddingBottom: 16,
+    paddingBottom: spacing.lg,
   },
   inputRow: {
     flexDirection: 'row',
     alignItems: 'flex-end',
-    paddingHorizontal: 12,
-    paddingVertical: 12,
-    gap: 8,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.md,
+    gap: spacing.sm,
   },
   actionButton: {
-    backgroundColor: '#1f2a44',
-    width: 42,
-    height: 42,
-    borderRadius: 21,
+    backgroundColor: chatTheme.colors.controls.surface,
+    width: controls.md,
+    height: controls.md,
+    borderRadius: controlRadius,
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -259,27 +269,27 @@ const styles = StyleSheet.create({
     opacity: 0.5,
   },
   actionText: {
-    color: '#fff',
-    fontSize: 18,
+    color: chatTheme.colors.text.primary,
+    fontSize: typography.fontSize.md,
   },
   recordingButton: {
-    backgroundColor: '#d1485f',
+    backgroundColor: chatTheme.colors.controls.recording,
   },
   input: {
     flex: 1,
-    minHeight: 42,
-    maxHeight: 120,
-    backgroundColor: '#101d35',
-    borderRadius: 20,
-    color: '#fff',
-    paddingHorizontal: 16,
-    paddingVertical: 10,
+    minHeight: controls.md,
+    maxHeight: inputMaxHeight,
+    backgroundColor: chatTheme.colors.background.tertiary,
+    borderRadius: radii.lg,
+    color: chatTheme.colors.text.primary,
+    paddingHorizontal: spacing.lg,
+    paddingVertical: inputVerticalPadding,
   },
   sendButton: {
-    backgroundColor: '#3A7EFB',
-    width: 48,
-    height: 48,
-    borderRadius: 24,
+    backgroundColor: chatTheme.colors.accent.primary,
+    width: controls.lg,
+    height: controls.lg,
+    borderRadius: sendControlRadius,
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -287,7 +297,7 @@ const styles = StyleSheet.create({
     opacity: 0.6,
   },
   sendText: {
-    color: '#fff',
-    fontSize: 18,
+    color: chatTheme.colors.text.inverted,
+    fontSize: typography.fontSize.md,
   },
 });
