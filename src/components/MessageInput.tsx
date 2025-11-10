@@ -1,6 +1,19 @@
 import React, { useState, KeyboardEvent, useEffect, useRef, useMemo, ChangeEvent } from 'react';
-import { MatrixClient, Message, MatrixUser, Sticker, Gif } from '@matrix-messenger/core';
+import {
+    MatrixClient,
+    Message,
+    MatrixUser,
+    Sticker,
+    Gif,
+    subscribeToGifFavorites,
+    replaceGifFavoritesFromRemote,
+    getGifFavorites,
+    loadGifFavoritesFromAccountData,
+    persistGifFavoritesToAccountData,
+    subscribeToGifFavoritesAccountData,
+} from '@matrix-messenger/core';
 import { sendTypingIndicator, getRoomTTL, setRoomTTL, setNextMessageTTL } from '@matrix-messenger/core';
+import type { GifFavorite } from '@matrix-messenger/core';
 import MentionSuggestions from './MentionSuggestions';
 import StickerGifPicker from './StickerGifPicker';
 import type { DraftAttachment, DraftContent, SendKeyBehavior } from '../types';
@@ -9,6 +22,27 @@ const deserializeAttachment = async (attachment: DraftAttachment): Promise<File>
     const response = await fetch(attachment.dataUrl);
     const blob = await response.blob();
     return new File([blob], attachment.name, { type: attachment.mimeType, lastModified: Date.now() });
+};
+
+const mergeGifFavorites = (local: GifFavorite[], remote: GifFavorite[]): GifFavorite[] => {
+    const map = new Map<string, GifFavorite>();
+    for (const entry of local) {
+        map.set(entry.id, entry);
+    }
+    for (const entry of remote) {
+        const existing = map.get(entry.id);
+        if (!existing) {
+            map.set(entry.id, entry);
+            continue;
+        }
+        const updated: GifFavorite = {
+            ...existing,
+            ...entry,
+            addedAt: Math.max(existing.addedAt ?? 0, entry.addedAt ?? 0),
+        };
+        map.set(entry.id, updated);
+    }
+    return Array.from(map.values()).sort((a, b) => b.addedAt - a.addedAt);
 };
 
 const formatFileSize = (size: number) => {
@@ -189,6 +223,58 @@ const MessageInput: React.FC<MessageInputProps> = ({
         loadRoomTTL();
         setNextMessageTtlMs(null);
     }, [client, roomId]);
+
+
+    useEffect(() => {
+        if (!client) return;
+        let cancelled = false;
+        let unsubscribeLocal: (() => void) | undefined;
+        let unsubscribeRemote: (() => void) | undefined;
+
+        const bootstrapFavorites = async () => {
+            try {
+                const [localFavorites, remoteFavorites] = await Promise.all([
+                    getGifFavorites(),
+                    loadGifFavoritesFromAccountData(client),
+                ]);
+                if (!cancelled && remoteFavorites) {
+                    await replaceGifFavoritesFromRemote(mergeGifFavorites(localFavorites, remoteFavorites));
+                }
+            } catch (error) {
+                if (!cancelled) {
+                    console.error('Failed to initialize GIF favorites sync', error);
+                }
+            }
+            if (cancelled) return;
+            unsubscribeRemote = subscribeToGifFavoritesAccountData(client, async favorites => {
+                try {
+                    const local = await getGifFavorites();
+                    await replaceGifFavoritesFromRemote(mergeGifFavorites(local, favorites));
+                } catch (error) {
+                    console.error('Failed to apply GIF favorites from account data', error);
+                }
+            });
+        };
+
+        unsubscribeLocal = subscribeToGifFavorites(async (favorites, source) => {
+            if (source !== 'local' || !client) {
+                return;
+            }
+            try {
+                await persistGifFavoritesToAccountData(client, favorites);
+            } catch (error) {
+                console.error('Failed to persist GIF favorites to account data', error);
+            }
+        });
+
+        bootstrapFavorites();
+
+        return () => {
+            cancelled = true;
+            unsubscribeLocal?.();
+            unsubscribeRemote?.();
+        };
+    }, [client]);
 
 
     useEffect(() => {

@@ -210,4 +210,27 @@ export interface Gif {
     dims: [number, number];
 }
 
+export interface GifFavorite extends Gif {
+    addedAt: number;
+}
+
+export interface GifSearchOptions {
+    limit?: number;
+    cursor?: string;
+    forceRefresh?: boolean;
+}
+
+export interface GifSearchResult {
+    items: Gif[];
+    nextCursor?: string;
+    query?: string;
+    fromCache: boolean;
+    error?: string;
+}
+
+export interface GifSearchHistoryEntry {
+    query: string;
+    timestamp: number;
+}
+
 export type SendKeyBehavior = 'enter' | 'ctrlEnter' | 'altEnter';
