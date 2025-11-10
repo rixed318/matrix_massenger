@@ -2,100 +2,45 @@
 @tailwind components;
 @tailwind utilities;
 
-:root { /* Default Dark Theme */
-  --color-bg-primary: #1f2937; /* gray-800 */
-  --color-bg-secondary: #111827; /* gray-900 */
-  --color-bg-tertiary: #374151; /* gray-700 */
-  --color-bg-hover: rgba(55, 65, 81, 0.5); /* gray-700/50 */
-  --color-bg-accent: #4f46e5; /* indigo-600 */
-  --color-bg-accent-hover: #4338ca; /* indigo-700 */
-  --color-text-primary: #f9fafb; /* gray-50 */
-  --color-text-secondary: #9ca3af; /* gray-400 */
-  --color-text-accent: #818cf8; /* indigo-400 */
-  --color-text-inverted: #ffffff;
-  --color-border-primary: #374151; /* gray-700 */
-  --color-border-secondary: rgba(17, 24, 39, 0.5); /* gray-900/50 */
-  --color-ring-focus: #6366f1; /* indigo-500 */
-  --color-error: #f87171; /* red-400 */
-  --color-mention-bg: rgba(79, 70, 229, 0.5); /* indigo-600/50 */
-  --color-mention-text: #a5b4fc; /* indigo-300 */
-  --color-mention-self-bg: rgba(234, 179, 8, 0.5); /* yellow-500/50 */
-  --color-mention-self-text: #fde047; /* yellow-200 */
-  --color-chip-selected: rgba(99, 102, 241, 0.25);
-  --color-status-offline: #f97316;
+@layer base {
+  @keyframes fadeIn {
+    from {
+      opacity: 0;
+    }
+    to {
+      opacity: 1;
+    }
+  }
+
+  @keyframes slideUp {
+    from {
+      transform: translateY(20px);
+      opacity: 0;
+    }
+    to {
+      transform: translateY(0);
+      opacity: 1;
+    }
+  }
 }
 
-.theme-light {
-  --color-bg-primary: #ffffff;
-  --color-bg-secondary: #f9fafb; /* gray-50 */
-  --color-bg-tertiary: #e5e7eb; /* gray-200 */
-  --color-bg-hover: rgba(229, 231, 235, 0.5); /* gray-200/50 */
-  --color-bg-accent: #4f46e5;
-  --color-bg-accent-hover: #4338ca;
-  --color-text-primary: #111827; /* gray-900 */
-  --color-text-secondary: #6b7280; /* gray-500 */
-  --color-text-accent: #4f46e5;
-  --color-text-inverted: #ffffff;
-  --color-border-primary: #d1d5db; /* gray-300 */
-  --color-border-secondary: #e5e7eb; /* gray-200 */
-  --color-ring-focus: #6366f1;
-  --color-error: #ef4444; /* red-500 */
-  --color-mention-bg: rgba(79, 70, 229, 0.2);
-  --color-mention-text: #3730a3; /* indigo-800 */
-  --color-mention-self-bg: rgba(250, 204, 21, 0.3);
-  --color-mention-self-text: #ca8a04;
-  --color-chip-selected: rgba(79, 70, 229, 0.15);
-  --color-status-offline: #ea580c;
-}
-
-.theme-midnight {
-  --color-bg-primary: #0d1117;
-  --color-bg-secondary: #010409;
-  --color-bg-tertiary: #161b22;
-  --color-bg-hover: rgba(22, 27, 34, 0.5);
-  --color-bg-accent: #58a6ff;
-  --color-bg-accent-hover: #388bfd;
-  --color-text-primary: #c9d1d9;
-  --color-text-secondary: #8b949e;
-  --color-text-accent: #58a6ff;
-  --color-text-inverted: #ffffff;
-  --color-border-primary: #30363d;
-  --color-border-secondary: rgba(48, 54, 61, 0.5);
-  --color-ring-focus: #58a6ff;
-  --color-error: #f85149;
-  --color-mention-bg: rgba(88, 166, 255, 0.3);
-  --color-mention-text: #80b6ff;
-  --color-mention-self-bg: rgba(210, 153, 34, 0.2);
-  --color-mention-self-text: #e3b341;
-  --color-chip-selected: rgba(88, 166, 255, 0.25);
-  --color-status-offline: #f97316;
-}
-
-@keyframes fadeIn {
-    from { opacity: 0; }
-    to { opacity: 1; }
-}
-
-@keyframes slideUp {
-    from { transform: translateY(20px); opacity: 0; }
-    to { transform: translateY(0); opacity: 1; }
-}
-
-.animate-fade-in-fast {
+@layer utilities {
+  .animate-fade-in-fast {
     animation: fadeIn 0.15s ease-out;
-}
+  }
 
-.animate-slide-up {
+  .animate-slide-up {
     animation: slideUp 0.2s ease-out;
-}
+  }
 
-.line-clamp-2 {
+  .line-clamp-2 {
     display: -webkit-box;
     -webkit-box-orient: vertical;
     -webkit-line-clamp: 2;
     overflow: hidden;
-}
+  }
 
-.text-shadow {
-  text-shadow: 0 1px 3px rgb(0 0 0 / 0.5);
+  .text-shadow {
+    text-shadow: 0 1px 3px rgb(0 0 0 / 0.5);
+  }
 }

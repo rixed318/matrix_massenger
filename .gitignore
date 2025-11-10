@@ -13,6 +13,7 @@ dist-ssr
 .test-dist
 *.local
 !packages/sdk/dist
+!packages/ui-tokens/dist
 
 # Editor directories and files
 .vscode/*
