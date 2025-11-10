@@ -112,7 +112,7 @@ export const createAccountStore = () => {
           userId: account.user_id,
           accessToken: account.access_token,
           label: session.displayName ?? account.user_id,
-          secureProfile: secureProfile ?? undefined,
+          secureProfile: secureProfile ?? null,
         },
         { client: session.client },
       );
@@ -132,8 +132,24 @@ export const createAccountStore = () => {
       if (get().isBooting) return;
       set({ isBooting: true, error: null });
 
+      sessionCleanup.forEach(disposer => {
+        try {
+          disposer();
+        } catch (error) {
+          console.warn('cleanup disposer failed', error);
+        }
+      });
+      sessionCleanup.clear();
+
+      try {
+        await matrixProfileManager.reset();
+      } catch (error) {
+        console.warn('failed to reset profile manager', error);
+      }
+
       if (!isTauriAvailable()) {
         set({ accounts: {}, activeKey: null, isBooting: false });
+        matrixProfileManager.clearActiveProfile();
         return;
       }
 
@@ -141,6 +157,7 @@ export const createAccountStore = () => {
         const stored = await invoke<StoredAccount[]>('load_credentials');
         if (!stored || stored.length === 0) {
           set({ accounts: {}, activeKey: null });
+          matrixProfileManager.clearActiveProfile();
           return;
         }
 
@@ -251,13 +268,16 @@ export const createAccountStore = () => {
         set({ activeKey: null });
         return;
       }
+      if (get().activeKey === key) {
+        return;
+      }
       const runtime = get().accounts[key];
       if (!runtime) {
         return;
       }
       set({ activeKey: key, error: null });
+      cleanupSession(key);
       void (async () => {
-        cleanupSession(key);
         try {
           const client = await matrixProfileManager.activateProfile(key, { forceRecreate: true });
           const refreshed = await toRuntime(runtime.creds, client);
@@ -268,10 +288,7 @@ export const createAccountStore = () => {
           matrixProfileManager.setActiveProfile(key, refreshed.client);
         } catch (error) {
           console.error('Failed to switch account', error);
-          set(state => ({
-            activeKey: null,
-            error: 'Не удалось переключить аккаунт. Авторизуйтесь заново.',
-          }));
+          set({ activeKey: null, error: 'Не удалось переключить аккаунт. Авторизуйтесь заново.' });
           matrixProfileManager.clearActiveProfile();
         }
       })();
@@ -300,7 +317,7 @@ export const createAccountStore = () => {
           userId: updatedCreds.user_id,
           accessToken: updatedCreds.access_token,
           label: current.displayName ?? updatedCreds.user_id,
-          secureProfile: secureProfile ?? undefined,
+          secureProfile: secureProfile ?? null,
         },
         { client: current.client, active: key === get().activeKey },
       );

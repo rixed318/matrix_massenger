@@ -541,9 +541,9 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess, initialError, sav
   const storeError = useAccountStore(state => state.error);
   const setStoreError = useAccountStore(state => state.setError);
   const setActiveAccount = useAccountStore(state => state.setActiveKey);
-  const removeAccountFromStore = useAccountStore(state => state.removeAccount);
-  const bootSessions = useAccountStore(state => state.boot);
-  const isBootingSessions = useAccountStore(state => state.isBooting);
+  const removeSavedAccount = useAccountStore(state => state.removeAccount);
+  const bootStoredAccounts = useAccountStore(state => state.boot);
+  const isBootingAccounts = useAccountStore(state => state.isBooting);
   const activeAccountKey = useAccountStore(state => state.activeKey);
 
   const resolvedOnLoginSuccess = onLoginSuccess ?? addAccount;
@@ -559,7 +559,7 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess, initialError, sav
   const [totpSessionId, setTotpSessionId] = useState<string | null>(null);
   const [totpCode, setTotpCode] = useState('');
   const [totpValidationError, setTotpValidationError] = useState<string | null>(null);
-  const [accountAction, setAccountAction] = useState<{ key: string; type: 'switch' | 'remove' } | null>(null);
+  const [pendingRemovalKey, setPendingRemovalKey] = useState<string | null>(null);
   const [isImportingSessions, setIsImportingSessions] = useState(false);
 
   const resetTotpState = () => {
@@ -586,11 +586,33 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess, initialError, sav
     applyError(initialErrorValue);
   }, [initialErrorValue]);
 
-  useEffect(() => {
-    if (accountAction?.type === 'switch' && accountAction.key === activeAccountKey) {
-      setAccountAction(null);
+  const handleSelectSavedAccount = (key: string) => {
+    setActiveAccount(key);
+  };
+
+  const handleRemoveSavedAccount = async (key: string) => {
+    setPendingRemovalKey(key);
+    try {
+      await removeSavedAccount(key);
+    } catch (error) {
+      console.error('Failed to remove saved account', error);
+      applyError('Не удалось удалить аккаунт. Попробуйте ещё раз.');
+    } finally {
+      setPendingRemovalKey(current => (current === key ? null : current));
     }
-  }, [accountAction, activeAccountKey]);
+  };
+
+  const handleImportSessions = async () => {
+    setIsImportingSessions(true);
+    try {
+      await bootStoredAccounts();
+    } catch (error) {
+      console.error('Failed to import stored sessions', error);
+      applyError('Не удалось импортировать сохранённые сессии.');
+    } finally {
+      setIsImportingSessions(false);
+    }
+  };
 
   const handleLogin = async (
     homeserverInput: string,
@@ -671,95 +693,62 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess, initialError, sav
     await handleLogin(homeserverUrl, username, password);
   };
 
-  const handleUseSavedAccount = (accountKey: string) => {
-    setAccountAction({ key: accountKey, type: 'switch' });
-    applyError(null);
-    setActiveAccount(accountKey);
-  };
-
-  const handleRemoveSavedAccount = async (accountKey: string) => {
-    setAccountAction({ key: accountKey, type: 'remove' });
-    applyError(null);
-    try {
-      await removeAccountFromStore(accountKey);
-    } catch (err) {
-      console.error('Failed to remove stored account', err);
-      applyError('Не удалось удалить аккаунт. Попробуйте позже.');
-    } finally {
-      setAccountAction(current => (current?.key === accountKey ? null : current));
-    }
-  };
-
-  const handleImportSessions = async () => {
-    setIsImportingSessions(true);
-    applyError(null);
-    try {
-      await bootSessions();
-    } catch (err) {
-      console.error('Failed to import sessions from secure storage', err);
-      applyError('Не удалось загрузить сессии из защищённого хранилища.');
-    } finally {
-      setIsImportingSessions(false);
-    }
-  };
-
-  const SavedList = () => {
-    if (!savedAccounts.length) return null;
-    return (
-      <div className="mt-4 space-y-3">
-        <div className="flex items-center justify-between">
-          <h4 className="text-sm font-semibold">Сохранённые аккаунты</h4>
-          <button
-            type="button"
-            onClick={() => void handleImportSessions()}
-            disabled={isImportingSessions || isBootingSessions}
-            className="text-xs px-3 py-1 rounded-md border border-border-primary text-text-secondary hover:text-text-primary hover:border-accent disabled:opacity-60"
-          >
-            {isImportingSessions || isBootingSessions ? 'Импорт...' : 'Импортировать'}
-          </button>
-        </div>
+  const SavedList = () => (
+    <div className="mt-3 space-y-3">
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+        <h4 className="text-sm font-semibold">Сохранённые аккаунты</h4>
+        <button
+          type="button"
+          onClick={() => void handleImportSessions()}
+          disabled={isImportingSessions || isBootingAccounts}
+          className="self-start rounded-md border border-border-primary px-3 py-1.5 text-xs font-medium text-text-secondary hover:text-text-primary hover:border-accent disabled:opacity-60"
+        >
+          {isImportingSessions || isBootingAccounts ? 'Импорт...' : 'Импортировать из хранилища'}
+        </button>
+      </div>
+      {savedAccounts.length ? (
         <ul className="space-y-2">
           {savedAccounts.map(account => {
             const isActive = account.key === activeAccountKey;
-            const isSwitching = accountAction?.key === account.key && accountAction.type === 'switch';
-            const isRemoving = accountAction?.key === account.key && accountAction.type === 'remove';
+            const isRemoving = pendingRemovalKey === account.key;
             return (
               <li
                 key={account.key}
-                className={`flex items-center justify-between gap-3 rounded-md border border-border-primary bg-bg-tertiary/40 px-3 py-2 ${isActive ? 'ring-1 ring-accent/70' : ''}`}
+                className={`rounded-md border px-3 py-2 text-xs transition-colors ${isActive ? 'border-accent bg-accent/10 text-text-primary' : 'border-border-primary text-text-secondary'}`}
               >
-                <div className="min-w-0">
-                  <p className="text-sm font-medium text-text-primary truncate">{account.user_id}</p>
-                  <p className="text-[11px] text-text-secondary truncate">{account.homeserver_url}</p>
-                  {isActive && (
-                    <span className="mt-1 inline-block text-[10px] uppercase tracking-wide text-accent">активный</span>
-                  )}
-                </div>
-                <div className="flex shrink-0 items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={() => handleUseSavedAccount(account.key)}
-                    disabled={isSwitching || isRemoving}
-                    className="px-3 py-1 text-xs font-medium rounded-md bg-accent text-text-inverted hover:bg-accent-hover disabled:opacity-60"
-                  >
-                    {isSwitching ? 'Переключение…' : 'Использовать'}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => void handleRemoveSavedAccount(account.key)}
-                    disabled={isRemoving}
-                    className="px-3 py-1 text-xs font-medium rounded-md border border-border-primary text-text-secondary hover:text-text-primary hover:border-accent disabled:opacity-60"
-                  >
-                    {isRemoving ? 'Удаление…' : 'Удалить'}
-                  </button>
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="space-y-1">
+                    <p className="text-sm font-semibold text-text-primary break-all">{account.user_id}</p>
+                    <p className="text-[11px] text-text-secondary break-all">{account.homeserver_url}</p>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      onClick={() => handleSelectSavedAccount(account.key)}
+                      disabled={isActive || isRemoving}
+                      className={`rounded-md px-3 py-1.5 text-xs font-medium ${isActive ? 'bg-accent text-text-inverted' : 'border border-border-primary text-text-secondary hover:text-text-primary hover:border-accent'}`}
+                    >
+                      {isActive ? 'Активный' : 'Использовать'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void handleRemoveSavedAccount(account.key)}
+                      disabled={isRemoving}
+                      className="rounded-md border border-border-primary px-3 py-1.5 text-xs font-medium text-text-secondary hover:text-text-primary hover:border-accent disabled:opacity-60"
+                    >
+                      {isRemoving ? 'Удаление…' : 'Удалить'}
+                    </button>
+                  </div>
                 </div>
               </li>
             );
           })}
         </ul>
-      </div>
-    );
-  };
+      ) : (
+        <p className="text-xs text-text-secondary">Нет сохранённых аккаунтов. Войдите, чтобы сохранить новую сессию.</p>
+      )}
+    </div>
+  );
 
   const renderContent = () => {
     if (connectionType && mode === 'login') {

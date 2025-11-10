@@ -25,6 +25,8 @@ interface ChatListProps {
     onRoomTypeFilterChange: (value: ChatRoomType) => void;
     statusFilter: ChatRoomStatus;
     onStatusFilterChange: (value: ChatRoomStatus) => void;
+    activeAccountLabel?: string;
+    onManageAccounts?: () => void;
 }
 
 const typeFilters: { value: ChatRoomType; label: string; icon: string }[] = [
@@ -61,6 +63,8 @@ const ChatList: React.FC<ChatListProps> = ({
     onRoomTypeFilterChange,
     statusFilter,
     onStatusFilterChange,
+    activeAccountLabel,
+    onManageAccounts,
 }) => {
     const user = client.getUser(client.getUserId());
     const userAvatarUrl = mxcToHttp(client, user?.avatarUrl);
@@ -93,9 +97,13 @@ const ChatList: React.FC<ChatListProps> = ({
                     <div className="flex items-center gap-3">
                         <Avatar name={user?.displayName || user?.userId || 'You'} imageUrl={userAvatarUrl || undefined} />
                         <div>
-                            <p className="text-[11px] uppercase tracking-wide text-text-secondary">Активный профиль</p>
+                            <p className="text-sm text-text-secondary">Logged in as</p>
                             <p className="font-semibold text-text-primary max-w-[160px] truncate">{user?.displayName || user?.userId}</p>
-                            <p className="text-xs text-text-secondary max-w-[160px] truncate">{client.getHomeserverUrl?.() ?? ''}</p>
+                            {activeAccountLabel && (
+                                <p className="text-xs text-text-secondary mt-1 truncate">
+                                    Аккаунт: <span className="text-text-primary">{activeAccountLabel}</span>
+                                </p>
+                            )}
                         </div>
                     </div>
                     <div className="flex items-center gap-2">
@@ -121,6 +129,14 @@ const ChatList: React.FC<ChatListProps> = ({
                     >
                         Folders
                     </button>
+                    {onManageAccounts && (
+                        <button
+                            onClick={onManageAccounts}
+                            className="px-3 py-2 text-sm font-medium rounded-md border border-border-primary text-text-secondary hover:text-text-primary"
+                        >
+                            Accounts
+                        </button>
+                    )}
                 </div>
             </div>
 

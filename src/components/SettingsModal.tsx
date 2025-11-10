@@ -133,11 +133,11 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, onSave, 
     return (
         <>
             <div className="fixed inset-0 bg-bg-secondary/60 flex items-center justify-center z-50 animate-fade-in-fast" onClick={onClose}>
-                <div className="bg-bg-primary rounded-lg shadow-xl w-full max-w-md animate-slide-up" onClick={e => e.stopPropagation()}>
-                    <div className="p-6 border-b border-border-primary">
-                        <h2 className="text-xl font-bold">Settings</h2>
-                    </div>
-                    <div className="p-6 space-y-6 max-h-[70vh] overflow-y-auto">
+            <div className="bg-bg-primary rounded-lg shadow-xl w-full max-w-md animate-slide-up" onClick={e => e.stopPropagation()}>
+                <div className="p-6 border-b border-border-primary">
+                    <h2 className="text-xl font-bold">Settings</h2>
+                </div>
+                <div className="p-6 space-y-6 max-h-[70vh] overflow-y-auto">
                     <h3 className="text-lg font-semibold text-text-primary">Profile</h3>
                     <div className="flex items-center gap-4">
                         <div className="relative cursor-pointer" onClick={() => fileInputRef.current?.click()}>
@@ -276,41 +276,39 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, onSave, 
                             Открыть настройки безопасности
                         </button>
                     </div>
-
-<div className="pt-6 border-t border-border-primary">
-    <h3 className="text-lg font-semibold text-text-primary mb-3">Перевод сообщений</h3>
-    <div className="space-y-4">
-        <div>
-            <label htmlFor="translationUrl" className="block text-sm font-medium text-text-secondary mb-1">
-                Базовый URL
-            </label>
-            <input
-                type="text"
-                id="translationUrl"
-                value={translationUrl}
-                onChange={(e) => setTranslationUrl(e.target.value)}
-                className="appearance-none block w-full px-3 py-2 border border-border-primary bg-bg-secondary text-text-primary placeholder-text-secondary rounded-md focus:outline-none focus:ring-ring-focus focus:border-ring-focus sm:text-sm"
-                placeholder="https://example.com/api/translate"
-            />
-            <p className="text-xs text-text-secondary mt-1">Если пусто, перевод отключен.</p>
-        </div>
-        <div>
-            <label htmlFor="translationApiKey" className="block text-sm font-medium text-text-secondary mb-1">
-                API‑ключ
-            </label>
-            <input
-                type="text"
-                id="translationApiKey"
-                value={translationApiKey}
-                onChange={(e) => setTranslationApiKey(e.target.value)}
-                className="appearance-none block w-full px-3 py-2 border border-border-primary bg-bg-secondary text-text-primary placeholder-text-secondary rounded-md focus:outline-none focus:ring-ring-focus focus:border-ring-focus sm:text-sm"
-                placeholder="опционально"
-            />
-            <p className="text-xs text-text-secondary mt-1">Синхронизируется с локальным хранилищем и Matrix Account Data.</p>
-        </div>
-    </div>
-</div>
-
+                    <div className="pt-6 border-t border-border-primary">
+                        <h3 className="text-lg font-semibold text-text-primary mb-3">Перевод сообщений</h3>
+                        <div className="space-y-4">
+                            <div>
+                                <label htmlFor="translationUrl" className="block text-sm font-medium text-text-secondary mb-1">
+                                    Базовый URL
+                                </label>
+                                <input
+                                    type="text"
+                                    id="translationUrl"
+                                    value={translationUrl}
+                                    onChange={(e) => setTranslationUrl(e.target.value)}
+                                    className="appearance-none block w-full px-3 py-2 border border-border-primary bg-bg-secondary text-text-primary placeholder-text-secondary rounded-md focus:outline-none focus:ring-ring-focus focus:border-ring-focus sm:text-sm"
+                                    placeholder="https://example.com/api/translate"
+                                />
+                                <p className="text-xs text-text-secondary mt-1">Если пусто, перевод отключен.</p>
+                            </div>
+                            <div>
+                                <label htmlFor="translationApiKey" className="block text-sm font-medium text-text-secondary mb-1">
+                                    API‑ключ
+                                </label>
+                                <input
+                                    type="text"
+                                    id="translationApiKey"
+                                    value={translationApiKey}
+                                    onChange={(e) => setTranslationApiKey(e.target.value)}
+                                    className="appearance-none block w-full px-3 py-2 border border-border-primary bg-bg-secondary text-text-primary placeholder-text-secondary rounded-md focus:outline-none focus:ring-ring-focus focus:border-ring-focus sm:text-sm"
+                                    placeholder="опционально"
+                                />
+                                <p className="text-xs text-text-secondary mt-1">Синхронизируется с локальным хранилищем и Matrix Account Data.</p>
+                            </div>
+                        </div>
+                    </div>
                     <div className="pt-6 border-t border-border-primary">
                         <h3 className="text-lg font-semibold text-text-primary mb-3">Notifications</h3>
                         <div className="relative flex items-start">
@@ -346,7 +344,7 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, onSave, 
                     </button>
                 </div>
             </div>
-            </div>
+        </div>
             <SecuritySettings client={client} isOpen={isSecurityOpen} onClose={() => setIsSecurityOpen(false)} />
         </>
     );

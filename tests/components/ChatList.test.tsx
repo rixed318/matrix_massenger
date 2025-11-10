@@ -102,4 +102,14 @@ describe('ChatList', () => {
         fireEvent.click(screen.getByText('Invites'));
         expect(onStatusFilterChange).toHaveBeenCalledWith('invited');
     });
+
+    it('renders active account information and allows managing accounts', () => {
+        const onManageAccounts = vi.fn();
+        renderChatList({ activeAccountLabel: '@tester:matrix', onManageAccounts });
+
+        expect(screen.getByText(/Аккаунт:/)).toBeTruthy();
+
+        fireEvent.click(screen.getByText('Accounts'));
+        expect(onManageAccounts).toHaveBeenCalled();
+    });
 });
