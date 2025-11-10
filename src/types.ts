@@ -104,6 +104,24 @@ export interface Message {
         size?: number;
         duration?: number;
         'xyz.amorgan.is_gif'?: boolean;
+        thumbnail_url?: string;
+        thumbnail_file?: {
+            url?: string;
+            mimetype?: string;
+            size?: number;
+            v?: string;
+            key_ops?: string[];
+            kty?: string;
+            key?: string;
+            iv?: string;
+            hashes?: Record<string, string>;
+        };
+        thumbnail_info?: {
+            mimetype?: string;
+            size?: number;
+            w?: number;
+            h?: number;
+        };
     }
     'm.mentions'?: {
         user_ids?: string[];
@@ -131,6 +149,7 @@ export interface Message {
     expiresAt: number;
     ttlMs?: number;
   } | null;
+  localThumbnailUrl?: string;
 }
 
 export interface ActiveThread {
@@ -144,7 +163,7 @@ export interface Folder {
   roomIds: string[];
 }
 
-export type DraftAttachmentKind = 'file' | 'image' | 'audio' | 'voice' | 'sticker' | 'gif';
+export type DraftAttachmentKind = 'file' | 'image' | 'audio' | 'voice' | 'sticker' | 'gif' | 'video';
 
 export interface DraftAttachment {
     id: string;
@@ -162,6 +181,17 @@ export interface DraftAttachment {
     body?: string;
     msgtype?: string;
     kind: DraftAttachmentKind;
+}
+
+export interface VideoMessageMetadata {
+    durationMs: number;
+    width: number;
+    height: number;
+    mimeType: string;
+    thumbnail: Blob;
+    thumbnailMimeType: string;
+    thumbnailWidth: number;
+    thumbnailHeight: number;
 }
 
 export interface DraftContent {
@@ -183,6 +213,8 @@ export interface ScheduledMessage {
   sendAtUtc?: number;
   /** Timezone offset (in minutes) of the client that created the schedule. */
   timezoneOffset?: number;
+  /** Olson timezone identifier selected by the author (if provided). */
+  timezoneId?: string;
   status?: 'pending' | 'retrying' | 'sent';
   attempts?: number;
   lastError?: string;
@@ -190,16 +222,61 @@ export interface ScheduledMessage {
   nextRetryAt?: number;
 }
 
+export interface StickerInfo {
+    w?: number;
+    h?: number;
+    mimetype?: string;
+    size?: number;
+    duration?: number;
+    thumbnail_url?: string;
+    file?: Record<string, any>;
+}
+
 export interface Sticker {
     id: string;
     url: string;
     body: string;
-    info: {
-        w: number;
-        h: number;
-        mimetype: 'image/svg+xml' | 'image/png' | 'image/webp';
-        size: number;
-    }
+    info?: StickerInfo;
+    /**
+     * Optional list of emoji unicode values suggested when using this asset as a custom emoji.
+     */
+    emoji?: string[];
+    /**
+     * Shortcodes or aliases that can be used to trigger this sticker/emoji.
+     */
+    shortcodes?: string[];
+    /** Identifier of the pack this sticker belongs to. */
+    packId?: string;
+    /**
+     * Indicates whether the sticker should behave like an emoji (inline) rather than an attachment.
+     */
+    isCustomEmoji?: boolean;
+}
+
+export type CustomEmoji = Sticker;
+
+export type StickerPackSource = 'local' | 'account_data' | 'room' | 'user';
+
+export interface StickerPack {
+    /** Unique identifier for the sticker pack (includes source prefix). */
+    id: string;
+    name: string;
+    description?: string;
+    avatarUrl?: string | null;
+    attribution?: string;
+    isEmojiPack?: boolean;
+    source: StickerPackSource;
+    roomId?: string;
+    creatorUserId?: string;
+    stickers: Sticker[];
+    isEnabled?: boolean;
+    lastUpdated?: number;
+}
+
+export interface StickerLibraryState {
+    packs: StickerPack[];
+    favorites: string[];
+    enabledPackIds: string[];
 }
 
 export interface Gif {

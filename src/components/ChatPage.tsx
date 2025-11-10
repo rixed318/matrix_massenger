@@ -1,16 +1,18 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 // FIX: Import MatrixRoom to correctly type room objects from the SDK.
-import { Room as UIRoom, Message, MatrixEvent, Reaction, ReplyInfo, MatrixClient, MatrixRoom, ActiveThread, MatrixUser, Poll, PollResult, Folder, ScheduledMessage, MatrixCall, LinkPreviewData, Sticker, Gif, RoomNotificationMode } from '@matrix-messenger/core';
+import { Room as UIRoom, Message, MatrixEvent, Reaction, ReplyInfo, MatrixClient, MatrixRoom, ActiveThread, MatrixUser, Poll, PollResult, Folder, ScheduledMessage, ScheduledMessageScheduleUpdate, ScheduledMessageUpdatePayload, MatrixCall, LinkPreviewData, Sticker, Gif, RoomNotificationMode } from '@matrix-messenger/core';
 import RoomList from './RoomList';
 import MessageView from './MessageView';
 import ChatHeader from './ChatHeader';
 import MessageInput from './MessageInput';
-import { mxcToHttp, sendReaction, sendTypingIndicator, editMessage, sendMessage, deleteMessage, sendImageMessage, sendReadReceipt, sendFileMessage, setDisplayName, setAvatar, createRoom, inviteUser, forwardMessage, paginateRoomHistory, sendAudioMessage, setPinnedMessages, sendPollStart, sendPollResponse, translateText, sendStickerMessage, sendGifMessage, getSecureCloudProfileForClient, getRoomNotificationMode, setRoomNotificationMode as updateRoomPushRule, RoomCreationOptions, getRoomTTL, setRoomTTL, isRoomHidden, setRoomHidden } from '@matrix-messenger/core';
+import { mxcToHttp, sendReaction, sendTypingIndicator, editMessage, sendMessage, deleteMessage, sendImageMessage, sendReadReceipt, sendFileMessage, setDisplayName, setAvatar, createRoom, inviteUser, forwardMessage, paginateRoomHistory, sendAudioMessage, sendVideoMessage, setPinnedMessages, sendPollStart, sendPollResponse, translateText, sendStickerMessage, sendGifMessage, getSecureCloudProfileForClient, getRoomNotificationMode, setRoomNotificationMode as updateRoomPushRule, RoomCreationOptions, getRoomTTL, setRoomTTL, isRoomHidden, setRoomHidden } from '@matrix-messenger/core';
 import { startGroupCall, joinGroupCall, getDisplayMedia, enumerateDevices } from '@matrix-messenger/core';
 import {
     getScheduledMessages,
     addScheduledMessage,
     deleteScheduledMessage,
+    updateScheduledMessage,
+    bulkUpdateScheduledMessages,
     markScheduledMessageSent,
     recordScheduledMessageError,
     parseScheduledMessagesFromEvent,
@@ -33,7 +35,7 @@ import CallView from './CallView';
 import SearchModal from './SearchModal';
 import PluginCatalogModal from './PluginCatalogModal';
 import { SearchResultItem } from '@matrix-messenger/core';
-import type { DraftContent, SendKeyBehavior, DraftAttachment, DraftAttachmentKind } from '../types';
+import type { DraftContent, SendKeyBehavior, DraftAttachment, DraftAttachmentKind, VideoMessageMetadata } from '../types';
 import SharedMediaPanel from './SharedMediaPanel';
 import type { RoomMediaSummary, SharedMediaCategory, RoomMediaItem } from '@matrix-messenger/core';
 // FIX: The `matrix-js-sdk` exports event names as enums. Import them to use with the event emitter.
@@ -1998,11 +2000,74 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
             URL.revokeObjectURL(localUrl);
         }
     };
+
+    const handleSendVideo = async (file: Blob, metadata: VideoMessageMetadata) => {
+        if (!selectedRoomId) return;
+
+        const tempId = `temp-video-${Date.now()}`;
+        const localUrl = URL.createObjectURL(file);
+        const localThumbnailUrl = URL.createObjectURL(metadata.thumbnail);
+        const user = client.getUser(client.getUserId()!);
+
+        const tempMessage: Message = {
+            id: tempId,
+            sender: {
+                id: client.getUserId()!,
+                name: user?.displayName || 'Me',
+                avatarUrl: mxcToHttp(client, user?.avatarUrl),
+            },
+            content: {
+                body: 'Video message',
+                msgtype: MsgType.Video,
+                info: {
+                    mimetype: metadata.mimeType,
+                    size: file.size,
+                    duration: metadata.durationMs,
+                    w: metadata.width,
+                    h: metadata.height,
+                    thumbnail_url: localThumbnailUrl,
+                    thumbnail_info: {
+                        mimetype: metadata.thumbnailMimeType,
+                        size: metadata.thumbnail.size,
+                        w: metadata.thumbnailWidth,
+                        h: metadata.thumbnailHeight,
+                    },
+                },
+            },
+            timestamp: Date.now(),
+            isOwn: true,
+            reactions: null, isEdited: false, isRedacted: false, replyTo: null, readBy: {},
+            isUploading: true,
+            localUrl,
+            localThumbnailUrl,
+            threadReplyCount: 0,
+        };
+
+        setMessages(prev => [...prev, tempMessage]);
+        scrollToBottom();
+
+        try {
+            await sendVideoMessage(client, selectedRoomId, file, metadata);
+        } catch (error) {
+            console.error('Failed to send video message:', error);
+            setMessages(prev => prev.filter(m => m.id !== tempId));
+        } finally {
+            URL.revokeObjectURL(localUrl);
+            URL.revokeObjectURL(localThumbnailUrl);
+        }
+    };
     
     const handleSendSticker = async (sticker: Sticker) => {
         if (!selectedRoomId) return;
+        if (sticker.isCustomEmoji) {
+            const shortcode = sticker.shortcodes?.[0] ?? sticker.body;
+            if (shortcode) {
+                await handleSendMessage({ body: shortcode });
+            }
+            return;
+        }
         try {
-            await sendStickerMessage(client, selectedRoomId, sticker.url, sticker.body, sticker.info);
+            await sendStickerMessage(client, selectedRoomId, sticker.url, sticker.body, sticker.info ?? {});
         } catch (error) {
             console.error('Failed to send sticker:', error);
         }
@@ -2177,13 +2242,17 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
         setIsScheduleModalOpen(true);
     };
 
-    const handleConfirmSchedule = async (sendAt: number) => {
+    const handleConfirmSchedule = async (selection: { sendAtUtc: number; timezoneOffset: number; timezoneId: string; localTimestamp: number }) => {
         if (selectedRoomId && contentToSchedule) {
             const preparedContent = prepareScheduledContent(contentToSchedule);
             const hasContent = preparedContent.plain.trim().length > 0 || preparedContent.attachments.length > 0 || !!preparedContent.msgtype;
             if (hasContent) {
                 try {
-                    await addScheduledMessage(client, selectedRoomId, preparedContent, sendAt);
+                    await addScheduledMessage(client, selectedRoomId, preparedContent, selection.sendAtUtc, {
+                        timezoneOffset: selection.timezoneOffset,
+                        timezoneId: selection.timezoneId,
+                        localTimestamp: selection.localTimestamp,
+                    });
                     setAllScheduledMessages(await getScheduledMessages(client));
                 } catch (error) {
                     console.error('Failed to schedule message', error);
@@ -2223,6 +2292,56 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
             }
         }
     };
+
+    const handleUpdateScheduled = useCallback(async (id: string, update: ScheduledMessageUpdatePayload) => {
+        try {
+            await updateScheduledMessage(client, id, update);
+            setAllScheduledMessages(await getScheduledMessages(client));
+        } catch (error) {
+            console.error(`Failed to update scheduled message ${id}`, error);
+            throw error;
+        }
+    }, [client]);
+
+    const handleBulkReschedule = useCallback(async (ids: string[], schedule: ScheduledMessageScheduleUpdate) => {
+        try {
+            await bulkUpdateScheduledMessages(client, ids.map(id => ({ id, schedule })));
+            setAllScheduledMessages(await getScheduledMessages(client));
+        } catch (error) {
+            console.error('Failed to bulk update scheduled messages', error);
+            throw error;
+        }
+    }, [client]);
+
+    const handleBulkSendScheduled = useCallback(async (ids: string[]) => {
+        try {
+            const latestMessages = await getScheduledMessages(client);
+            const selected = latestMessages.filter(message => ids.includes(message.id));
+            const errors: string[] = [];
+
+            for (const message of selected) {
+                try {
+                    await dispatchScheduledMessage(message);
+                    await markScheduledMessageSent(client, message.id);
+                } catch (error) {
+                    console.error(`Failed to send scheduled message ${message.id} immediately:`, error);
+                    errors.push(message.id);
+                    await recordScheduledMessageError(client, message.id, error);
+                }
+            }
+
+            setAllScheduledMessages(await getScheduledMessages(client));
+
+            if (errors.length > 0) {
+                throw new Error(`Не удалось отправить ${errors.length} из ${selected.length} сообщений`);
+            }
+        } catch (error) {
+            if (error instanceof Error) {
+                throw error;
+            }
+            throw new Error('Не удалось выполнить массовую отправку');
+        }
+    }, [client, dispatchScheduledMessage]);
 
     const handlePlaceCall = (type: 'voice' | 'video') => {
         if (!selectedRoomId || activeCall) return;
@@ -2542,12 +2661,13 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
                                 </svg>
                             </button>
                         )}
-                        <MessageComposer
-                            onSendMessage={handleSendMessage}
-                            onSendFile={handleSendFile}
-                            onSendAudio={handleSendAudio}
-                            onSendSticker={handleSendSticker}
-                            onSendGif={handleSendGif}
+                            <MessageComposer
+                                onSendMessage={handleSendMessage}
+                                onSendFile={handleSendFile}
+                                onSendAudio={handleSendAudio}
+                                onSendVideo={handleSendVideo}
+                                onSendSticker={handleSendSticker}
+                                onSendGif={handleSendGif}
                             onOpenCreatePoll={() => setIsCreatePollOpen(true)}
                             onSchedule={handleOpenScheduleModal}
                             isSending={isSending}
@@ -2621,7 +2741,7 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
                 />
             )}
             
-             {isScheduleModalOpen && (
+            {isScheduleModalOpen && (
                 <ScheduleMessageModal
                     isOpen={isScheduleModalOpen}
                     onClose={() => setIsScheduleModalOpen(false)}
@@ -2629,7 +2749,7 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
                     messageContent={contentToSchedule}
                 />
             )}
-            
+
             {isViewScheduledModalOpen && (
                 <ViewScheduledMessagesModal
                     isOpen={isViewScheduledModalOpen}
@@ -2637,6 +2757,9 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
                     messages={scheduledForThisRoom}
                     onDelete={handleDeleteScheduled}
                     onSendNow={handleSendScheduledNow}
+                    onUpdate={handleUpdateScheduled}
+                    onBulkReschedule={handleBulkReschedule}
+                    onBulkSend={handleBulkSendScheduled}
                 />
             )}
 
@@ -2733,6 +2856,7 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
                 isLoading={isSharedMediaLoading}
                 isPaginating={isSharedMediaPaginating}
                 onLoadMore={sharedMediaData?.hasMore ? handleLoadMoreMedia : undefined}
+                currentUserId={client.getUserId() || undefined}
             />
             {activeGroupCall && (
                 <CallView
