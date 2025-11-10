@@ -11,6 +11,7 @@ import {
 import Avatar from './Avatar';
 import SecuritySettings from './SecuritySettings';
 import PluginsPanel from './Settings/PluginsPanel';
+import AutomationsPanel from './Settings/AutomationsPanel';
 import type { SendKeyBehavior } from '../types';
 
 interface SettingsModalProps {
@@ -458,6 +459,10 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, onSave, 
 
                     <div className="pt-6 border-t border-border-primary">
                         <PluginsPanel />
+                    </div>
+
+                    <div className="pt-6 border-t border-border-primary">
+                        <AutomationsPanel client={client} />
                     </div>
 
                     <div className="pt-6 border-t border-border-primary">
