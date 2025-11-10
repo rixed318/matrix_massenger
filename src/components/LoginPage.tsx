@@ -1,5 +1,5 @@
-import React, { useState, FormEvent, useEffect } from 'react';
-import type { MatrixClient, SecureCloudProfile } from '@matrix-messenger/core';
+import React, { FormEvent, useEffect, useState } from 'react';
+import type { MatrixClient } from '@matrix-messenger/core';
 import {
   login,
   resolveHomeserverBaseUrl,
@@ -8,13 +8,14 @@ import {
   TotpRequiredError,
   type LoginOptions,
 } from '@matrix-messenger/core';
+import type { SecureCloudProfile } from '../services/secureCloudService';
 import ServerDeploymentWizard from './ServerDeploymentWizard';
-import { useAccountStore } from '../services/accountManager';
+import { useAccountStore, type StoredAccount } from '../services/accountManager';
 
 interface LoginPageProps {
   onLoginSuccess?: (client: MatrixClient) => void;
   initialError?: string | null;
-  savedAccounts?: { key: string; homeserver_url: string; user_id: string; access_token: string }[];
+  savedAccounts?: StoredAccount[];
   isEmbedded?: boolean;
 }
 

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { MatrixClient } from '@matrix-messenger/core';
 import { mxcToHttp, getTranslationSettings, setTranslationSettings } from '@matrix-messenger/core';
 import Avatar from './Avatar';
