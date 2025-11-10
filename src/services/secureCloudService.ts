@@ -1,6 +1,7 @@
 import { RoomEvent, EventType } from 'matrix-js-sdk';
 import type { MatrixClient, MatrixEvent, MatrixRoom } from '../types';
 import { getLocalMlDetectors } from './secureCloudDetectors/localMl';
+import { getRegisteredDetectors } from './secureCloudDetectors/registry';
 
 export type SecureCloudMode = 'disabled' | 'managed' | 'self-hosted';
 
@@ -22,6 +23,36 @@ export interface SecureCloudDetectorConfig {
     [key: string]: unknown;
 }
 
+export type SecureCloudDetectorType = 'heuristic' | 'ml' | 'llm';
+
+export type SecureCloudDetectorModelProvider = 'onnx' | 'transformer' | 'external';
+
+export interface SecureCloudDetectorCapabilities {
+    handlesAttachments?: boolean;
+    offlineSupport?: boolean;
+    requiresPremium?: boolean;
+}
+
+export interface SecureCloudDetectorModel {
+    id: string;
+    provider: SecureCloudDetectorModelProvider;
+    label: string;
+    description?: string;
+    path?: string;
+    endpoint?: string;
+    parameters?: Record<string, unknown>;
+    languages?: string[];
+    metadata?: Record<string, unknown>;
+}
+
+export interface SecureCloudDetectorLanguageConfig {
+    language: string;
+    threshold?: number;
+    modelId?: string;
+    promptTemplate?: string;
+    settings?: Record<string, unknown>;
+}
+
 export interface SecureCloudDetector {
     id: string;
     displayName: string;
@@ -29,6 +60,10 @@ export interface SecureCloudDetector {
     required?: boolean;
     requireForPremium?: boolean;
     defaultConfig?: SecureCloudDetectorConfig;
+    type?: SecureCloudDetectorType;
+    models?: SecureCloudDetectorModel[];
+    languageOverrides?: SecureCloudDetectorLanguageConfig[];
+    capabilities?: SecureCloudDetectorCapabilities;
     warmup?: () => Promise<void> | void;
     score: (
         event: MatrixEvent,
@@ -56,6 +91,9 @@ export interface SecureCloudProfile {
     riskThreshold?: number;
     allowedEventTypes?: string[];
     detectors?: SecureCloudDetectorState[];
+    detectorModels?: Record<string, string>;
+    userSensitivity?: number | 'low' | 'medium' | 'high';
+    organizationSensitivity?: number | 'low' | 'medium' | 'high';
 }
 
 export interface SuspiciousEventNotice {
@@ -143,6 +181,19 @@ const KEYWORD_PATTERNS = [
     'giveaway',
 ];
 
+const clamp01 = (value: number): number => {
+    if (!Number.isFinite(value)) {
+        return 0;
+    }
+    if (value <= 0) {
+        return 0;
+    }
+    if (value >= 1) {
+        return 1;
+    }
+    return value;
+};
+
 const summariseMessageBody = (body: string): string => {
     return body.length > 160 ? `${body.substring(0, 157)}...` : body;
 };
@@ -160,6 +211,8 @@ const builtinDetectors: SecureCloudDetector[] = [
         displayName: 'Базовые эвристики',
         description: 'Поиск ключевых слов и признаков фишинга в сообщениях.',
         required: true,
+        type: 'heuristic',
+        capabilities: { handlesAttachments: false, offlineSupport: true },
         score: (event) => {
             const { body, msgtype } = readEventBody(event);
             const lowerBody = body.toLowerCase();
@@ -743,6 +796,15 @@ const mergeDetectors = (profile: SecureCloudProfile): SecureCloudDetectorState[]
         register(state);
     }
 
+    for (const detector of getRegisteredDetectors()) {
+        const existing = states.get(detector.id);
+        if (existing) {
+            register({ ...existing, detector, enabled: existing.enabled, config: existing.config });
+        } else {
+            register({ detector, enabled: Boolean(detector.required), config: detector.defaultConfig });
+        }
+    }
+
     for (const detector of getLocalMlDetectors()) {
         const existing = states.get(detector.id);
         if (existing) {
@@ -759,18 +821,90 @@ export const resolveSecureCloudDetectors = (profile: SecureCloudProfile): Secure
     return mergeDetectors(profile);
 };
 
+const sensitivityLabels: Record<'low' | 'medium' | 'high', number> = {
+    low: 0.2,
+    medium: 0.5,
+    high: 0.85,
+};
+
+const normaliseSensitivityValue = (value: SecureCloudProfile['userSensitivity']): number | undefined => {
+    if (value == null) {
+        return undefined;
+    }
+    if (typeof value === 'number' && Number.isFinite(value)) {
+        return Math.min(1, Math.max(0, value));
+    }
+    const key = String(value).toLowerCase() as 'low' | 'medium' | 'high';
+    if (key in sensitivityLabels) {
+        return sensitivityLabels[key];
+    }
+    return undefined;
+};
+
+const normaliseDetectorModels = (models: SecureCloudProfile['detectorModels']): Record<string, string> | undefined => {
+    if (!models || typeof models !== 'object') {
+        return undefined;
+    }
+    const entries: Array<[string, string]> = [];
+    for (const [detectorId, modelId] of Object.entries(models)) {
+        if (!detectorId || typeof modelId !== 'string') {
+            continue;
+        }
+        entries.push([detectorId, modelId]);
+    }
+    if (entries.length === 0) {
+        return undefined;
+    }
+    return Object.fromEntries(entries);
+};
+
 export const normaliseSecureCloudProfile = (profile: SecureCloudProfile): SecureCloudProfile => {
     const metadataConsent = profile.metadataConsent !== undefined ? Boolean(profile.metadataConsent) : true;
     const retentionPeriodDays =
         typeof profile.retentionPeriodDays === 'number' && Number.isFinite(profile.retentionPeriodDays)
             ? Math.max(0, profile.retentionPeriodDays)
             : undefined;
-    return {
+    const detectorModels = normaliseDetectorModels(profile.detectorModels);
+    const userSensitivity = normaliseSensitivityValue(profile.userSensitivity);
+    const organizationSensitivity = normaliseSensitivityValue(profile.organizationSensitivity);
+
+    const baseProfile: SecureCloudProfile = {
         ...profile,
         metadataConsent,
         retentionPeriodDays,
-        detectors: mergeDetectors(profile),
+        detectorModels,
+        userSensitivity,
+        organizationSensitivity,
     };
+
+    return {
+        ...baseProfile,
+        detectors: mergeDetectors(baseProfile),
+    };
+};
+
+export const getSecureCloudDetectorCatalog = (): SecureCloudDetector[] => {
+    const map = new Map<string, SecureCloudDetector>();
+    const collect = (detector: SecureCloudDetector | null | undefined) => {
+        if (!detector) {
+            return;
+        }
+        if (!map.has(detector.id)) {
+            map.set(detector.id, detector);
+        }
+    };
+
+    for (const detector of builtinDetectors) {
+        collect(detector);
+    }
+    for (const detector of getRegisteredDetectors()) {
+        collect(detector);
+    }
+    for (const detector of getLocalMlDetectors()) {
+        collect(detector);
+    }
+
+    return Array.from(map.values());
 };
 
 interface DetectorExecutionError {
@@ -819,9 +953,9 @@ const evaluateEventRisk = async (
                 for (const reason of result.reasons) {
                     reasons.push(`${detector.id}:${reason}`);
                 }
-            } else {
-                reasons.push(detector.id);
-            }
+    } else {
+        reasons.push(detector.id);
+    }
 
             if (Array.isArray(result.keywords)) {
                 for (const keyword of result.keywords) {
@@ -840,10 +974,22 @@ const evaluateEventRisk = async (
         }
     }
 
-    const threshold = typeof profile.riskThreshold === 'number' ? profile.riskThreshold : 0.6;
+    const baseThreshold = typeof profile.riskThreshold === 'number' ? profile.riskThreshold : 0.6;
+    const userSensitivity = typeof profile.userSensitivity === 'number' ? profile.userSensitivity : undefined;
+    const organizationSensitivity = typeof profile.organizationSensitivity === 'number'
+        ? profile.organizationSensitivity
+        : undefined;
+
+    let effectiveThreshold = clamp01(baseThreshold);
+    if (userSensitivity !== undefined || organizationSensitivity !== undefined) {
+        const combined = clamp01(((userSensitivity ?? 0.5) + (organizationSensitivity ?? userSensitivity ?? 0.5)) / 2);
+        const adjustment = (0.5 - combined) * 0.3;
+        effectiveThreshold = clamp01(baseThreshold + adjustment);
+    }
+
     const cappedScore = Math.min(1, aggregatedScore);
 
-    if (cappedScore < threshold) {
+    if (cappedScore < effectiveThreshold) {
         return { notice: null, errors };
     }
 
