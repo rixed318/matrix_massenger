@@ -43,6 +43,7 @@ const ChatMessage: React.FC<ChatMessageProps> = ({
     const isOwn = message.isOwn;
     const isReadByOthers = isOwn && Object.keys(message.readBy).some(userId => userId !== client.getUserId());
     const [remainingSeconds, setRemainingSeconds] = useState<number | null>(null);
+    const [showTranscript, setShowTranscript] = useState<boolean>(message.transcript?.status === 'completed');
 
     useEffect(() => {
         if (isEditing) {
@@ -54,6 +55,14 @@ const ChatMessage: React.FC<ChatMessageProps> = ({
     useEffect(() => {
         setEditedContent(message.content.body);
     }, [message.content.body]);
+
+    useEffect(() => {
+        if (message.transcript?.status === 'completed') {
+            setShowTranscript(true);
+        } else {
+            setShowTranscript(false);
+        }
+    }, [message.id, message.transcript?.status, message.transcript?.eventId]);
 
     useEffect(() => {
         if (!message.selfDestruct?.expiresAt) {
@@ -337,8 +346,42 @@ const ChatMessage: React.FC<ChatMessageProps> = ({
                 {message.replyTo && !message.threadRootId && <ReplyQuote sender={message.replyTo.sender} body={message.replyTo.body} />}
                 {renderMessageBody()}
                 {message.linkPreview && <LinkPreview data={message.linkPreview} />}
+                {renderTranscriptBlock()}
             </>
         )
+    };
+
+    const renderTranscriptBlock = () => {
+        const transcript = message.transcript;
+        if (!transcript) return null;
+        if (message.content.msgtype !== 'm.audio' && message.content.msgtype !== 'm.video') return null;
+        const languageLabel = transcript.language ? ` (${transcript.language.toUpperCase()})` : '';
+        const isCompleted = transcript.status === 'completed' && Boolean(transcript.text);
+        return (
+            <div className="mt-2 w-full rounded-md bg-bg-secondary/40 p-2">
+                <div className="flex items-center justify-between text-xs text-text-secondary">
+                    <span>Транскрипт{languageLabel}</span>
+                    {isCompleted && (
+                        <button
+                            onClick={() => setShowTranscript(prev => !prev)}
+                            className="text-text-accent hover:underline"
+                            type="button"
+                        >
+                            {showTranscript ? 'Скрыть' : 'Показать'}
+                        </button>
+                    )}
+                </div>
+                {transcript.status === 'pending' && (
+                    <p className="mt-1 text-xs italic text-text-secondary">Обработка аудио...</p>
+                )}
+                {transcript.status === 'error' && (
+                    <p className="mt-1 text-xs text-red-400">Ошибка: {transcript.error ?? 'Не удалось получить транскрипт'}</p>
+                )}
+                {isCompleted && showTranscript && transcript.text && (
+                    <p className="mt-2 whitespace-pre-wrap text-sm text-text-primary">{transcript.text}</p>
+                )}
+            </div>
+        );
     };
     
     const renderTranslation = () => {

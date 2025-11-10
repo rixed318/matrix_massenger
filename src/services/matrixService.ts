@@ -28,6 +28,13 @@ import {
     AutoDiscoveryError, 
     IndexedDBStore, IndexedDBCryptoStore, ClientEvent, MemoryStore, MatrixScheduler, Preset, RoomEvent} from 'matrix-js-sdk';
 import type { HierarchyRoom } from 'matrix-js-sdk';
+import {
+    enqueueTranscriptionJob,
+    confirmTranscriptionJob,
+    cancelTranscriptionJob,
+    getTranscriptionRuntimeConfig,
+} from './transcriptionService';
+import type { TranscriptionSettings as ServiceTranscriptionSettings } from './transcriptionService';
 
 
 // ===== Offline Outbox Queue (IndexedDB/SQLite) =====
@@ -892,6 +899,11 @@ export const flushOutbox = async () => {
                 }
             }
             const sendRes = await _boundClient.sendEvent(item.roomId, item.type as any, baseContent);
+            try {
+                confirmTranscriptionJob(item.id, { eventId: sendRes.event_id, client: _boundClient, roomId: item.roomId, content: baseContent });
+            } catch (error) {
+                console.warn('Failed to schedule transcription for outbox item', error);
+            }
             await idbDelete(item.id);
             if (Array.isArray(workingItem.attachments)) {
                 for (const attachment of workingItem.attachments) {
@@ -938,6 +950,11 @@ export const enqueueOutbox = async (
 
 export const cancelOutboxItem = async (id: string) => {
     await idbDelete(id);
+    try {
+        cancelTranscriptionJob(id);
+    } catch (error) {
+        console.warn('Failed to cancel transcription job', error);
+    }
     _outboxEmitter.emit({ kind: 'cancelled', id });
     await updateServiceWorkerOutboxState();
 };
@@ -1254,6 +1271,10 @@ const GIF_FAVORITES_ACCOUNT_EVENT = 'com.econix.gif_favorites';
 
 let _translationSettingsCache: TranslationSettings | null = null;
 
+const TRANSCRIPTION_ACCOUNT_EVENT = 'com.econix.transcription.settings';
+const TRANSCRIPTION_LOCAL_KEY = 'econix.transcription.settings';
+let _transcriptionSettingsCache: ServiceTranscriptionSettings | null = null;
+
 /**
  * Read translation settings from Matrix account data or localStorage.
  * Account data has priority if present.
@@ -1299,6 +1320,87 @@ export async function setTranslationSettings(client: MatrixClient | null | undef
         }
     } catch (e) {
         console.warn('Failed to persist translation settings to account data', e);
+    }
+}
+
+const sanitizeTranscriptionSettings = (value: ServiceTranscriptionSettings | null | undefined): ServiceTranscriptionSettings | null => {
+    if (!value || typeof value !== 'object') return null;
+    const result: ServiceTranscriptionSettings = {};
+    if (typeof value.enabled === 'boolean') {
+        result.enabled = value.enabled;
+    }
+    if (typeof value.language === 'string' && value.language.trim().length) {
+        result.language = value.language.trim();
+    }
+    if (typeof value.maxDurationSec === 'number' && Number.isFinite(value.maxDurationSec)) {
+        result.maxDurationSec = Math.max(0, value.maxDurationSec);
+    }
+    return result;
+};
+
+const mergeTranscriptionSettings = (
+    defaults: ServiceTranscriptionSettings,
+    local: ServiceTranscriptionSettings | null,
+    remote: ServiceTranscriptionSettings | null,
+): ServiceTranscriptionSettings => {
+    const merged: ServiceTranscriptionSettings = { ...defaults };
+    const sources = [local, remote];
+    for (const source of sources) {
+        if (!source) continue;
+        if (typeof source.enabled === 'boolean') merged.enabled = source.enabled;
+        if (typeof source.language === 'string') merged.language = source.language;
+        if (typeof source.maxDurationSec === 'number') merged.maxDurationSec = source.maxDurationSec;
+    }
+    return merged;
+};
+
+export function getTranscriptionSettings(client?: MatrixClient | null): ServiceTranscriptionSettings {
+    try {
+        const defaults = (() => {
+            const runtime = getTranscriptionRuntimeConfig();
+            const base: ServiceTranscriptionSettings = { enabled: runtime.enabled };
+            if (runtime.defaultLanguage) base.language = runtime.defaultLanguage;
+            if (typeof runtime.maxDurationSec === 'number') base.maxDurationSec = runtime.maxDurationSec;
+            return base;
+        })();
+
+        const localRaw = (globalThis as any).localStorage?.getItem(TRANSCRIPTION_LOCAL_KEY);
+        const local = localRaw ? sanitizeTranscriptionSettings(JSON.parse(localRaw)) : null;
+        let remote: ServiceTranscriptionSettings | null = null;
+        if (client) {
+            const ev: any = (client as any).getAccountData?.(TRANSCRIPTION_ACCOUNT_EVENT as any);
+            const content = ev?.getContent?.();
+            if (content && typeof content === 'object') {
+                remote = sanitizeTranscriptionSettings({
+                    enabled: typeof content.enabled === 'boolean' ? content.enabled : undefined,
+                    language: typeof content.language === 'string' ? content.language : undefined,
+                    maxDurationSec: typeof content.maxDurationSec === 'number' ? content.maxDurationSec : undefined,
+                });
+            }
+        }
+        const merged = mergeTranscriptionSettings(defaults, local, remote);
+        _transcriptionSettingsCache = merged;
+        return merged;
+    } catch (error) {
+        console.warn('Failed to read transcription settings', error);
+        return _transcriptionSettingsCache || { enabled: false };
+    }
+}
+
+export async function setTranscriptionSettings(client: MatrixClient | null | undefined, settings: ServiceTranscriptionSettings): Promise<void> {
+    const sanitized = sanitizeTranscriptionSettings(settings) ?? {};
+    try {
+        (globalThis as any).localStorage?.setItem(TRANSCRIPTION_LOCAL_KEY, JSON.stringify(sanitized));
+    } catch (error) {
+        console.warn('Failed to persist transcription settings to localStorage', error);
+    }
+    _transcriptionSettingsCache = mergeTranscriptionSettings(getTranscriptionSettings(client), sanitized, null);
+    try {
+        if (client) {
+            await (client as any).setAccountData?.(TRANSCRIPTION_ACCOUNT_EVENT as any, sanitized as any);
+        }
+    } catch (error) {
+        console.warn('Failed to persist transcription settings to account data', error);
     }
 }
 
@@ -3316,12 +3418,16 @@ const applySelfDestructContent = async (client: MatrixClient, roomId: string, co
 };
 
 export const sendAudioMessage = async (client: MatrixClient, roomId: string, file: Blob, duration: number): Promise<{ event_id: string }> => {
+    const durationMs = Math.round(duration * 1000);
+    const transcriptionSettings = getTranscriptionSettings(client);
+    const runtimeConfig = getTranscriptionRuntimeConfig();
+    const shouldAttemptTranscription = (transcriptionSettings.enabled ?? runtimeConfig.enabled) && Boolean(runtimeConfig.endpoint);
     const content = {
         body: "Voice Message",
         info: {
             mimetype: file.type,
             size: file.size,
-            duration: Math.round(duration * 1000), // duration in milliseconds
+            duration: durationMs,
         },
         msgtype: MsgType.Audio,
         url: undefined as unknown as string,
@@ -3332,7 +3438,21 @@ export const sendAudioMessage = async (client: MatrixClient, roomId: string, fil
             name: "voice-message.ogg",
             type: file.type,
         });
-        return client.sendEvent(roomId, EventType.RoomMessage, { ...content, url: mxcUrl } as any);
+        const result = await client.sendEvent(roomId, EventType.RoomMessage, { ...content, url: mxcUrl } as any);
+        if (shouldAttemptTranscription && result?.event_id) {
+            enqueueTranscriptionJob({
+                client,
+                roomId,
+                eventId: result.event_id,
+                msgType: MsgType.Audio,
+                mimeType: file.type,
+                durationMs,
+                file,
+                mxcUrl,
+                settings: transcriptionSettings,
+            });
+        }
+        return result;
     };
 
     const queueOutbox = async () => {
@@ -3343,6 +3463,17 @@ export const sendAudioMessage = async (client: MatrixClient, roomId: string, fil
         });
         const localId = await enqueueOutbox(roomId, EventType.RoomMessage, content, { attachments: [attachment] });
         clearNextMessageTTL(roomId);
+        if (shouldAttemptTranscription) {
+            enqueueTranscriptionJob({
+                client,
+                roomId,
+                localId,
+                msgType: MsgType.Audio,
+                mimeType: file.type,
+                durationMs,
+                settings: transcriptionSettings,
+            });
+        }
         return { event_id: localId };
     };
 
@@ -3368,12 +3499,16 @@ export const sendVideoMessage = async (
     file: Blob,
     metadata: VideoMessageMetadata,
 ): Promise<{ event_id: string }> => {
+    const durationMs = Math.round(metadata.durationMs);
+    const transcriptionSettings = getTranscriptionSettings(client);
+    const runtimeConfig = getTranscriptionRuntimeConfig();
+    const shouldAttemptTranscription = (transcriptionSettings.enabled ?? runtimeConfig.enabled) && Boolean(runtimeConfig.endpoint);
     const content: any = {
         body: 'Video message',
         info: {
             mimetype: metadata.mimeType,
             size: file.size,
-            duration: Math.round(metadata.durationMs),
+            duration: durationMs,
             w: metadata.width,
             h: metadata.height,
             thumbnail_url: undefined as unknown as string,
@@ -3415,7 +3550,21 @@ export const sendVideoMessage = async (
         if (thumbMxc) {
             payload.info = { ...payload.info, thumbnail_url: thumbMxc };
         }
-        return client.sendEvent(roomId, EventType.RoomMessage, payload as any);
+        const result = await client.sendEvent(roomId, EventType.RoomMessage, payload as any);
+        if (shouldAttemptTranscription && result?.event_id) {
+            enqueueTranscriptionJob({
+                client,
+                roomId,
+                eventId: result.event_id,
+                msgType: MsgType.Video,
+                mimeType: metadata.mimeType,
+                durationMs,
+                file,
+                mxcUrl: videoMxc,
+                settings: transcriptionSettings,
+            });
+        }
+        return result;
     };
 
     const queueOutbox = async () => {
@@ -3433,6 +3582,17 @@ export const sendVideoMessage = async (
         });
         const localId = await enqueueOutbox(roomId, EventType.RoomMessage, content, { attachments: [videoAttachment, thumbAttachment] });
         clearNextMessageTTL(roomId);
+        if (shouldAttemptTranscription) {
+            enqueueTranscriptionJob({
+                client,
+                roomId,
+                localId,
+                msgType: MsgType.Video,
+                mimeType: metadata.mimeType,
+                durationMs,
+                settings: transcriptionSettings,
+            });
+        }
         return { event_id: localId };
     };
 

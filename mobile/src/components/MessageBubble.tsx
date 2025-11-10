@@ -78,6 +78,27 @@ const renderAttachment = (message: Message) => {
 };
 
 export const MessageBubble: React.FC<MessageBubbleProps> = ({ message, isOwn }) => {
+  const renderTranscript = () => {
+    const transcript = message.transcript;
+    if (!transcript) return null;
+    if (message.content.msgtype !== 'm.audio' && message.content.msgtype !== 'm.video') return null;
+    const languageLabel = transcript.language ? ` (${transcript.language.toUpperCase()})` : '';
+    return (
+      <View style={styles.transcriptContainer}>
+        <Text style={styles.transcriptTitle}>Транскрипт{languageLabel}</Text>
+        {transcript.status === 'pending' && (
+          <Text style={styles.transcriptPending}>Обработка аудио...</Text>
+        )}
+        {transcript.status === 'error' && (
+          <Text style={styles.transcriptError}>Ошибка: {transcript.error ?? 'Не удалось получить транскрипт'}</Text>
+        )}
+        {transcript.status === 'completed' && transcript.text && (
+          <Text style={styles.transcriptBody}>{transcript.text}</Text>
+        )}
+      </View>
+    );
+  };
+
   return (
     <View style={[styles.container, isOwn ? styles.ownContainer : styles.otherContainer]}>
       <View style={[styles.bubble, isOwn ? styles.ownBubble : styles.otherBubble]}>
@@ -85,6 +106,7 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({ message, isOwn }) 
           {message.content.body}
         </Text>
         {renderAttachment(message)}
+        {renderTranscript()}
         <Text style={[styles.timestamp, isOwn ? styles.ownTimestamp : styles.otherTimestamp]}>
           {new Date(message.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
         </Text>

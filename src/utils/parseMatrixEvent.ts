@@ -171,6 +171,13 @@ export function parseMatrixEvent(client: MatrixClient, event: MatrixEvent): Mess
         }
     }
 
+    let transcript = null;
+    const eventId = event.getId();
+    if (eventId && room) {
+        const related = (room as any).getRelatedEventsForEvent?.(eventId, RelationType.Annotation, EventType.RoomMessage) as MatrixEvent[] | undefined;
+        transcript = pickLatestTranscript(related);
+    }
+
     return {
         id: event.getId()!,
         sender: {
