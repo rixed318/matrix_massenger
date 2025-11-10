@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { EventType, RoomEvent } from 'matrix-js-sdk';
-import { MatrixClient, MatrixEvent, MatrixRoom, Message } from '../types';
-import { parseMatrixEvent } from '../utils/parseMatrixEvent';
+import { MatrixClient, Message } from '../types';
+import { mapRoomTimeline, subscribeRoomTimeline } from '../../packages/core/src/roomTimeline';
 
 export interface UseRoomTimelineOptions {
   client: MatrixClient;
@@ -18,14 +17,6 @@ export interface UseRoomTimelineResult {
   refresh: () => void;
 }
 
-const toTimeline = (client: MatrixClient, room: MatrixRoom, limit?: number): Message[] => {
-  const timeline = room.getLiveTimeline().getEvents();
-  const slice = typeof limit === 'number' ? timeline.slice(-limit) : timeline;
-  return slice
-    .map((event: MatrixEvent) => parseMatrixEvent(client, event))
-    .filter((event): event is Message => Boolean(event));
-};
-
 export const useRoomTimeline = ({ client, roomId, limit }: UseRoomTimelineOptions): UseRoomTimelineResult => {
   const [events, setEvents] = useState<Message[]>([]);
   const [isLoading, setIsLoading] = useState(true);
@@ -37,7 +28,7 @@ export const useRoomTimeline = ({ client, roomId, limit }: UseRoomTimelineOption
       setIsLoading(false);
       return;
     }
-    setEvents(toTimeline(client, room, limit));
+    setEvents(mapRoomTimeline(client, room, limit));
     setIsLoading(false);
   }, [client, roomId, limit]);
 
@@ -45,33 +36,7 @@ export const useRoomTimeline = ({ client, roomId, limit }: UseRoomTimelineOption
     refresh();
   }, [refresh]);
 
-  useEffect(() => {
-    const handleTimeline = (event: MatrixEvent, room: MatrixRoom | undefined) => {
-      if (!room || room.roomId !== roomId) {
-        return;
-      }
-      if (event.getType() === EventType.RoomMessage || event.getType() === 'm.sticker') {
-        refresh();
-      }
-    };
-
-    const handleDecryption = (event: MatrixEvent, _success: boolean, room: MatrixRoom | undefined) => {
-      if (!room || room.roomId !== roomId) {
-        return;
-      }
-      if (event.isDecryptionFailure() || event.getType() === EventType.RoomMessage) {
-        refresh();
-      }
-    };
-
-    client.on(RoomEvent.Timeline, handleTimeline);
-    (client as any).on?.('Event.decrypted', handleDecryption);
-
-    return () => {
-      client.removeListener(RoomEvent.Timeline, handleTimeline);
-      (client as any).removeListener?.('Event.decrypted', handleDecryption);
-    };
-  }, [client, refresh, roomId]);
+  useEffect(() => subscribeRoomTimeline(client, roomId, refresh), [client, refresh, roomId]);
 
   const sendMessage = useCallback(async (message: string) => {
     const trimmed = message.trim();

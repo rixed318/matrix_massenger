@@ -41,6 +41,8 @@ export const CallScreen: React.FC<CallScreenProps> = ({ session, route }) => {
     };
   }, [accountKey]);
 
+  useNativeCallBridge(roomId, callState);
+
   useEffect(() => {
     let disposed = false;
     let matrixCall: any = null;

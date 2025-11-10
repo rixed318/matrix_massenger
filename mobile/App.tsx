@@ -10,12 +10,14 @@ import { ChatScreen } from './src/screens/ChatScreen';
 import { CallScreen } from './src/screens/CallScreen';
 import { RootStackParamList } from './src/types/navigation';
 import { usePushNotifications } from './src/hooks/usePushNotifications';
+import { useSecureCloudNotifications } from './src/hooks/useSecureCloudNotifications';
 
 const Stack = createNativeStackNavigator<RootStackParamList>();
 
 const AuthenticatedNavigator = () => {
   const { session, logout } = useMatrixSession();
   usePushNotifications(session);
+  useSecureCloudNotifications(session);
 
   if (!session) {
     return null;

@@ -1,4 +1,4 @@
-import React, { useCallback, useMemo } from 'react';
+import React, { useCallback, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
   FlatList,
@@ -15,6 +15,8 @@ import { useChats } from '@matrix-messenger/core';
 import { ChatListItem } from '../components/ChatListItem';
 import { MatrixSessionWithAccount } from '../context/MatrixSessionContext';
 import { RootStackParamList } from '../types/navigation';
+import { useUniversalInbox } from '../hooks/useUniversalInbox';
+import { UniversalInbox } from '../components/UniversalInbox';
 
 interface ChatListScreenProps {
   session: MatrixSessionWithAccount;
@@ -23,10 +25,11 @@ interface ChatListScreenProps {
 }
 
 export const ChatListScreen: React.FC<ChatListScreenProps> = ({ session, navigation, onLogout }) => {
-  const { filteredRooms, isLoading, refresh, searchTerm, setSearchTerm } = useChats({
+  const { rooms, filteredRooms, isLoading, refresh, searchTerm, setSearchTerm } = useChats({
     client: session.client,
     savedMessagesRoomId: session.savedMessagesRoomId ?? '',
   });
+  const [inboxFilter, setInboxFilter] = useState<'all' | 'unread' | 'mentions' | 'secure'>('all');
 
   const handleOpenRoom = useCallback((roomId: string, name: string) => {
     navigation.navigate('Chat', { roomId, roomName: name });
@@ -36,7 +39,16 @@ export const ChatListScreen: React.FC<ChatListScreenProps> = ({ session, navigat
     <ChatListItem room={item} onPress={() => handleOpenRoom(item.roomId, item.name)} />
   ), [handleOpenRoom]);
 
-  const rooms = useMemo(() => filteredRooms, [filteredRooms]);
+  const inboxEntries = useUniversalInbox(rooms);
+
+  const filteredByInbox = useMemo(() => {
+    if (inboxFilter === 'all') return filteredRooms;
+    return filteredRooms.filter(room => {
+      if (inboxFilter === 'unread') return (room.unreadCount ?? 0) > 0;
+      if (inboxFilter === 'mentions') return (room.mentionCount ?? 0) > 0;
+      return (room.secureAlertCount ?? 0) > 0;
+    });
+  }, [filteredRooms, inboxFilter]);
 
   return (
     <SafeAreaView style={styles.container}>
@@ -50,6 +62,7 @@ export const ChatListScreen: React.FC<ChatListScreenProps> = ({ session, navigat
           value={searchTerm}
           onChangeText={setSearchTerm}
         />
+        <UniversalInbox entries={inboxEntries} active={inboxFilter} onSelect={setInboxFilter} />
         <TouchableOpacity style={styles.logoutButton} onPress={onLogout} accessibilityRole="button">
           <Text style={styles.logoutText}>Выйти</Text>
         </TouchableOpacity>
@@ -60,7 +73,7 @@ export const ChatListScreen: React.FC<ChatListScreenProps> = ({ session, navigat
         </View>
       ) : (
         <FlatList
-          data={rooms}
+          data={filteredByInbox}
           keyExtractor={item => item.roomId}
           renderItem={renderItem}
           contentContainerStyle={styles.listContent}

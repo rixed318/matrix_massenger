@@ -1,4 +1,4 @@
-import React, { useCallback, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
   FlatList,
@@ -7,7 +7,6 @@ import {
   SafeAreaView,
   StyleSheet,
   Text,
-  TextInput,
   TouchableOpacity,
   View,
 } from 'react-native';
@@ -15,11 +14,15 @@ import { RouteProp, useNavigation } from '@react-navigation/native';
 import { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import * as DocumentPicker from 'expo-document-picker';
 import { Audio } from 'expo-av';
-import { useRoomTimeline } from '@matrix-messenger/core';
+import { MatrixUser, useRoomTimeline } from '@matrix-messenger/core';
 import { getTheme, spacing, controls, radii, typography } from '@matrix-messenger/ui-tokens';
+import { MessageInputNative } from '@matrix-messenger/ui/message-input';
 import { MessageBubble } from '../components/MessageBubble';
+import { GifStickerPicker } from '../components/GifStickerPicker';
 import { MatrixSessionWithAccount } from '../context/MatrixSessionContext';
 import { RootStackParamList } from '../types/navigation';
+import { useDraftManager } from '../hooks/useDraftManager';
+import { useMessageScheduler } from '../hooks/useMessageScheduler';
 
 interface ChatScreenProps {
   session: MatrixSessionWithAccount;
@@ -34,11 +37,6 @@ const fetchArrayBuffer = async (uri: string) => {
 };
 
 const chatTheme = getTheme('dark');
-const controlRadius = controls.md / 2;
-const sendControlRadius = controls.lg / 2;
-const inputVerticalPadding = spacing.sm + spacing.xs / 2;
-const inputMaxHeight = controls.lg * 2.5;
-
 export const ChatScreen: React.FC<ChatScreenProps> = ({ session, route }) => {
   const { roomId, roomName } = route.params;
   const navigation = useNavigation<NativeStackNavigationProp<RootStackParamList>>();
@@ -46,27 +44,57 @@ export const ChatScreen: React.FC<ChatScreenProps> = ({ session, route }) => {
   const [sending, setSending] = useState(false);
   const [recording, setRecording] = useState<Audio.Recording | null>(null);
   const [isUploading, setIsUploading] = useState(false);
+  const [pickerVisible, setPickerVisible] = useState(false);
+  const [scheduledFor, setScheduledFor] = useState<Date | null>(null);
 
   const { events, isLoading, sendMessage, sendAttachment, sendVoiceMessage } = useRoomTimeline({
     client: session.client,
     roomId,
   });
 
+  const members = useMemo<MatrixUser[]>(() => {
+    const room = session.client.getRoom(roomId);
+    if (!room) return [];
+    return room.getMembersWithMembership('join').map(member => ({
+      userId: member.userId,
+      displayName: member.name,
+      avatarUrl: member.getAvatarUrl(session.client.baseUrl, 64, 64, 'scale') ?? undefined,
+    }));
+  }, [roomId, session.client]);
+
+  const { currentDraft, updateDraft } = useDraftManager(roomId);
+  const { upcoming, scheduleMessage, clearRoomSchedules } = useMessageScheduler(roomId);
+
+  const activeSchedule = useMemo(() => {
+    if (!upcoming.length) return null;
+    const first = upcoming[0];
+    const ts = Date.parse(first.content.scheduledFor ?? '');
+    if (Number.isNaN(ts)) return null;
+    return new Date(ts);
+  }, [upcoming]);
+
+  useEffect(() => {
+    if (!input && currentDraft?.plain) {
+      setInput(currentDraft.plain);
+    }
+  }, [currentDraft, input]);
+
   const sortedEvents = useMemo(() => [...events].sort((a, b) => a.timestamp - b.timestamp), [events]);
 
-  const handleSend = useCallback(async () => {
-    const text = input.trim();
+  const handleSend = useCallback(async ({ body }: { body: string }) => {
+    const text = body.trim();
     if (!text) return;
     setSending(true);
     try {
       await sendMessage(text);
       setInput('');
+      updateDraft(null);
     } catch (error) {
       console.warn('send message failed', error);
     } finally {
       setSending(false);
     }
-  }, [input, sendMessage]);
+  }, [sendMessage, updateDraft]);
 
   const handleAttachment = useCallback(async () => {
     try {
@@ -137,8 +165,6 @@ export const ChatScreen: React.FC<ChatScreenProps> = ({ session, route }) => {
     navigation.navigate('Call', { roomId });
   }, [navigation, roomId]);
 
-  const placeholderColor = chatTheme.colors.text.placeholder;
-
   return (
     <SafeAreaView style={styles.container}>
       <KeyboardAvoidingView
@@ -156,7 +182,7 @@ export const ChatScreen: React.FC<ChatScreenProps> = ({ session, route }) => {
           </TouchableOpacity>
         </View>
         {isLoading ? (
-          <View style={styles.loading}> 
+          <View style={styles.loading}>
             <ActivityIndicator color={chatTheme.colors.text.primary} />
           </View>
         ) : (
@@ -169,38 +195,55 @@ export const ChatScreen: React.FC<ChatScreenProps> = ({ session, route }) => {
             contentContainerStyle={styles.messages}
           />
         )}
-        <View style={styles.inputRow}>
-          <TouchableOpacity
-            style={[styles.actionButton, isUploading && styles.disabledActionButton]}
-            onPress={handleAttachment}
-            disabled={isUploading}
-          >
-            <Text style={styles.actionText}>➕</Text>
-          </TouchableOpacity>
-          <TouchableOpacity
-            style={[styles.actionButton, recording && styles.recordingButton]}
-            onPress={toggleRecording}
-          >
-            <Text style={styles.actionText}>{recording ? '⏹' : '🎙️'}</Text>
-          </TouchableOpacity>
-          <TextInput
-            style={styles.input}
-            placeholder="Сообщение"
-            placeholderTextColor={placeholderColor}
-            value={input}
-            onChangeText={setInput}
-            multiline
-          />
-          <TouchableOpacity
-            style={[styles.sendButton, sending && styles.disabledSendButton]}
-            onPress={handleSend}
-            accessibilityRole="button"
-            disabled={sending}
-          >
-            <Text style={styles.sendText}>➤</Text>
-          </TouchableOpacity>
-        </View>
+        <MessageInputNative
+          roomMembers={members}
+          value={input || currentDraft?.plain || ''}
+          onChangeValue={setInput}
+          onSend={handleSend}
+          isSending={sending}
+          onDraftChange={draft => updateDraft(draft)}
+          draftContent={currentDraft}
+          onOpenAttachmentPicker={handleAttachment}
+          onToggleVoiceRecording={toggleRecording}
+          isRecording={Boolean(recording)}
+          onOpenGifPicker={() => setPickerVisible(true)}
+          onSchedule={content => {
+            scheduleMessage(content);
+            setScheduledFor(new Date(content.scheduledFor ?? Date.now()));
+          }}
+          scheduledFor={scheduledFor ?? activeSchedule}
+          onClearSchedule={() => {
+            clearRoomSchedules();
+            setScheduledFor(null);
+          }}
+          accessoryContent={
+            isUploading ? (
+              <View style={styles.uploadBanner}>
+                <ActivityIndicator color={chatTheme.colors.text.primary} size="small" />
+                <Text style={styles.uploadText}>Загрузка вложения…</Text>
+              </View>
+            ) : null
+          }
+        />
       </KeyboardAvoidingView>
+      <GifStickerPicker
+        visible={pickerVisible}
+        onClose={() => setPickerVisible(false)}
+        onSelectGif={async gif => {
+          try {
+            await sendMessage(gif.url);
+          } catch (error) {
+            console.warn('send gif failed', error);
+          }
+        }}
+        onSelectSticker={async sticker => {
+          try {
+            await sendMessage(sticker.url);
+          } catch (error) {
+            console.warn('send sticker failed', error);
+          }
+        }}
+      />
     </SafeAreaView>
   );
 };
@@ -250,54 +293,15 @@ const styles = StyleSheet.create({
   messages: {
     paddingBottom: spacing.lg,
   },
-  inputRow: {
+  uploadBanner: {
     flexDirection: 'row',
-    alignItems: 'flex-end',
+    alignItems: 'center',
     paddingHorizontal: spacing.md,
-    paddingVertical: spacing.md,
-    gap: spacing.sm,
+    paddingVertical: spacing.xs,
+    gap: spacing.xs,
   },
-  actionButton: {
-    backgroundColor: chatTheme.colors.controls.surface,
-    width: controls.md,
-    height: controls.md,
-    borderRadius: controlRadius,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  disabledActionButton: {
-    opacity: 0.5,
-  },
-  actionText: {
-    color: chatTheme.colors.text.primary,
-    fontSize: typography.fontSize.md,
-  },
-  recordingButton: {
-    backgroundColor: chatTheme.colors.controls.recording,
-  },
-  input: {
-    flex: 1,
-    minHeight: controls.md,
-    maxHeight: inputMaxHeight,
-    backgroundColor: chatTheme.colors.background.tertiary,
-    borderRadius: radii.lg,
-    color: chatTheme.colors.text.primary,
-    paddingHorizontal: spacing.lg,
-    paddingVertical: inputVerticalPadding,
-  },
-  sendButton: {
-    backgroundColor: chatTheme.colors.accent.primary,
-    width: controls.lg,
-    height: controls.lg,
-    borderRadius: sendControlRadius,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  disabledSendButton: {
-    opacity: 0.6,
-  },
-  sendText: {
-    color: chatTheme.colors.text.inverted,
-    fontSize: typography.fontSize.md,
+  uploadText: {
+    color: chatTheme.colors.text.secondary,
+    ...typography.caption,
   },
 });
