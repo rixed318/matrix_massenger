@@ -25,8 +25,15 @@ import {
     Visibility,
     AutoDiscovery,
     AutoDiscoveryAction,
-    AutoDiscoveryError, 
-    IndexedDBStore, IndexedDBCryptoStore, ClientEvent, MemoryStore, MatrixScheduler, Preset, RoomEvent} from 'matrix-js-sdk';
+    AutoDiscoveryError,
+    IndexedDBStore,
+    IndexedDBCryptoStore,
+    ClientEvent,
+    MemoryStore,
+    MatrixScheduler,
+    Preset,
+    RoomEvent,
+} from 'matrix-js-sdk';
 import type { HierarchyRoom } from 'matrix-js-sdk';
 import {
     enqueueTranscriptionJob,
@@ -779,6 +786,697 @@ export const __resetStickerLibraryForTests = () => {
     enabledStickerPacks = new Set();
     persistStickerEnabled();
     persistStickerFavorites();
+};
+
+// ===== Stories (account data) =====
+
+export const STORY_EVENT_TYPE = 'econix.story';
+export const STORY_READ_EVENT_TYPE = 'econix.story.read';
+
+export type StoryMediaKind = 'image' | 'video';
+
+export interface StoryMedia {
+    kind: StoryMediaKind;
+    mxcUrl: string;
+    thumbnailMxcUrl?: string;
+    mimeType?: string;
+    width?: number;
+    height?: number;
+    durationMs?: number;
+    sizeBytes?: number;
+    blurhash?: string;
+}
+
+export interface StoryReaction {
+    key: string;
+    count: number;
+    senders: string[];
+    selfReacted: boolean;
+}
+
+export interface Story {
+    id: string;
+    authorId: string;
+    authorDisplayName?: string;
+    createdAt: number;
+    expiresAt?: number;
+    caption?: string;
+    media: StoryMedia;
+    reactions: StoryReaction[];
+    seenBy: string[];
+    seenCount: number;
+    hasSeen: boolean;
+    raw?: Record<string, any> | null;
+}
+
+export interface StoryReadReceipt {
+    storyId: string;
+    userId: string;
+    timestamp: number;
+}
+
+export interface StorySyncState {
+    stories: Story[];
+    reads: Record<string, StoryReadReceipt>;
+}
+
+export interface CreateStoryPayload {
+    id?: string;
+    caption?: string;
+    createdAt?: number;
+    expiresAt?: number;
+    media: StoryMedia;
+    reactions?: Record<string, string[]>;
+    seenBy?: string[];
+    raw?: Record<string, any> | null;
+}
+
+type StoryListener = (state: StorySyncState) => void;
+
+const storyStateByClient = new WeakMap<MatrixClient, StorySyncState>();
+const storyListenersByClient = new WeakMap<MatrixClient, Set<StoryListener>>();
+const storyCleanupByClient = new WeakMap<MatrixClient, () => void>();
+
+const getNumber = (value: unknown): number | undefined => {
+    if (typeof value === 'number' && Number.isFinite(value)) {
+        return value;
+    }
+    if (typeof value === 'string') {
+        const parsed = Number.parseFloat(value);
+        if (Number.isFinite(parsed)) {
+            return parsed;
+        }
+    }
+    return undefined;
+};
+
+const cloneStoryState = (state: StorySyncState): StorySyncState => ({
+    stories: state.stories.map(story => ({
+        ...story,
+        reactions: story.reactions.map(reaction => ({
+            ...reaction,
+            senders: [...reaction.senders],
+        })),
+        seenBy: [...story.seenBy],
+        raw: story.raw ? { ...story.raw } : null,
+    })),
+    reads: { ...state.reads },
+});
+
+const ensureStoryListenerSet = (client: MatrixClient): Set<StoryListener> => {
+    let listeners = storyListenersByClient.get(client);
+    if (!listeners) {
+        listeners = new Set();
+        storyListenersByClient.set(client, listeners);
+    }
+    return listeners;
+};
+
+const parseStoryMedia = (source: any): StoryMedia | null => {
+    if (!source || typeof source !== 'object') {
+        return null;
+    }
+    const mxcUrl =
+        (typeof source.mxcUrl === 'string' && source.mxcUrl)
+        || (typeof source.mxc_url === 'string' && source.mxc_url)
+        || (typeof source.url === 'string' && source.url)
+        || (typeof source.content_uri === 'string' && source.content_uri)
+        || null;
+    if (!mxcUrl) {
+        return null;
+    }
+    const mimeType =
+        (typeof source.mimeType === 'string' && source.mimeType)
+        || (typeof source.mimetype === 'string' && source.mimetype)
+        || undefined;
+    let kind: StoryMediaKind | undefined;
+    const rawKind =
+        (typeof source.kind === 'string' && source.kind)
+        || (typeof source.type === 'string' && source.type)
+        || (typeof source.msgtype === 'string' && source.msgtype)
+        || undefined;
+    if (rawKind) {
+        if (rawKind.toLowerCase().includes('video')) {
+            kind = 'video';
+        } else if (rawKind.toLowerCase().includes('image') || rawKind.toLowerCase().includes('photo')) {
+            kind = 'image';
+        }
+    }
+    if (!kind && mimeType) {
+        if (mimeType.startsWith('video')) {
+            kind = 'video';
+        } else if (mimeType.startsWith('image')) {
+            kind = 'image';
+        }
+    }
+    const thumbnail =
+        (typeof source.thumbnailMxcUrl === 'string' && source.thumbnailMxcUrl)
+        || (typeof source.thumbnail_url === 'string' && source.thumbnail_url)
+        || (typeof source.thumbnailUrl === 'string' && source.thumbnailUrl)
+        || undefined;
+    const preview = (typeof source.previewUrl === 'string' && source.previewUrl) || undefined;
+    const width = getNumber((source as any).width ?? (source as any).w);
+    const height = getNumber((source as any).height ?? (source as any).h);
+    const duration = getNumber((source as any).durationMs ?? (source as any).duration ?? (source as any).length);
+    const sizeBytes = getNumber((source as any).size ?? (source as any).filesize);
+    const blurhash = typeof source.blurhash === 'string' ? source.blurhash : undefined;
+    return {
+        kind: kind ?? 'image',
+        mxcUrl,
+        thumbnailMxcUrl: thumbnail ?? preview,
+        mimeType,
+        width,
+        height,
+        durationMs: duration,
+        sizeBytes,
+        blurhash,
+    } satisfies StoryMedia;
+};
+
+const parseStoryReactions = (source: any, userId?: string | null): StoryReaction[] => {
+    if (!source || typeof source !== 'object') {
+        return [];
+    }
+    const reactionEntries: Array<[string, string[]]> = [];
+    if (Array.isArray(source)) {
+        source.forEach(entry => {
+            if (!entry || typeof entry !== 'object') {
+                return;
+            }
+            const key =
+                (typeof entry.key === 'string' && entry.key)
+                || (typeof entry.emoji === 'string' && entry.emoji)
+                || undefined;
+            if (!key) {
+                return;
+            }
+            const senders = Array.isArray(entry.senders)
+                ? entry.senders.filter((sender: unknown): sender is string => typeof sender === 'string')
+                : [];
+            reactionEntries.push([key, senders]);
+        });
+    } else {
+        Object.entries(source).forEach(([key, value]) => {
+            if (!key) {
+                return;
+            }
+            const senders = Array.isArray(value)
+                ? value.filter((sender: unknown): sender is string => typeof sender === 'string')
+                : [];
+            reactionEntries.push([key, senders]);
+        });
+    }
+    return reactionEntries.map(([key, senders]) => ({
+        key,
+        count: senders.length,
+        senders,
+        selfReacted: Boolean(userId && senders.includes(userId)),
+    }));
+};
+
+const parseStory = (content: any, currentUserId?: string | null): Story | null => {
+    if (!content || typeof content !== 'object') {
+        return null;
+    }
+    const mediaSource = (content as any).media ?? content;
+    const media = parseStoryMedia(mediaSource);
+    if (!media) {
+        return null;
+    }
+    const id =
+        (typeof content.id === 'string' && content.id)
+        || (typeof content.story_id === 'string' && content.story_id)
+        || (typeof content.guid === 'string' && content.guid)
+        || (typeof content.local_id === 'string' && content.local_id)
+        || `story_${Math.random().toString(36).slice(2, 10)}_${Date.now()}`;
+    const authorId =
+        (typeof content.author === 'string' && content.author)
+        || (typeof content.user_id === 'string' && content.user_id)
+        || (typeof content.sender === 'string' && content.sender)
+        || currentUserId
+        || 'unknown';
+    const authorDisplayName =
+        (typeof content.authorDisplayName === 'string' && content.authorDisplayName)
+        || (typeof content.author_display_name === 'string' && content.author_display_name)
+        || undefined;
+    const createdAt =
+        getNumber((content as any).createdAt ?? (content as any).created_at ?? (content as any).timestamp ?? (content as any).ts)
+        ?? Date.now();
+    const expiresAt = getNumber((content as any).expiresAt ?? (content as any).expires_at ?? (content as any).expiry_ts);
+    const caption =
+        (typeof content.caption === 'string' && content.caption)
+        || (typeof content.body === 'string' && content.body)
+        || (typeof content.text === 'string' && content.text)
+        || undefined;
+    const seenBy = Array.isArray((content as any).seenBy ?? (content as any).seen_by)
+        ? ((content as any).seenBy ?? (content as any).seen_by).filter((value: unknown): value is string => typeof value === 'string')
+        : [];
+    const seenCount =
+        getNumber((content as any).seenCount ?? (content as any).seen_count ?? (content as any).views)
+        ?? seenBy.length;
+    const reactions = parseStoryReactions((content as any).reactions, currentUserId);
+    return {
+        id,
+        authorId,
+        authorDisplayName,
+        createdAt,
+        expiresAt,
+        caption,
+        media,
+        reactions,
+        seenBy,
+        seenCount,
+        hasSeen: false,
+        raw: { ...content },
+    } satisfies Story;
+};
+
+const parseStoryReads = (content: any, userId?: string | null): Record<string, StoryReadReceipt> => {
+    if (!content || typeof content !== 'object') {
+        return {};
+    }
+    const payload = (content as any).seen ?? (content as any).reads ?? content;
+    const reads: Record<string, StoryReadReceipt> = {};
+    if (Array.isArray(payload)) {
+        payload.forEach(entry => {
+            if (!entry || typeof entry !== 'object') {
+                return;
+            }
+            const id = (typeof (entry as any).id === 'string' && (entry as any).id)
+                || (typeof (entry as any).storyId === 'string' && (entry as any).storyId);
+            if (!id) {
+                return;
+            }
+            const timestamp = getNumber((entry as any).ts ?? (entry as any).timestamp ?? (entry as any).time) ?? Date.now();
+            const uid = (typeof (entry as any).userId === 'string' && (entry as any).userId)
+                || (typeof (entry as any).user_id === 'string' && (entry as any).user_id)
+                || userId
+                || 'unknown';
+            reads[id] = { storyId: id, timestamp, userId: uid };
+        });
+        return reads;
+    }
+    Object.entries(payload).forEach(([id, value]) => {
+        if (!id) {
+            return;
+        }
+        if (typeof value === 'number') {
+            reads[id] = { storyId: id, timestamp: value, userId: userId ?? 'unknown' };
+            return;
+        }
+        if (typeof value === 'object' && value) {
+            const timestamp = getNumber((value as any).ts ?? (value as any).timestamp ?? (value as any).time) ?? Date.now();
+            const uid = (typeof (value as any).userId === 'string' && (value as any).userId)
+                || (typeof (value as any).user_id === 'string' && (value as any).user_id)
+                || userId
+                || 'unknown';
+            reads[id] = { storyId: id, timestamp, userId: uid };
+        }
+    });
+    return reads;
+};
+
+const applyReadsToStories = (stories: Story[], reads: Record<string, StoryReadReceipt>, currentUserId?: string | null): Story[] => {
+    const now = Date.now();
+    return stories
+        .filter(story => (typeof story.expiresAt === 'number' ? story.expiresAt > now : true))
+        .map(story => {
+            const read = reads[story.id];
+            const seenSet = new Set(story.seenBy);
+            if (read?.userId) {
+                seenSet.add(read.userId);
+            }
+            const seenCount = Math.max(story.seenCount, seenSet.size);
+            const hasSeen = Boolean(
+                (currentUserId && seenSet.has(currentUserId))
+                || (currentUserId && read && read.userId === currentUserId)
+            );
+            return {
+                ...story,
+                seenBy: Array.from(seenSet),
+                seenCount,
+                hasSeen,
+                reactions: story.reactions.map(reaction => ({
+                    ...reaction,
+                    selfReacted: Boolean(currentUserId && reaction.senders.includes(currentUserId)),
+                })),
+            } satisfies Story;
+        })
+        .sort((a, b) => b.createdAt - a.createdAt);
+};
+
+const readStoryAccountData = (client: MatrixClient): StorySyncState => {
+    const storyEvent = client.getAccountData(STORY_EVENT_TYPE as any);
+    const readEvent = client.getAccountData(STORY_READ_EVENT_TYPE as any);
+    const userId = client.getUserId?.() ?? null;
+    const rawStories: any[] = Array.isArray((storyEvent as any)?.getContent?.()?.stories)
+        ? (storyEvent as any).getContent().stories
+        : Array.isArray((storyEvent as any)?.getContent?.()?.items)
+            ? (storyEvent as any).getContent().items
+            : Array.isArray((storyEvent as any)?.getContent?.())
+                ? (storyEvent as any).getContent()
+                : [];
+    const parsedStories = rawStories
+        .map(entry => parseStory(entry, userId))
+        .filter((story): story is Story => Boolean(story));
+    const reads = parseStoryReads((readEvent as any)?.getContent?.(), userId);
+    const stories = applyReadsToStories(parsedStories, reads, userId);
+    return { stories, reads } satisfies StorySyncState;
+};
+
+const serializeStoryMedia = (media: StoryMedia): Record<string, any> => {
+    const payload: Record<string, any> = {
+        kind: media.kind,
+        url: media.mxcUrl,
+        mxcUrl: media.mxcUrl,
+    };
+    if (media.thumbnailMxcUrl) payload.thumbnail_url = media.thumbnailMxcUrl;
+    if (media.mimeType) payload.mimeType = media.mimeType;
+    if (typeof media.width === 'number') payload.width = media.width;
+    if (typeof media.height === 'number') payload.height = media.height;
+    if (typeof media.durationMs === 'number') payload.durationMs = media.durationMs;
+    if (typeof media.sizeBytes === 'number') payload.size = media.sizeBytes;
+    if (media.blurhash) payload.blurhash = media.blurhash;
+    return payload;
+};
+
+const serializeStoryReactions = (reactions: StoryReaction[]): Record<string, string[]> => {
+    return reactions.reduce<Record<string, string[]>>((acc, reaction) => {
+        acc[reaction.key] = [...reaction.senders];
+        return acc;
+    }, {});
+};
+
+const serializeStoryReads = (reads: Record<string, StoryReadReceipt>): Record<string, any> => {
+    const entries: Record<string, { ts: number; user_id?: string }> = {};
+    Object.values(reads).forEach(receipt => {
+        entries[receipt.storyId] = {
+            ts: receipt.timestamp,
+            user_id: receipt.userId,
+        };
+    });
+    return { seen: entries, updated_at: Date.now() };
+};
+
+const serializeStories = (stories: Story[]): Record<string, any> => ({
+    stories: stories.map(story => {
+        const base: Record<string, any> = { ...(story.raw ?? {}) };
+        base.id = story.id;
+        base.author = story.authorId;
+        if (story.authorDisplayName) {
+            base.author_display_name = story.authorDisplayName;
+        }
+        base.created_at = story.createdAt;
+        if (story.expiresAt) {
+            base.expires_at = story.expiresAt;
+        }
+        if (story.caption) {
+            base.caption = story.caption;
+        }
+        base.media = serializeStoryMedia(story.media);
+        base.reactions = serializeStoryReactions(story.reactions);
+        base.seen_by = Array.from(new Set(story.seenBy));
+        base.seen_count = story.seenCount;
+        return base;
+    }),
+    updated_at: Date.now(),
+});
+
+const notifyStoryListeners = (client: MatrixClient) => {
+    const state = storyStateByClient.get(client);
+    if (!state) {
+        return;
+    }
+    const listeners = storyListenersByClient.get(client);
+    if (!listeners || listeners.size === 0) {
+        return;
+    }
+    const snapshot = cloneStoryState(state);
+    listeners.forEach(listener => {
+        try {
+            listener(snapshot);
+        } catch (error) {
+            console.warn('story listener failed', error);
+        }
+    });
+};
+
+const updateStoryState = (client: MatrixClient, nextState: StorySyncState): void => {
+    storyStateByClient.set(client, nextState);
+    notifyStoryListeners(client);
+};
+
+const ensureStoryState = (client: MatrixClient): StorySyncState => {
+    let state = storyStateByClient.get(client);
+    if (!state) {
+        try {
+            state = readStoryAccountData(client);
+        } catch (error) {
+            console.warn('Failed to read story account data', error);
+            state = { stories: [], reads: {} };
+        }
+        storyStateByClient.set(client, state);
+    }
+    return state;
+};
+
+const handleStoryAccountDataEvent = (client: MatrixClient, content: any): void => {
+    const previous = ensureStoryState(client);
+    const previousIds = new Set(previous.stories.map(story => story.id));
+    const next = readStoryAccountData(client);
+    storyStateByClient.set(client, next);
+    notifyStoryListeners(client);
+    const userId = client.getUserId?.() ?? null;
+    const newStories = next.stories.filter(story => !previousIds.has(story.id) && story.authorId !== userId);
+    newStories.forEach(story => {
+        const title = story.authorDisplayName
+            ? `${story.authorDisplayName} обновил(а) сторис`
+            : 'Новая сторис';
+        const body = story.caption
+            ? story.caption
+            : 'Откройте, чтобы посмотреть свежую историю.';
+        void sendNotification(title, body, {
+            type: 'story',
+            storyId: story.id,
+            authorId: story.authorId,
+        });
+    });
+};
+
+const handleStoryReadAccountDataEvent = (client: MatrixClient): void => {
+    const current = ensureStoryState(client);
+    const nextReads = parseStoryReads(client.getAccountData(STORY_READ_EVENT_TYPE as any)?.getContent?.(), client.getUserId?.());
+    const nextStories = applyReadsToStories(current.stories, nextReads, client.getUserId?.());
+    storyStateByClient.set(client, { stories: nextStories, reads: nextReads });
+    notifyStoryListeners(client);
+};
+
+export const loadStoriesFromAccountData = (client: MatrixClient): StorySyncState => {
+    const state = readStoryAccountData(client);
+    storyStateByClient.set(client, state);
+    return cloneStoryState(state);
+};
+
+export const getStoriesForClient = (client: MatrixClient): Story[] => {
+    const state = ensureStoryState(client);
+    return cloneStoryState(state).stories;
+};
+
+export const subscribeToStoryUpdates = (
+    client: MatrixClient,
+    listener: StoryListener,
+): (() => void) => {
+    const listeners = ensureStoryListenerSet(client);
+    listeners.add(listener);
+    const state = ensureStoryState(client);
+    try {
+        listener(cloneStoryState(state));
+    } catch (error) {
+        console.warn('story listener initial emission failed', error);
+    }
+    return () => {
+        const set = storyListenersByClient.get(client);
+        set?.delete(listener);
+    };
+};
+
+export const bindStoryAccountData = (client: MatrixClient): void => {
+    const cleanup = storyCleanupByClient.get(client);
+    cleanup?.();
+    try {
+        const initial = readStoryAccountData(client);
+        storyStateByClient.set(client, initial);
+    } catch (error) {
+        console.warn('Failed to bootstrap story account data', error);
+        storyStateByClient.set(client, { stories: [], reads: {} });
+    }
+    const handler = (event: MatrixEvent) => {
+        const type = event.getType?.();
+        if (type === STORY_EVENT_TYPE) {
+            handleStoryAccountDataEvent(client, event.getContent?.());
+        } else if (type === STORY_READ_EVENT_TYPE) {
+            handleStoryReadAccountDataEvent(client);
+        }
+    };
+    client.on(ClientEvent.AccountData as any, handler as any);
+    storyCleanupByClient.set(client, () => {
+        client.removeListener(ClientEvent.AccountData as any, handler as any);
+        storyListenersByClient.delete(client);
+    });
+};
+
+export const unbindStoryAccountData = (client: MatrixClient): void => {
+    const cleanup = storyCleanupByClient.get(client);
+    cleanup?.();
+    storyCleanupByClient.delete(client);
+    storyListenersByClient.delete(client);
+    storyStateByClient.delete(client);
+};
+
+const updateStoryCollection = (client: MatrixClient, updater: (state: StorySyncState, userId: string | null) => StorySyncState): StorySyncState => {
+    const current = ensureStoryState(client);
+    const userId = client.getUserId?.() ?? null;
+    const next = updater(current, userId);
+    storyStateByClient.set(client, next);
+    notifyStoryListeners(client);
+    return next;
+};
+
+export const markStoryAsRead = async (
+    client: MatrixClient,
+    storyId: string,
+    timestamp: number = Date.now(),
+): Promise<void> => {
+    if (!storyId) {
+        return;
+    }
+    const state = updateStoryCollection(client, (current, userId) => {
+        const reads = { ...current.reads };
+        const existing = reads[storyId];
+        const nextTimestamp = Math.max(existing?.timestamp ?? 0, timestamp);
+        reads[storyId] = {
+            storyId,
+            userId: userId ?? existing?.userId ?? 'unknown',
+            timestamp: nextTimestamp,
+        } satisfies StoryReadReceipt;
+        const stories = applyReadsToStories(current.stories, reads, userId);
+        return { stories, reads } satisfies StorySyncState;
+    });
+    try {
+        await client.setAccountData(STORY_READ_EVENT_TYPE as any, serializeStoryReads(state.reads) as any);
+    } catch (error) {
+        console.warn('Failed to persist story read receipts', error);
+    }
+};
+
+const updateStoryReactionsInState = (
+    story: Story,
+    emoji: string,
+    userId: string,
+    shouldReact: boolean,
+): StoryReaction[] => {
+    const reactions = story.reactions.map(reaction => ({
+        ...reaction,
+        senders: [...reaction.senders],
+    }));
+    const existingIndex = reactions.findIndex(reaction => reaction.key === emoji);
+    const existing = existingIndex >= 0 ? reactions[existingIndex] : null;
+    const senders = new Set(existing?.senders ?? []);
+    if (shouldReact) {
+        senders.add(userId);
+    } else {
+        senders.delete(userId);
+    }
+    const updated: StoryReaction = {
+        key: emoji,
+        senders: Array.from(senders),
+        count: senders.size,
+        selfReacted: senders.has(userId),
+    };
+    if (existingIndex >= 0) {
+        if (updated.count === 0 && !updated.selfReacted) {
+            reactions.splice(existingIndex, 1);
+        } else {
+            reactions[existingIndex] = updated;
+        }
+    } else if (updated.count > 0 || updated.selfReacted) {
+        reactions.push(updated);
+    }
+    return reactions;
+};
+
+export const toggleStoryReaction = async (
+    client: MatrixClient,
+    storyId: string,
+    emoji: string,
+    force?: boolean,
+): Promise<void> => {
+    if (!storyId || !emoji) {
+        return;
+    }
+    const userId = client.getUserId?.() ?? 'unknown';
+    let persistedState: StorySyncState | null = null;
+    const nextState = updateStoryCollection(client, (current, currentUserId) => {
+        const story = current.stories.find(item => item.id === storyId);
+        if (!story) {
+            return current;
+        }
+        const shouldReact =
+            typeof force === 'boolean'
+                ? force
+                : !story.reactions.some(reaction => reaction.key === emoji && reaction.senders.includes(userId));
+        const reactions = updateStoryReactionsInState(story, emoji, userId, shouldReact);
+        const updatedStory: Story = {
+            ...story,
+            reactions,
+        };
+        const stories = current.stories
+            .map(item => (item.id === storyId ? updatedStory : item))
+            .sort((a, b) => b.createdAt - a.createdAt);
+        const appliedStories = applyReadsToStories(stories, current.reads, currentUserId);
+        const next = { stories: appliedStories, reads: current.reads } satisfies StorySyncState;
+        persistedState = next;
+        return next;
+    });
+    if (!persistedState) {
+        return;
+    }
+    try {
+        await client.setAccountData(STORY_EVENT_TYPE as any, serializeStories(nextState.stories) as any);
+    } catch (error) {
+        console.warn('Failed to persist story reactions', error);
+    }
+};
+
+export const publishStory = async (client: MatrixClient, payload: CreateStoryPayload): Promise<Story> => {
+    const userId = client.getUserId?.() ?? 'unknown';
+    const createdAt = payload.createdAt ?? Date.now();
+    const storyId = payload.id ?? `story_${Math.random().toString(36).slice(2, 10)}_${createdAt}`;
+    const story: Story = {
+        id: storyId,
+        authorId: userId,
+        authorDisplayName: payload.raw?.authorDisplayName ?? payload.raw?.author_display_name,
+        createdAt,
+        expiresAt: payload.expiresAt,
+        caption: payload.caption,
+        media: payload.media,
+        reactions: parseStoryReactions(payload.reactions ?? {}, userId),
+        seenBy: payload.seenBy ? Array.from(new Set(payload.seenBy)) : [userId],
+        seenCount: payload.seenBy ? new Set(payload.seenBy).size : 1,
+        hasSeen: true,
+        raw: payload.raw ?? null,
+    } satisfies Story;
+    const nextState = updateStoryCollection(client, (current, currentUserId) => {
+        const filtered = current.stories.filter(existing => existing.id !== storyId);
+        const stories = applyReadsToStories([story, ...filtered], current.reads, currentUserId ?? userId);
+        return { stories, reads: current.reads } satisfies StorySyncState;
+    });
+    try {
+        await client.setAccountData(STORY_EVENT_TYPE as any, serializeStories(nextState.stories) as any);
+    } catch (error) {
+        console.warn('Failed to persist story payload', error);
+    }
+    return nextState.stories.find(entry => entry.id === storyId) ?? story;
 };
 
 let _boundClient: MatrixClient | null = null;
@@ -1959,6 +2657,11 @@ const bootstrapAuthenticatedClient = async (client: MatrixClient, secureProfile?
         bindStickerPackWatcher(client);
     } catch (e) {
         console.warn('bindStickerPackWatcher failed', e);
+    }
+    try {
+        bindStoryAccountData(client);
+    } catch (e) {
+        console.warn('bindStoryAccountData failed', e);
     }
     if (secureProfile) {
         setSecureCloudProfileForClient(client, secureProfile);
