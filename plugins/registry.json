@@ -6,6 +6,7 @@
       "version": "1.0.0",
       "description": "Отвечает на команды !echo в комнатах Matrix.",
       "entry": "./echo-bot.js",
+      "integrity": "sha256-fh5RS0zokHjhkkfnsM/DobMuDqXIVkZSJqECpEhCSwY=",
       "permissions": ["sendTextMessage"],
       "requiredEvents": ["matrix.message"]
     }

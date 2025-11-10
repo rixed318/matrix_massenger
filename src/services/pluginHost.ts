@@ -7,6 +7,7 @@ import {
   type PluginEventName,
   type PluginHandle,
 } from '@matrix-messenger/sdk';
+import { createSandboxedPluginDefinition } from './pluginSandboxBridge';
 import type { MatrixClient, MatrixEvent, MatrixRoom } from '../types';
 
 const storage = typeof window !== 'undefined'
@@ -32,6 +33,12 @@ export const KNOWN_PLUGIN_PERMISSIONS = [
   'scheduler',
 ] as const;
 
+const ACTION_PERMISSION_MAP: Record<string, PluginPermission> = {
+  sendTextMessage: 'sendTextMessage',
+  sendEvent: 'sendEvent',
+  redactEvent: 'redactEvent',
+};
+
 export type PluginPermission = typeof KNOWN_PLUGIN_PERMISSIONS[number];
 
 const PERMISSION_DESCRIPTIONS: Record<PluginPermission, string> = {
@@ -53,6 +60,8 @@ export interface PluginManifest {
   entry: string;
   permissions?: PluginPermission[];
   requiredEvents?: PluginEventName[];
+  integrity?: string;
+  signature?: string;
 }
 
 interface StoredPluginEntry {
@@ -103,7 +112,7 @@ const validateManifest = (manifest: PluginManifest): PluginManifest => {
   if (!manifest || typeof manifest !== 'object') {
     throw new Error('Некорректный манифест плагина');
   }
-  const { id, name, entry, permissions, requiredEvents } = manifest;
+  const { id, name, entry, permissions, requiredEvents, integrity, signature } = manifest;
   if (!id || typeof id !== 'string') {
     throw new Error('Манифест должен содержать строковый "id"');
   }
@@ -127,6 +136,12 @@ const validateManifest = (manifest: PluginManifest): PluginManifest => {
       }
     }
   }
+  if (integrity && typeof integrity !== 'string') {
+    throw new Error(`Поле integrity плагина "${id}" должно быть строкой`);
+  }
+  if (signature && typeof signature !== 'string') {
+    throw new Error(`Поле signature плагина "${id}" должно быть строкой`);
+  }
   return manifest;
 };
 
@@ -142,22 +157,66 @@ const resolveEntryUrl = (entry: string): string => {
   }
 };
 
-const loadPluginModule = async (manifest: PluginManifest): Promise<PluginDefinition> => {
-  const url = resolveEntryUrl(manifest.entry);
-  const module = await import(/* @vite-ignore */ url);
-  const definition = (module?.default ?? module) as PluginDefinition | undefined;
-  if (!definition || typeof definition !== 'object' || typeof definition.setup !== 'function') {
-    throw new Error(`Модуль плагина "${manifest.id}" не экспортирует корректное определение`);
+const decodeIntegrity = (integrity: string): { algorithm: string; hash: string } => {
+  const [algorithm, hash] = integrity.split('-', 2);
+  if (!algorithm || !hash) {
+    throw new Error('Поле integrity должно быть в формате "<алгоритм>-<хеш>"');
   }
-  if (definition.id && definition.id !== manifest.id) {
-    console.warn(`Идентификатор манифеста (${manifest.id}) отличается от id в модуле (${definition.id}). Используется значение из модуля.`);
+  return { algorithm: algorithm.toUpperCase(), hash };
+};
+
+const verifyManifestIntegrity = async (manifest: PluginManifest, entryUrl: string): Promise<void> => {
+  const reference = manifest.integrity ?? manifest.signature;
+  if (!reference) {
+    throw new Error(`Плагин "${manifest.id}" не содержит подпись или контрольную сумму`);
   }
-  return definition;
+  if (typeof window === 'undefined' || typeof fetch === 'undefined' || !('crypto' in window) || !window.crypto?.subtle) {
+    throw new Error('Проверка подписи плагина недоступна в текущей среде');
+  }
+  const { algorithm, hash } = decodeIntegrity(reference);
+  if (algorithm !== 'SHA256' && algorithm !== 'SHA-256') {
+    throw new Error(`Поддерживается только алгоритм SHA-256 (получено ${algorithm})`);
+  }
+  const response = await fetch(entryUrl, { cache: 'no-store' });
+  if (!response.ok) {
+    throw new Error(`Не удалось загрузить модуль плагина для проверки подписи (${response.status})`);
+  }
+  const data = await response.arrayBuffer();
+  const digest = await window.crypto.subtle.digest('SHA-256', data);
+  const actual = window.btoa(String.fromCharCode(...Array.from(new Uint8Array(digest))));
+  if (actual !== hash && `sha256-${actual}` !== reference) {
+    throw new Error(`Подпись плагина "${manifest.id}" не совпадает с контрольной суммой`);
+  }
+};
+
+const getAllowedEvents = (manifest: PluginManifest): PluginEventName[] =>
+  (manifest.requiredEvents ?? []).filter(event => KNOWN_PLUGIN_EVENTS.includes(event));
+
+const getAllowedActions = (manifest: PluginManifest): string[] => {
+  const permissions = new Set(manifest.permissions ?? []);
+  return Object.entries(ACTION_PERMISSION_MAP)
+    .filter(([, permission]) => permissions.has(permission))
+    .map(([action]) => action);
 };
 
 const registerPluginFromManifest = async (manifest: PluginManifest): Promise<void> => {
-  const definition = await loadPluginModule(manifest);
-  const handle = await pluginHost.registerPlugin({ ...definition, id: definition.id ?? manifest.id });
+  const entryUrl = resolveEntryUrl(manifest.entry);
+  await verifyManifestIntegrity(manifest, entryUrl);
+  const definition = createSandboxedPluginDefinition({
+    manifest: {
+      id: manifest.id,
+      name: manifest.name,
+      version: manifest.version,
+      description: manifest.description,
+      entry: manifest.entry,
+    },
+    entryUrl,
+    allowedEvents: getAllowedEvents(manifest),
+    allowedActions: getAllowedActions(manifest),
+    allowStorage: (manifest.permissions ?? []).includes('storage'),
+    allowScheduler: (manifest.permissions ?? []).includes('scheduler'),
+  });
+  const handle = await pluginHost.registerPlugin(definition);
   pluginHandles.set(manifest.id, handle);
 };
 
