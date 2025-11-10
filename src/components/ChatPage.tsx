@@ -31,6 +31,7 @@ import ViewScheduledMessagesModal from './ViewScheduledMessagesModal';
 import IncomingCallModal from './IncomingCallModal';
 import CallView from './CallView';
 import SearchModal from './SearchModal';
+import PluginCatalogModal from './PluginCatalogModal';
 import { SearchResultItem } from '@matrix-messenger/core';
 import type { DraftContent, SendKeyBehavior, DraftAttachment, DraftAttachmentKind } from '../types';
 import SharedMediaPanel from './SharedMediaPanel';
@@ -157,6 +158,7 @@ const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, s
     const [sharedMediaData, setSharedMediaData] = useState<RoomMediaSummary | null>(null);
     const [isSharedMediaLoading, setIsSharedMediaLoading] = useState(false);
     const [isSharedMediaPaginating, setIsSharedMediaPaginating] = useState(false);
+    const [isPluginCatalogOpen, setIsPluginCatalogOpen] = useState(false);
     const [outboxItems, setOutboxItems] = useState<Record<string, { payload: OutboxPayload; attempts: number; error?: string }>>({});
     const [currentSelfDestructSeconds, setCurrentSelfDestructSeconds] = useState<number | null>(null);
     const [appLockState, setAppLockState] = useState<{ enabled: boolean; biometricEnabled: boolean; unlocked: boolean }>(() => ({
@@ -2309,6 +2311,7 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
                 onLogout={logout}
                 client={client}
                 onOpenSettings={() => setIsSettingsOpen(true)}
+                onOpenPlugins={() => setIsPluginCatalogOpen(true)}
                 onOpenCreateRoom={() => setIsCreateRoomOpen(true)}
                 folders={folders}
                 activeFolderId={activeFolderId}
@@ -2719,6 +2722,10 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
                     onSelectResult={handleJumpToSearchResult}
                 />
             )}
+            <PluginCatalogModal
+                isOpen={isPluginCatalogOpen}
+                onClose={() => setIsPluginCatalogOpen(false)}
+            />
             <SharedMediaPanel
                 isOpen={isSharedMediaOpen}
                 onClose={() => setIsSharedMediaOpen(false)}

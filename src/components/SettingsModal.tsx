@@ -3,6 +3,7 @@ import { MatrixClient } from '@matrix-messenger/core';
 import { mxcToHttp, getTranslationSettings, setTranslationSettings } from '@matrix-messenger/core';
 import Avatar from './Avatar';
 import SecuritySettings from './SecuritySettings';
+import PluginsPanel from './Settings/PluginsPanel';
 import type { SendKeyBehavior } from '../types';
 
 interface SettingsModalProps {
@@ -309,6 +310,10 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, onSave, 
         </div>
     </div>
 </div>
+
+                    <div className="pt-6 border-t border-border-primary">
+                        <PluginsPanel />
+                    </div>
 
                     <div className="pt-6 border-t border-border-primary">
                         <h3 className="text-lg font-semibold text-text-primary mb-3">Notifications</h3>

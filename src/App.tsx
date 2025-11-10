@@ -3,6 +3,7 @@ import LoginPage from './components/LoginPage';
 import ChatPage from './components/ChatPage';
 import AppErrorBoundary from './components/AppErrorBoundary';
 import { AccountProvider, useAccountStore } from './services/accountManager';
+import { bootstrapStoredPlugins } from './services/pluginHost';
 
 const AppContent: React.FC = () => {
   const boot = useAccountStore(state => state.boot);
@@ -24,6 +25,10 @@ const AppContent: React.FC = () => {
   useEffect(() => {
     void boot();
   }, [boot]);
+
+  useEffect(() => {
+    void bootstrapStoredPlugins();
+  }, []);
 
   const active = activeKey ? accounts[activeKey] : null;
   const canUseUniversal = active && (Object.keys(accounts).length > 1 || aggregatedRooms.length > 0);

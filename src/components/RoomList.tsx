@@ -13,6 +13,7 @@ interface RoomListProps {
   onLogout: () => void;
   client: MatrixClient;
   onOpenSettings: () => void;
+  onOpenPlugins: () => void;
   onOpenCreateRoom: () => void;
   folders: Folder[];
   activeFolderId: string;
@@ -29,7 +30,7 @@ interface RoomListProps {
 
 const RoomList: React.FC<RoomListProps> = ({
   rooms, selectedRoomId, onSelectRoom, isLoading, onLogout, client,
-  onOpenSettings, onOpenCreateRoom, folders, activeFolderId, onSelectFolder, onManageFolders,
+  onOpenSettings, onOpenPlugins, onOpenCreateRoom, folders, activeFolderId, onSelectFolder, onManageFolders,
   accounts, activeAccountKey, onSwitchAccount, onAddAccount,
   hiddenRoomIds = [], onUnlockHidden, isHiddenUnlocked = true,
 }) => {
@@ -160,7 +161,7 @@ const RoomList: React.FC<RoomListProps> = ({
         )}
       </div>
 
-      <div className="p-4 border-t border-border-primary flex items-center justify-between">
+      <div className="p-4 border-t border-border-primary flex items-center justify-between gap-3">
         <div className="flex items-center">
           <Avatar name={user?.displayName || client.getUserId()} imageUrl={userAvatarUrl} size="sm" />
           <div className="ml-3">
@@ -168,11 +169,18 @@ const RoomList: React.FC<RoomListProps> = ({
             <p className="text-xs text-text-secondary">{client.getUserId()}</p>
           </div>
         </div>
-        <button onClick={onOpenSettings} className="p-2 rounded-full hover:bg-bg-tertiary" title="Settings">
-          <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
-            <path fillRule="evenodd" d="M11.49 3.17c-.38-1.56-2.6-1.56-2.98 0a1.532 1.532 0 01-2.286.948c-1.372-.836-2.942.734-2.106 2.106.54.886.061 2.042-.947 2.287-1.561.379-1.561 2.6 0 2.978a1.532 1.532 0 01.947 2.287c-.836 1.372.734 2.942 2.106 2.106a1.532 1.532 0 012.287.947c.379 1.561 2.6 1.561 2.978 0a1.533 1.533 0 012.287-.947c1.372.836 2.942-.734 2.106-2.106a1.533 1.533 0 01-.947-2.287c1.561-.379 1.561-2.6 0-2.978a1.532 1.532 0 01-.947-2.287c.836-1.372-.734-2.942-2.106-2.106a1.532 1.532 0 01-2.287-.947zM10 13a3 3 0 100-6 3 3 0 000 6z" clipRule="evenodd" />
-          </svg>
-        </button>
+        <div className="flex items-center gap-2">
+          <button onClick={onOpenPlugins} className="p-2 rounded-full hover:bg-bg-tertiary" title="Plugins">
+            <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 24 24" fill="currentColor">
+              <path d="M19 11h-2.17a3.001 3.001 0 00-5.66 0H9a1 1 0 100 2h2.17a3.001 3.001 0 005.66 0H19a1 1 0 100-2zm-7-9a1 1 0 00-1 1v2.17a3.001 3.001 0 000 5.66V13a1 1 0 102 0v-2.17a3.001 3.001 0 000-5.66V3a1 1 0 00-1-1zM5 11a1 1 0 100 2h2.17a3.001 3.001 0 005.66 0H15a1 1 0 100-2h-2.17a3.001 3.001 0 00-5.66 0H5z" />
+            </svg>
+          </button>
+          <button onClick={onOpenSettings} className="p-2 rounded-full hover:bg-bg-tertiary" title="Settings">
+            <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+              <path fillRule="evenodd" d="M11.49 3.17c-.38-1.56-2.6-1.56-2.98 0a1.532 1.532 0 01-2.286.948c-1.372-.836-2.942.734-2.106 2.106.54.886.061 2.042-.947 2.287-1.561.379-1.561 2.6 0 2.978a1.532 1.532 0 01.947 2.287c-.836 1.372.734 2.942 2.106 2.106a1.532 1.532 0 012.287.947c.379 1.561 2.6 1.561 2.978 0a1.533 1.533 0 012.287-.947c1.372.836 2.942-.734 2.106-2.106a1.533 1.533 0 01-.947-2.287c1.561-.379 1.561-2.6 0-2.978a1.532 1.532 0 01-.947-2.287c.836-1.372-.734-2.942-2.106-2.106a1.532 1.532 0 01-2.287-.947zM10 13a3 3 0 100-6 3 3 0 000 6z" clipRule="evenodd" />
+            </svg>
+          </button>
+        </div>
       </div>
     </aside>
   );

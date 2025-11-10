@@ -1,0 +1,13 @@
+{
+  "plugins": [
+    {
+      "id": "demo.echo",
+      "name": "Echo bot",
+      "version": "1.0.0",
+      "description": "Отвечает на команды !echo в комнатах Matrix.",
+      "entry": "./echo-bot.js",
+      "permissions": ["sendTextMessage"],
+      "requiredEvents": ["matrix.message"]
+    }
+  ]
+}
