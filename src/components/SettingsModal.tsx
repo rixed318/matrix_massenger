@@ -12,6 +12,8 @@ import Avatar from './Avatar';
 import SecuritySettings from './SecuritySettings';
 import PluginsPanel from './Settings/PluginsPanel';
 import type { SendKeyBehavior } from '../types';
+import { getSmartReplySettings, setSmartReplySettings } from '../services/aiComposeService';
+import type { SmartReplySettings } from '../services/aiComposeService';
 
 interface SettingsModalProps {
     isOpen: boolean;
@@ -86,9 +88,14 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, onSave, 
     const [transcriptionMaxDuration, setTranscriptionMaxDuration] = useState<string>(
         typeof runtimeTranscription.maxDurationSec === 'number' ? String(runtimeTranscription.maxDurationSec) : ''
     );
+    const [smartRepliesEnabled, setSmartRepliesEnabled] = useState<boolean>(false);
+    const [smartReplyMaxMessages, setSmartReplyMaxMessages] = useState<string>('12');
+    const [smartReplyMaxCharacters, setSmartReplyMaxCharacters] = useState<string>('4000');
+    const [smartReplyIncludeMedia, setSmartReplyIncludeMedia] = useState<boolean>(false);
     const [isSecurityOpen, setIsSecurityOpen] = useState(false);
     const fileInputRef = useRef<HTMLInputElement>(null);
     const bgFileInputRef = useRef<HTMLInputElement>(null);
+    const smartReplySettingsRef = useRef<SmartReplySettings | null>(null);
 
 
     useEffect(() => {
@@ -138,6 +145,20 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, onSave, 
 
     useEffect(() => {
         if (!isOpen) return;
+        try {
+            const settings = getSmartReplySettings(client);
+            smartReplySettingsRef.current = settings;
+            setSmartRepliesEnabled(Boolean(settings.enabled));
+            setSmartReplyMaxMessages(String(settings.privacy.maxMessages));
+            setSmartReplyMaxCharacters(String(settings.privacy.maxCharacters));
+            setSmartReplyIncludeMedia(Boolean(settings.privacy.includeMedia));
+        } catch (error) {
+            console.warn('Failed to load smart reply settings', error);
+        }
+    }, [isOpen, client]);
+
+    useEffect(() => {
+        if (!isOpen) return;
         const handle = setTimeout(() => {
             const maxDurationValue = transcriptionMaxDuration.trim();
             const parsed = maxDurationValue.length ? Number(maxDurationValue) : undefined;
@@ -150,6 +171,42 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, onSave, 
         }, 400);
         return () => clearTimeout(handle);
     }, [transcriptionEnabled, transcriptionLanguage, transcriptionMaxDuration, client, isOpen]);
+
+    useEffect(() => {
+        if (!isOpen) return;
+        const handle = setTimeout(() => {
+            const base = smartReplySettingsRef.current ?? getSmartReplySettings(client);
+            const parsedMessages = Number.parseInt(smartReplyMaxMessages, 10);
+            const parsedChars = Number.parseInt(smartReplyMaxCharacters, 10);
+            const limitedMessages = Math.max(
+                1,
+                Math.min(Number.isFinite(parsedMessages) && parsedMessages > 0 ? parsedMessages : base.privacy.maxMessages, 50),
+            );
+            const limitedChars = Math.max(
+                500,
+                Math.min(Number.isFinite(parsedChars) && parsedChars > 0 ? parsedChars : base.privacy.maxCharacters, 40000),
+            );
+            const nextSettings: SmartReplySettings = {
+                ...base,
+                enabled: smartRepliesEnabled,
+                privacy: {
+                    ...base.privacy,
+                    maxMessages: limitedMessages,
+                    maxCharacters: limitedChars,
+                    includeMedia: smartReplyIncludeMedia,
+                },
+            };
+            smartReplySettingsRef.current = nextSettings;
+            void setSmartReplySettings(client, nextSettings);
+            if (Number.isFinite(parsedMessages) && parsedMessages !== limitedMessages) {
+                setSmartReplyMaxMessages(String(limitedMessages));
+            }
+            if (Number.isFinite(parsedChars) && parsedChars !== limitedChars) {
+                setSmartReplyMaxCharacters(String(limitedChars));
+            }
+        }, 400);
+        return () => clearTimeout(handle);
+    }, [smartRepliesEnabled, smartReplyMaxMessages, smartReplyMaxCharacters, smartReplyIncludeMedia, client, isOpen]);
 
     useEffect(() => {
         if (!isOpen) {
@@ -343,6 +400,63 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, onSave, 
                                     Alt + Enter sends message, Enter starts a new line
                                 </span>
                             </label>
+                        </div>
+                    </div>
+
+                    <div className="pt-6 border-t border-border-primary">
+                        <h3 className="text-lg font-semibold text-text-primary mb-3">Smart Replies</h3>
+                        <div className="flex items-center justify-between">
+                            <div>
+                                <p className="text-sm font-medium text-text-primary">Enable smart replies</p>
+                                <p className="text-xs text-text-secondary">Показывать предложения на основе последних сообщений и черновика.</p>
+                            </div>
+                            <label className="relative inline-flex items-center cursor-pointer">
+                                <input
+                                    type="checkbox"
+                                    className="sr-only peer"
+                                    checked={smartRepliesEnabled}
+                                    onChange={(event) => setSmartRepliesEnabled(event.target.checked)}
+                                />
+                                <div className="w-11 h-6 bg-bg-tertiary peer-focus:outline-none rounded-full peer peer-checked:bg-accent transition-colors"></div>
+                                <div className="absolute top-1 left-1 w-4 h-4 bg-white rounded-full transition-transform peer-checked:translate-x-5"></div>
+                            </label>
+                        </div>
+                        <div className={`mt-4 space-y-4 ${smartRepliesEnabled ? '' : 'opacity-60 pointer-events-none'}`}>
+                            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                                <label className="flex flex-col">
+                                    <span className="text-xs text-text-secondary mb-1">Количество сообщений в контексте</span>
+                                    <input
+                                        type="number"
+                                        min={1}
+                                        max={50}
+                                        value={smartReplyMaxMessages}
+                                        onChange={event => setSmartReplyMaxMessages(event.target.value)}
+                                        className="px-3 py-2 rounded-md border border-border-primary bg-bg-secondary text-sm text-text-primary focus:outline-none focus:ring-2 focus:ring-ring-focus"
+                                    />
+                                </label>
+                                <label className="flex flex-col">
+                                    <span className="text-xs text-text-secondary mb-1">Максимум символов истории</span>
+                                    <input
+                                        type="number"
+                                        min={500}
+                                        max={40000}
+                                        step={100}
+                                        value={smartReplyMaxCharacters}
+                                        onChange={event => setSmartReplyMaxCharacters(event.target.value)}
+                                        className="px-3 py-2 rounded-md border border-border-primary bg-bg-secondary text-sm text-text-primary focus:outline-none focus:ring-2 focus:ring-ring-focus"
+                                    />
+                                </label>
+                            </div>
+                            <label className="flex items-start gap-3 text-sm text-text-primary">
+                                <input
+                                    type="checkbox"
+                                    className="mt-1 h-4 w-4 text-accent focus:ring-ring-focus"
+                                    checked={smartReplyIncludeMedia}
+                                    onChange={event => setSmartReplyIncludeMedia(event.target.checked)}
+                                />
+                                <span>Добавлять краткие описания вложений при генерации подсказок.</span>
+                            </label>
+                            <p className="text-xs text-text-secondary">Настройки сохраняются в данных аккаунта и применяются также при показе предложенных ответов в уведомлениях.</p>
                         </div>
                     </div>
 
