@@ -2,6 +2,8 @@ import React, { useState, useRef, useEffect } from 'react';
 import { Room, Message, RoomNotificationMode } from '@matrix-messenger/core';
 import Avatar from './Avatar';
 import PinnedMessageBar from './PinnedMessageBar';
+import type { PresenceSummary } from '../utils/presence';
+import { presenceStatusToClass } from '../utils/presence';
 
 interface ChatHeaderProps {
     room: Room;
@@ -31,6 +33,8 @@ interface ChatHeaderProps {
     isHiddenRoom?: boolean;
     onToggleHiddenRoom?: () => void;
     appLockEnabled?: boolean;
+    presenceSummary?: PresenceSummary;
+    presenceHidden?: boolean;
 }
 
 const statusLabels: Record<NonNullable<Room['status']>, string> = {
@@ -77,6 +81,8 @@ const ChatHeader: React.FC<ChatHeaderProps> = ({
     isHiddenRoom = false,
     onToggleHiddenRoom,
     appLockEnabled = false,
+    presenceSummary,
+    presenceHidden = false,
 }) => {
     const [callMenuOpen, setCallMenuOpen] = useState(false);
     const callMenuRef = useRef<HTMLDivElement>(null);
@@ -101,9 +107,33 @@ const ChatHeader: React.FC<ChatHeaderProps> = ({
         return () => document.removeEventListener('mousedown', onClick);
     }, []);
 
-    const typingText = (() => {
+    const presenceDetails = presenceSummary && presenceSummary.status !== 'hidden'
+        ? {
+            indicatorClass: presenceStatusToClass(presenceSummary.status),
+            label: presenceSummary.formattedUserId
+                ? `${presenceSummary.formattedUserId} • ${presenceSummary.label}`
+                : presenceSummary.label,
+        }
+        : presenceHidden
+            ? {
+                indicatorClass: presenceStatusToClass('hidden'),
+                label: 'Presence hidden',
+            }
+            : null;
+
+    const typingContent: React.ReactNode = (() => {
         const count = typingUsers.length;
-        if (count === 0) return room.status === 'invited' ? 'Waiting for your response' : `Room ID: ${room.roomId}`;
+        if (count === 0) {
+            if (presenceDetails) {
+                return (
+                    <span className="flex items-center gap-2">
+                        <span className={`h-2 w-2 rounded-full ${presenceDetails.indicatorClass}`} aria-hidden="true" />
+                        <span className="truncate">{presenceDetails.label}</span>
+                    </span>
+                );
+            }
+            return room.status === 'invited' ? 'Waiting for your response' : `Room ID: ${room.roomId}`;
+        }
         if (count === 1) return `${typingUsers[0]} is typing…`;
         if (count === 2) return `${typingUsers[0]} and ${typingUsers[1]} are typing…`;
         return 'Several people are typing…';
@@ -176,7 +206,7 @@ const ChatHeader: React.FC<ChatHeaderProps> = ({
                             </span>
                         )}
                     </div>
-                    <p className="text-xs text-text-secondary min-h-[16px] transition-all">{typingText}</p>
+                    <p className="text-xs text-text-secondary min-h-[16px] transition-all">{typingContent}</p>
                 </div>
                 <div className="flex items-center gap-2">
                     {onSelfDestructChange && (

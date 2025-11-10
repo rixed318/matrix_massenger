@@ -5,14 +5,17 @@ import React from 'react';
 import { Room } from '@matrix-messenger/core';
 import Avatar from './Avatar';
 import { formatDistanceToNow } from 'date-fns';
+import type { PresenceSummary } from '../utils/presence';
+import { presenceStatusToClass } from '../utils/presence';
 
 interface RoomListItemProps {
     room: Room;
     isSelected: boolean;
     onSelect: () => void;
+    presenceSummary?: PresenceSummary;
 }
 
-const RoomListItem: React.FC<RoomListItemProps> = ({ room, isSelected, onSelect }) => {
+const RoomListItem: React.FC<RoomListItemProps> = ({ room, isSelected, onSelect, presenceSummary }) => {
     const lastMessage = room.lastMessage;
     const isSpace = room.isSpace;
     const timestamp = !isSpace && lastMessage
@@ -47,6 +50,29 @@ const RoomListItem: React.FC<RoomListItemProps> = ({ room, isSelected, onSelect 
         }
 
         return 'No messages yet';
+    };
+
+    const renderPresenceDetails = () => {
+        if (!presenceSummary) return null;
+        if (presenceSummary.status === 'hidden') {
+            return (
+                <span className="flex items-center gap-2 text-xs text-text-tertiary" title="Presence is hidden">
+                    <span className={`h-2 w-2 rounded-full ${presenceStatusToClass(presenceSummary.status)}`} aria-hidden="true" />
+                    <span className="truncate">Presence hidden</span>
+                </span>
+            );
+        }
+
+        const label = presenceSummary.formattedUserId
+            ? `${presenceSummary.formattedUserId} • ${presenceSummary.label}`
+            : presenceSummary.label;
+
+        return (
+            <span className="flex items-center gap-2 text-xs text-text-secondary truncate" title={presenceSummary.label}>
+                <span className={`h-2 w-2 rounded-full ${presenceStatusToClass(presenceSummary.status)}`} aria-hidden="true" />
+                <span className="truncate">{label}</span>
+            </span>
+        );
     };
 
     const renderAvatar = () => {
@@ -104,13 +130,16 @@ const RoomListItem: React.FC<RoomListItemProps> = ({ room, isSelected, onSelect 
                     </p>
                     <p className="text-xs text-text-secondary flex-shrink-0">{timestamp}</p>
                 </div>
-                <div className="flex justify-between items-start">
-                    <p className="text-sm text-text-secondary truncate flex items-center gap-2">
-                        <span className="truncate">{renderMetaText()}</span>
-                        {hasRecentAttachment && (
-                            <span className="px-1.5 py-0.5 rounded-full bg-accent/10 text-[10px] uppercase tracking-wide text-accent font-semibold">Shared</span>
-                        )}
-                    </p>
+                <div className="flex justify-between items-start gap-2">
+                    <div className="flex-1 min-w-0 flex flex-col gap-1">
+                        <div className="text-sm text-text-secondary truncate flex items-center gap-2">
+                            <span className="truncate">{renderMetaText()}</span>
+                            {hasRecentAttachment && (
+                                <span className="px-1.5 py-0.5 rounded-full bg-accent/10 text-[10px] uppercase tracking-wide text-accent font-semibold">Shared</span>
+                            )}
+                        </div>
+                        {renderPresenceDetails()}
+                    </div>
                     {room.unreadCount > 0 && (
                         <span className="bg-accent text-text-inverted text-xs font-bold rounded-full h-5 w-5 flex items-center justify-center flex-shrink-0 ml-2">
                             {room.unreadCount}

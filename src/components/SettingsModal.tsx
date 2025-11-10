@@ -18,6 +18,9 @@ interface SettingsModalProps {
     onResetChatBackground: () => void;
     sendKeyBehavior: SendKeyBehavior;
     onSetSendKeyBehavior: (behavior: SendKeyBehavior) => void;
+    isPresenceHidden: boolean;
+    onSetPresenceHidden: (hidden: boolean) => void;
+    presenceRestricted: boolean;
 }
 
 const ThemeSwatch: React.FC<{ name: string; colors: { primary: string; secondary: string; accent: string; }; isActive: boolean; onClick: () => void; }> = ({ name, colors, isActive, onClick }) => (
@@ -47,7 +50,7 @@ const BACKGROUNDS = [
 ];
 
 
-const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, onSave, client, notificationsEnabled, onSetNotificationsEnabled, chatBackground, onSetChatBackground, onResetChatBackground, sendKeyBehavior, onSetSendKeyBehavior }) => {
+const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, onSave, client, notificationsEnabled, onSetNotificationsEnabled, chatBackground, onSetChatBackground, onResetChatBackground, sendKeyBehavior, onSetSendKeyBehavior, isPresenceHidden, onSetPresenceHidden, presenceRestricted }) => {
     const user = client.getUser(client.getUserId());
     const [displayName, setDisplayName] = useState(user?.displayName || '');
     const [avatarFile, setAvatarFile] = useState<File | null>(null);
@@ -351,7 +354,14 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, onSave, 
                 </div>
             </div>
         </div>
-        <SecuritySettings client={client} isOpen={isSecurityOpen} onClose={() => setIsSecurityOpen(false)} />
+        <SecuritySettings
+            client={client}
+            isOpen={isSecurityOpen}
+            onClose={() => setIsSecurityOpen(false)}
+            presenceHidden={isPresenceHidden}
+            onSetPresenceHidden={onSetPresenceHidden}
+            presenceRestricted={presenceRestricted}
+        />
     </div>
     );
 };

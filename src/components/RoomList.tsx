@@ -4,6 +4,7 @@ import RoomListItem from './RoomListItem';
 import Avatar from './Avatar';
 import { mxcToHttp } from '@matrix-messenger/core';
 import { AccountListItemSnapshot } from '../services/accountManager';
+import type { PresenceSummary } from '../utils/presence';
 
 interface RoomListProps {
   rooms: Room[];
@@ -26,6 +27,7 @@ interface RoomListProps {
   hiddenRoomIds?: string[];
   onUnlockHidden?: () => void;
   isHiddenUnlocked?: boolean;
+  presenceSummaries?: Map<string, PresenceSummary>;
 }
 
 const RoomList: React.FC<RoomListProps> = ({
@@ -33,6 +35,7 @@ const RoomList: React.FC<RoomListProps> = ({
   onOpenSettings, onOpenPlugins, onOpenCreateRoom, folders, activeFolderId, onSelectFolder, onManageFolders,
   accounts, activeAccountKey, onSwitchAccount, onAddAccount,
   hiddenRoomIds = [], onUnlockHidden, isHiddenUnlocked = true,
+  presenceSummaries,
 }) => {
   const user = client.getUser(client.getUserId());
   const userAvatarUrl = mxcToHttp(client, user?.avatarUrl);
@@ -155,6 +158,7 @@ const RoomList: React.FC<RoomListProps> = ({
                 room={room}
                 isSelected={room.roomId === selectedRoomId}
                 onSelect={() => onSelectRoom(room.roomId)}
+                presenceSummary={presenceSummaries?.get(room.roomId)}
               />
             ))}
           </ul>
