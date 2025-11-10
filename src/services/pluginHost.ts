@@ -8,6 +8,13 @@ import {
   type PluginHandle,
 } from '@matrix-messenger/sdk';
 import { createSandboxedPluginDefinition } from './pluginSandboxBridge';
+import {
+  PLUGIN_SURFACE_LOCATIONS,
+  registerPluginSurfaces,
+  unregisterPluginSurfaces,
+  type PluginSurfaceDefinition,
+  type PluginSurfaceLocation,
+} from './pluginUiRegistry';
 import type { MatrixClient, MatrixEvent, MatrixRoom } from '../types';
 import { configurePluginAnimatedReactions, clearPluginAnimatedReactions, isAnimatedReactionsEnabled } from './animatedReactions';
 
@@ -24,6 +31,8 @@ export const KNOWN_PLUGIN_EVENTS: PluginEventName[] = [
   'matrix.room-event',
   'matrix.message',
   'command.invoked',
+  'ui.render',
+  'ui.action',
 ];
 
 export const KNOWN_PLUGIN_PERMISSIONS = [
@@ -33,6 +42,8 @@ export const KNOWN_PLUGIN_PERMISSIONS = [
   'storage',
   'scheduler',
   'animatedReactions',
+  'ui.panel',
+  'background',
 ] as const;
 
 const ACTION_PERMISSION_MAP: Record<string, PluginPermission> = {
@@ -52,6 +63,8 @@ const PERMISSION_DESCRIPTIONS: Record<PluginPermission, string> = {
   storage: 'Доступ к изолированному хранилищу плагина',
   scheduler: 'Запуск фоновых таймеров внутри плагина',
   animatedReactions: 'Управление анимациями реакций и доступ к пользовательской настройке',
+  'ui.panel': 'Встраивание пользовательского интерфейса плагина во вкладки приложения',
+  background: 'Работа плагина в фоне даже без активных поверхностей UI',
 };
 
 export const describePluginPermission = (permission: PluginPermission): string =>
@@ -64,7 +77,9 @@ export interface PluginManifest {
   description?: string;
   entry: string;
   permissions?: PluginPermission[];
+  capabilities?: string[];
   requiredEvents?: PluginEventName[];
+  surfaces?: PluginSurfaceDefinition[];
   integrity?: string;
   signature?: string;
 }
@@ -117,7 +132,17 @@ const validateManifest = (manifest: PluginManifest): PluginManifest => {
   if (!manifest || typeof manifest !== 'object') {
     throw new Error('Некорректный манифест плагина');
   }
-  const { id, name, entry, permissions, requiredEvents, integrity, signature } = manifest;
+  const {
+    id,
+    name,
+    entry,
+    permissions,
+    capabilities,
+    requiredEvents,
+    surfaces,
+    integrity,
+    signature,
+  } = manifest;
   if (!id || typeof id !== 'string') {
     throw new Error('Манифест должен содержать строковый "id"');
   }
@@ -134,12 +159,55 @@ const validateManifest = (manifest: PluginManifest): PluginManifest => {
       }
     }
   }
+  if (capabilities) {
+    if (!Array.isArray(capabilities)) {
+      throw new Error(`Поле capabilities плагина "${id}" должно быть массивом строк`);
+    }
+    for (const capability of capabilities) {
+      if (typeof capability !== 'string' || capability.trim() === '') {
+        throw new Error(`Плагин "${id}" содержит некорректную capability: ${String(capability)}`);
+      }
+    }
+  }
   if (requiredEvents) {
     for (const event of requiredEvents) {
       if (!KNOWN_PLUGIN_EVENTS.includes(event)) {
         throw new Error(`Плагин "${id}" запрашивает неподдерживаемое событие "${event}"`);
       }
     }
+  }
+  if (surfaces) {
+    if (!Array.isArray(surfaces)) {
+      throw new Error(`Поле surfaces плагина "${id}" должно быть массивом объектов`);
+    }
+    const hasUiPermission = (permissions ?? []).includes('ui.panel');
+    if (surfaces.length > 0 && !hasUiPermission) {
+      throw new Error(`Плагин "${id}" определяет поверхности UI без разрешения "ui.panel"`);
+    }
+    surfaces.forEach(surface => {
+      if (!surface || typeof surface !== 'object') {
+        throw new Error(`Плагин "${id}" содержит некорректное описание поверхности UI`);
+      }
+      const { id: surfaceId, location, entry: surfaceEntry, label, description, csp } = surface;
+      if (!surfaceId || typeof surfaceId !== 'string') {
+        throw new Error(`Поверхность UI плагина "${id}" должна иметь строковый идентификатор`);
+      }
+      if (!location || !PLUGIN_SURFACE_LOCATIONS.includes(location as PluginSurfaceLocation)) {
+        throw new Error(`Плагин "${id}" использует неподдерживаемое расположение поверхности "${String(location)}"`);
+      }
+      if (!surfaceEntry || typeof surfaceEntry !== 'string') {
+        throw new Error(`Поверхность UI "${surfaceId}" плагина "${id}" должна содержать поле entry`);
+      }
+      if (label !== undefined && typeof label !== 'string') {
+        throw new Error(`Поле label поверхности "${surfaceId}" плагина "${id}" должно быть строкой`);
+      }
+      if (description !== undefined && typeof description !== 'string') {
+        throw new Error(`Поле description поверхности "${surfaceId}" плагина "${id}" должно быть строкой`);
+      }
+      if (csp !== undefined && typeof csp !== 'string') {
+        throw new Error(`Поле csp поверхности "${surfaceId}" плагина "${id}" должно быть строкой`);
+      }
+    });
   }
   if (integrity && typeof integrity !== 'string') {
     throw new Error(`Поле integrity плагина "${id}" должно быть строкой`);
@@ -158,6 +226,18 @@ const resolveEntryUrl = (entry: string): string => {
     return new URL(entry, window.location.origin).toString();
   } catch (error) {
     console.warn('Failed to resolve plugin entry, using raw value', error);
+    return entry;
+  }
+};
+
+const resolveSurfaceUrl = (entry: string, baseUrl: string): string => {
+  if (typeof window === 'undefined') {
+    return entry;
+  }
+  try {
+    return new URL(entry, baseUrl).toString();
+  } catch (error) {
+    console.warn('Failed to resolve plugin surface entry, using raw value', error);
     return entry;
   }
 };
@@ -206,6 +286,10 @@ const getAllowedActions = (manifest: PluginManifest): string[] => {
 
 const registerPluginFromManifest = async (manifest: PluginManifest): Promise<void> => {
   const entryUrl = resolveEntryUrl(manifest.entry);
+  const resolvedSurfaces = (manifest.surfaces ?? []).map(surface => ({
+    ...surface,
+    entry: resolveSurfaceUrl(surface.entry, entryUrl),
+  }));
   await verifyManifestIntegrity(manifest, entryUrl);
   const definition = createSandboxedPluginDefinition({
     manifest: {
@@ -220,14 +304,19 @@ const registerPluginFromManifest = async (manifest: PluginManifest): Promise<voi
     allowedActions: getAllowedActions(manifest),
     allowStorage: (manifest.permissions ?? []).includes('storage'),
     allowScheduler: (manifest.permissions ?? []).includes('scheduler'),
+    allowUiPanel: (manifest.permissions ?? []).includes('ui.panel'),
+    allowBackground: (manifest.permissions ?? []).includes('background'),
+    surfaces: resolvedSurfaces,
     configureAnimatedReactions: configurePluginAnimatedReactions,
     getAnimatedReactionsPreference: () => isAnimatedReactionsEnabled(),
   });
   const handle = await pluginHost.registerPlugin(definition);
   pluginHandles.set(manifest.id, handle);
+  registerPluginSurfaces(manifest, resolvedSurfaces);
 };
 
 const unregisterPlugin = async (pluginId: string): Promise<void> => {
+  unregisterPluginSurfaces(pluginId);
   const existingHandle = pluginHandles.get(pluginId);
   if (existingHandle) {
     pluginHandles.delete(pluginId);
@@ -269,9 +358,15 @@ export const getPluginRegistry = async (): Promise<PluginManifest[]> => {
   }
   manifestCache = items.map(item => {
     const manifest = validateManifest(item as PluginManifest);
+    const entryUrl = new URL(manifest.entry, registryUrl).toString();
+    const resolvedSurfaces = (manifest.surfaces ?? []).map(surface => ({
+      ...surface,
+      entry: new URL(surface.entry, registryUrl).toString(),
+    }));
     return {
       ...manifest,
-      entry: new URL(manifest.entry, registryUrl).toString(),
+      entry: entryUrl,
+      surfaces: resolvedSurfaces,
     } satisfies PluginManifest;
   });
   return manifestCache;

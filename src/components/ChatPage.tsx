@@ -34,6 +34,7 @@ import IncomingCallModal from './IncomingCallModal';
 import CallView from './CallView';
 import SearchModal from './SearchModal';
 import PluginCatalogModal from './PluginCatalogModal';
+import PluginSurfaceHost from './PluginSurfaceHost';
 import { SearchResultItem } from '@matrix-messenger/core';
 import type { DraftContent, SendKeyBehavior, DraftAttachment, DraftAttachmentKind, VideoMessageMetadata } from '../types';
 import SharedMediaPanel from './SharedMediaPanel';
@@ -3825,6 +3826,12 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
                             presenceHidden={isPresenceHidden}
                         />
                         <ChatTimelineSection {...timelineProps} />
+                        <PluginSurfaceHost
+                            location="chat.panel"
+                            roomId={selectedRoom.roomId}
+                            context={{ roomName: selectedRoom.name }}
+                            className="px-4"
+                        />
                         <ChatComposerSection {...composerProps} />
                     </>
                 ) : <WelcomeView client={client} />}
