@@ -9,6 +9,7 @@ import {
 } from '@matrix-messenger/sdk';
 import { createSandboxedPluginDefinition } from './pluginSandboxBridge';
 import type { MatrixClient, MatrixEvent, MatrixRoom } from '../types';
+import { configurePluginAnimatedReactions, clearPluginAnimatedReactions, isAnimatedReactionsEnabled } from './animatedReactions';
 
 const storage = typeof window !== 'undefined'
   ? createBrowserStorageAdapter('matrix-messenger.plugins')
@@ -31,12 +32,15 @@ export const KNOWN_PLUGIN_PERMISSIONS = [
   'redactEvent',
   'storage',
   'scheduler',
+  'animatedReactions',
 ] as const;
 
 const ACTION_PERMISSION_MAP: Record<string, PluginPermission> = {
   sendTextMessage: 'sendTextMessage',
   sendEvent: 'sendEvent',
   redactEvent: 'redactEvent',
+  configureAnimatedReactions: 'animatedReactions',
+  getAnimatedReactionsPreference: 'animatedReactions',
 };
 
 export type PluginPermission = typeof KNOWN_PLUGIN_PERMISSIONS[number];
@@ -47,6 +51,7 @@ const PERMISSION_DESCRIPTIONS: Record<PluginPermission, string> = {
   redactEvent: 'Удаление (redact) событий в комнатах Matrix',
   storage: 'Доступ к изолированному хранилищу плагина',
   scheduler: 'Запуск фоновых таймеров внутри плагина',
+  animatedReactions: 'Управление анимациями реакций и доступ к пользовательской настройке',
 };
 
 export const describePluginPermission = (permission: PluginPermission): string =>
@@ -215,6 +220,8 @@ const registerPluginFromManifest = async (manifest: PluginManifest): Promise<voi
     allowedActions: getAllowedActions(manifest),
     allowStorage: (manifest.permissions ?? []).includes('storage'),
     allowScheduler: (manifest.permissions ?? []).includes('scheduler'),
+    configureAnimatedReactions: configurePluginAnimatedReactions,
+    getAnimatedReactionsPreference: () => isAnimatedReactionsEnabled(),
   });
   const handle = await pluginHost.registerPlugin(definition);
   pluginHandles.set(manifest.id, handle);
@@ -225,9 +232,11 @@ const unregisterPlugin = async (pluginId: string): Promise<void> => {
   if (existingHandle) {
     pluginHandles.delete(pluginId);
     await existingHandle.dispose();
+    clearPluginAnimatedReactions(pluginId);
     return;
   }
   await pluginHost.unregisterPlugin(pluginId);
+  clearPluginAnimatedReactions(pluginId);
 };
 
 const updateStoredEntry = (pluginId: string, updater: (entry: StoredPluginEntry | undefined) => StoredPluginEntry | undefined) => {

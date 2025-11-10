@@ -6,6 +6,7 @@ import type {
   PluginCleanup,
   CommandDefinition,
 } from '@matrix-messenger/sdk';
+import type { AnimatedReactionDefinition } from '../types/animatedReactions';
 import {
   SANDBOX_MESSAGE,
   type SandboxActionRequest,
@@ -264,6 +265,8 @@ const actions = {
   sendTextMessage: createAction('sendTextMessage'),
   sendEvent: createAction('sendEvent'),
   redactEvent: createAction('redactEvent'),
+  configureAnimatedReactions: createAction('configureAnimatedReactions'),
+  getAnimatedReactionsPreference: createAction('getAnimatedReactionsPreference'),
 };
 
 const buildLogger = (id: string) => ({
@@ -289,11 +292,44 @@ const handleInit = async (message: SandboxInitMessage) => {
     pluginDefinition = definition;
 
     const resolvedId = definition.id ?? message.manifest.id;
+    const animatedReactions = (() => {
+      const canConfigure = allowedActions.has('configureAnimatedReactions');
+      const canQuery = allowedActions.has('getAnimatedReactionsPreference');
+      if (!canConfigure && !canQuery) {
+        return undefined;
+      }
+      return {
+        async isEnabled(): Promise<boolean> {
+          if (!canQuery) {
+            throw new Error('Animated reactions preference access is not permitted');
+          }
+          const response = await actions.getAnimatedReactionsPreference({});
+          if (response && typeof response === 'object' && 'enabled' in (response as any)) {
+            return Boolean((response as any).enabled);
+          }
+          return Boolean(response);
+        },
+        async register(definitions: AnimatedReactionDefinition[], options?: { append?: boolean }): Promise<void> {
+          if (!canConfigure) {
+            throw new Error('Animated reactions configuration is not permitted');
+          }
+          await actions.configureAnimatedReactions({ definitions, append: Boolean(options?.append) });
+        },
+        async clear(): Promise<void> {
+          if (!canConfigure) {
+            throw new Error('Animated reactions configuration is not permitted');
+          }
+          await actions.configureAnimatedReactions({ clear: true });
+        },
+      };
+    })();
+
     const context = {
       id: resolvedId,
       logger: buildLogger(resolvedId),
       storage: createStorage(),
       events,
+      animatedReactions,
       commands: {
         register(definitionToRegister: CommandDefinition) {
           const handlerId = nextRequestId++;

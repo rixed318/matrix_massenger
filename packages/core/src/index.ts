@@ -6,6 +6,7 @@ export * from '../../../src/services/matrixService_appendix';
 export * from '../../../src/services/mediaIndexService';
 export * from '../../../src/services/schedulerService';
 export * from '../../../src/services/secureCloudService';
+export * from '../../../src/services/animatedReactions';
 export * from '../../../src/services/gifService';
 export * from '../../../src/services/notificationService';
 export * from '../../../src/services/pushService';

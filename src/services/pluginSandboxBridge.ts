@@ -4,6 +4,7 @@ import type {
   PluginEventName,
   CommandDefinition,
 } from '@matrix-messenger/sdk';
+import type { ConfigureAnimatedReactionsPayload } from '../types/animatedReactions';
 import {
   SANDBOX_MESSAGE,
   type SandboxActionRequest,
@@ -36,6 +37,8 @@ export interface PluginSandboxOptions {
   allowStorage: boolean;
   allowScheduler: boolean;
   createWorker?: (url: URL) => Worker;
+  configureAnimatedReactions?: (pluginId: string, payload: ConfigureAnimatedReactionsPayload) => Promise<unknown> | unknown;
+  getAnimatedReactionsPreference?: () => boolean;
 }
 
 class PluginSandboxBridge {
@@ -112,6 +115,13 @@ class PluginSandboxBridge {
     }
     this.commandDisposers.clear();
     this.pendingCommands.clear();
+    if (this.options.configureAnimatedReactions) {
+      try {
+        await Promise.resolve(this.options.configureAnimatedReactions(this.options.manifest.id, { clear: true }));
+      } catch (error) {
+        console.warn('[plugin-sandbox] Failed to clear animated reactions', error);
+      }
+    }
   }
 
   private nextId(): number {
@@ -279,9 +289,29 @@ class PluginSandboxBridge {
       if (!this.allowedActions.has(message.action)) {
         throw new Error(`Action ${message.action} is not permitted`);
       }
-      const result = await (this.ctx.actions as Record<string, (payload: unknown) => unknown>)[message.action](message.payload);
-      response.success = true;
-      response.result = result;
+      if (message.action === 'configureAnimatedReactions') {
+        if (!this.options.configureAnimatedReactions) {
+          throw new Error('Animated reactions configuration is not available');
+        }
+        const result = await this.options.configureAnimatedReactions(
+          this.options.manifest.id,
+          message.payload as ConfigureAnimatedReactionsPayload,
+        );
+        response.success = true;
+        response.result = result;
+      } else if (message.action === 'getAnimatedReactionsPreference') {
+        const enabled = this.options.getAnimatedReactionsPreference?.() ?? false;
+        response.success = true;
+        response.result = { enabled };
+      } else {
+        const handler = (this.ctx.actions as Record<string, (payload: unknown) => unknown>)[message.action];
+        if (!handler) {
+          throw new Error(`Action ${message.action} is not implemented`);
+        }
+        const result = await handler(message.payload);
+        response.success = true;
+        response.result = result;
+      }
     } catch (error) {
       response.error = error instanceof Error ? error.message : String(error);
     }

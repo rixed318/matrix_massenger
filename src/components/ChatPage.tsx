@@ -15,7 +15,7 @@ import {
     bulkUpdateScheduledMessages,
     markScheduledMessageSent,
     recordScheduledMessageError,
-    parseScheduledMessagesFromEvent,
+    applyScheduledMessagesEvent,
     SCHEDULED_MESSAGES_EVENT_TYPE,
 } from '@matrix-messenger/core';
 import { checkPermission, sendNotification, setupNotificationListeners, subscribeToWebPush, isWebPushSupported, registerMatrixWebPush, setRoomNotificationPreference, setRoomNotificationPreferences } from '@matrix-messenger/core';
@@ -78,6 +78,11 @@ import {
     formatMatrixIdForDisplay,
     type PresenceSummary,
 } from '../utils/presence';
+import {
+    isAnimatedReactionsEnabled,
+    setAnimatedReactionsEnabled as persistAnimatedReactionsEnabled,
+    onAnimatedReactionsPreferenceChange,
+} from '../services/animatedReactions';
 
 interface ChatPageProps {
     client?: MatrixClient;
@@ -89,6 +94,804 @@ const DRAFT_STORAGE_KEY = 'matrix-message-drafts';
 const DRAFT_ACCOUNT_DATA_EVENT = 'econix.message_drafts';
 
 type PendingQueueSummary = OutboxPayload & { attempts: number; error?: string; progress?: OutboxProgressState };
+
+interface ChatTimelineSectionProps {
+    secureCloud: {
+        isActive: boolean;
+        error: string | null;
+        detectors: SecureCloudDetectorState[];
+        formatStatus: (state: SecureCloudDetectorState) => string;
+        onClearError: () => void;
+        onToggleDetector: (detectorId: string, enabled: boolean) => void;
+        onUpdateDetectorConfig: (detectorId: string, patch: SecureCloudDetectorConfig) => void;
+        alerts: SuspiciousEventNotice[];
+        roomId: string | null;
+        onDismissAlert: (roomId: string, eventId?: string) => void;
+    };
+    verification: {
+        requests: unknown[];
+        onAccept: (request: unknown) => void;
+        onDecline: (request: unknown) => void;
+    };
+    messageView: {
+        messages: Message[];
+        client: MatrixClient;
+        onReaction: (messageId: string, emoji: string, reaction?: Reaction) => void;
+        onEditMessage: (messageId: string, newContent: string) => void;
+        onDeleteMessage: (messageId: string) => void;
+        onSetReplyTo: (message: Message) => void;
+        onForwardMessage: (message: Message) => void;
+        onImageClick: (url: string) => void;
+        onOpenThread: (message: Message) => void;
+        onPollVote: (messageId: string, optionId: string) => void;
+        onTranslateMessage: (messageId: string, text: string) => void;
+        translatedMessages: Record<string, { text: string; isLoading: boolean }>;
+        scrollContainerRef: React.RefObject<HTMLDivElement>;
+        onScroll: () => void;
+        onPaginate: () => void;
+        isPaginating: boolean;
+        canPaginate: boolean;
+        pinnedEventIds: string[];
+        canPin: boolean;
+        onPinToggle: (messageId: string) => void;
+        highlightedMessageId: string | null;
+        pendingMessages: Message[];
+        pendingQueue: PendingQueueSummary[];
+        onRetryPending: (id: string) => void;
+        onCancelPending: (id: string) => void;
+    };
+    showScrollToBottom: boolean;
+    onScrollToBottom: () => void;
+}
+
+interface ChatComposerSectionProps {
+    composer: {
+        onSendMessage: (content: { body: string; formattedBody?: string }, threadRootId?: string) => Promise<void> | void;
+        onSendFile: (file: File) => Promise<void> | void;
+        onSendAudio: (file: Blob, duration: number) => Promise<void> | void;
+        onSendVideo: (file: Blob, metadata: VideoMessageMetadata) => Promise<void> | void;
+        onSendSticker: (sticker: Sticker) => Promise<void> | void;
+        onSendGif: (gif: Gif) => Promise<void> | void;
+        onOpenCreatePoll: () => void;
+        onSchedule: (content: DraftContent) => void;
+        isSending: boolean;
+        client: MatrixClient;
+        roomId: string | null;
+        replyingTo: Message | null;
+        onCancelReply: () => void;
+        roomMembers: MatrixUser[];
+        draftContent: DraftContent | null;
+        onDraftChange: (content: DraftContent) => void;
+        isOffline: boolean;
+        sendKeyBehavior: SendKeyBehavior;
+        pendingQueue: PendingQueueSummary[];
+        onRetryPending: (id: string) => void;
+        onCancelPending: (id: string) => void;
+    };
+}
+
+interface ChatSidePanelsProps {
+    thread: {
+        activeThread: ActiveThread | null;
+        selectedRoomId: string | null;
+        onCloseThread: () => void;
+        client: MatrixClient;
+        onSendMessage: (content: { body: string; formattedBody?: string }, threadRootId?: string) => Promise<void> | void;
+        onImageClick: (url: string) => void;
+        sendKeyBehavior: SendKeyBehavior;
+    };
+    settings: {
+        isOpen: boolean;
+        onClose: () => void;
+        onSave: (newName: string, newAvatar: File | null) => void;
+        client: MatrixClient;
+        notificationsEnabled: boolean;
+        onSetNotificationsEnabled: (enabled: boolean) => void;
+        chatBackground: string;
+        onSetChatBackground: (url: string) => void;
+        onResetChatBackground: () => void;
+        sendKeyBehavior: SendKeyBehavior;
+        onSetSendKeyBehavior: (behavior: SendKeyBehavior) => void;
+        isPresenceHidden: boolean;
+        onSetPresenceHidden: (hidden: boolean) => void;
+        presenceRestricted: boolean;
+        animatedReactionsEnabled: boolean;
+        onSetAnimatedReactionsEnabled: (enabled: boolean) => void;
+    };
+    createRoom: {
+        isOpen: boolean;
+        onClose: () => void;
+        onCreate: (options: RoomCreationOptions) => Promise<string> | string | void;
+    };
+    createPoll: {
+        isOpen: boolean;
+        onClose: () => void;
+        onCreate: (question: string, options: string[]) => Promise<void> | void;
+    };
+    manageFolders: {
+        isOpen: boolean;
+        onClose: () => void;
+        onSave: (folders: Folder[]) => void;
+        initialFolders: Folder[];
+        rooms: UIRoom[];
+    };
+    schedule: {
+        isOpen: boolean;
+        onClose: () => void;
+        onConfirm: (selection: { sendAtUtc: number; timezoneOffset: number; timezoneId: string; localTimestamp: number }) => Promise<void> | void;
+        content: DraftContent | null;
+    };
+    scheduledList: {
+        isOpen: boolean;
+        onClose: () => void;
+        messages: ScheduledMessage[];
+        onDelete: (id: string) => Promise<void> | void;
+        onSendNow: (id: string) => Promise<void> | void;
+        onUpdate: (id: string, update: ScheduledMessageUpdatePayload) => Promise<void>;
+        onBulkReschedule: (ids: string[], schedule: ScheduledMessageScheduleUpdate) => Promise<void>;
+        onBulkSend: (ids: string[]) => Promise<void>;
+    };
+    hiddenRooms: {
+        isPromptOpen: boolean;
+        pinInput: string;
+        onPinInputChange: (value: string) => void;
+        pinError: string | null;
+        onCancel: () => void;
+        onUnlockBiometric?: () => void;
+        onUnlockPin: () => void;
+        appLockEnabled: boolean;
+        biometricEnabled: boolean;
+    };
+    invite: {
+        isOpen: boolean;
+        onClose: () => void;
+        onInvite: (userId: string) => Promise<void> | void;
+        roomName?: string;
+    };
+    forwarding: {
+        message: Message | null;
+        onClose: () => void;
+        onForward: (roomId: string) => Promise<void> | void;
+        rooms: UIRoom[];
+        client: MatrixClient;
+        savedMessagesRoom: UIRoom | null | undefined;
+        currentRoomId: string | null;
+    };
+    mediaViewer: {
+        imageUrl: string | null;
+        onClose: () => void;
+    };
+    search: {
+        isOpen: boolean;
+        onClose: () => void;
+        client: MatrixClient;
+        rooms: UIRoom[];
+        onSelectResult: (result: SearchResultItem) => void;
+    };
+    plugins: {
+        isOpen: boolean;
+        onClose: () => void;
+    };
+    sharedMedia: {
+        isOpen: boolean;
+        onClose: () => void;
+        data: RoomMediaSummary | null;
+        isLoading: boolean;
+        isPaginating: boolean;
+        onLoadMore?: () => void;
+        currentUserId?: string;
+    };
+    groupCall: {
+        activeGroupCall: {
+            roomId: string;
+            sessionId: string;
+            url: string;
+            layout: CallLayout;
+            isScreensharing: boolean;
+            isMuted: boolean;
+            isVideoMuted: boolean;
+            coWatchActive: boolean;
+        } | null;
+        participantViews: GroupCallParticipant[];
+        showParticipantsPanel: boolean;
+        onToggleParticipantsPanel: () => void;
+        onLayoutChange: (layout: CallLayout) => void;
+        onToggleScreenshare: () => void;
+        onToggleMute: () => void;
+        onToggleVideo: () => void;
+        onToggleCoWatch: () => void;
+        onMuteParticipant: (userId: string) => void;
+        onVideoParticipantToggle: (userId: string) => void;
+        onRemoveParticipant: (userId: string) => void;
+        onPromotePresenter: (userId: string) => void;
+        onSpotlightParticipant: (userId: string | null) => void;
+        localUserId?: string;
+        canModerateParticipants: boolean;
+        client: MatrixClient;
+        onHangup: () => void;
+    };
+    calls: {
+        activeCall: MatrixCall | null;
+        incomingCall: MatrixCall | null;
+        onHangup: (isIncoming: boolean) => void;
+        onAccept: () => void;
+        onDecline: () => void;
+        client: MatrixClient;
+    };
+    groupCallPermission: {
+        error: string | null;
+        onDismiss: () => void;
+    };
+}
+
+const ChatTimelineSection: React.FC<ChatTimelineSectionProps> = ({ secureCloud, verification, messageView, showScrollToBottom, onScrollToBottom }) => {
+    const {
+        messages,
+        client,
+        onReaction,
+        onEditMessage,
+        onDeleteMessage,
+        onSetReplyTo,
+        onForwardMessage,
+        onImageClick,
+        onOpenThread,
+        onPollVote,
+        onTranslateMessage,
+        translatedMessages,
+        scrollContainerRef,
+        onScroll,
+        onPaginate,
+        isPaginating,
+        canPaginate,
+        pinnedEventIds,
+        canPin,
+        onPinToggle,
+        highlightedMessageId,
+        pendingMessages,
+        pendingQueue,
+        onRetryPending,
+        onCancelPending,
+    } = messageView;
+
+    return (
+        <>
+            {secureCloud.isActive && (
+                <div className="px-4 pt-3 space-y-3">
+                    {secureCloud.error && (
+                        <div className="rounded-md border border-red-500/60 bg-red-500/10 px-3 py-2 text-sm text-red-600 flex items-start justify-between gap-4">
+                            <span>Secure Cloud: {secureCloud.error}</span>
+                            <button
+                                type="button"
+                                onClick={secureCloud.onClearError}
+                                className="text-xs font-semibold uppercase tracking-wide text-red-600/80 hover:text-red-600"
+                            >
+                                Скрыть
+                            </button>
+                        </div>
+                    )}
+                    {secureCloud.detectors.length > 0 && (
+                        <div className="rounded-md border border-neutral-500/40 bg-neutral-900/40 px-3 py-2 text-xs text-neutral-100 space-y-2">
+                            <div className="flex items-center justify-between">
+                                <span className="font-semibold text-sm">Детекторы Secure Cloud</span>
+                            </div>
+                            <ul className="space-y-2">
+                                {secureCloud.detectors.map(state => {
+                                    const mergedConfig: SecureCloudDetectorConfig = {
+                                        ...(state.detector.defaultConfig ?? {}),
+                                        ...(state.config ?? {}),
+                                    };
+                                    const derivedThreshold = typeof mergedConfig.threshold === 'number'
+                                        ? mergedConfig.threshold
+                                        : typeof state.detector.defaultConfig?.threshold === 'number'
+                                            ? state.detector.defaultConfig.threshold
+                                            : 0.6;
+                                    const thresholdValue = Number.isFinite(derivedThreshold)
+                                        ? Math.min(0.95, Math.max(0.2, derivedThreshold))
+                                        : 0.6;
+                                    const languageValue = typeof mergedConfig.language === 'string'
+                                        ? mergedConfig.language
+                                        : 'auto';
+                                    const configDisabled = !state.enabled && !state.detector.required;
+                                    const showThresholdControl = state.detector.defaultConfig?.threshold !== undefined
+                                        || typeof state.config?.threshold === 'number';
+                                    const showLanguageControl = state.detector.defaultConfig?.language !== undefined
+                                        || typeof state.config?.language === 'string';
+
+                                    return (
+                                        <li key={state.detector.id} className="flex flex-col gap-2">
+                                            <div className="flex items-start justify-between gap-3">
+                                                <div className="flex-1 min-w-0">
+                                                    <div className="flex items-center gap-2">
+                                                        <span className="font-medium text-sm text-neutral-100">{state.detector.displayName}</span>
+                                                        {state.detector.required && (
+                                                            <span className="text-[10px] uppercase tracking-wide text-emerald-400/80">обязательный</span>
+                                                        )}
+                                                    </div>
+                                                    {state.detector.description && (
+                                                        <p className="text-[11px] text-neutral-400 mt-0.5">{state.detector.description}</p>
+                                                    )}
+                                                    <p className="text-[10px] text-neutral-500 mt-1">{secureCloud.formatStatus(state)}</p>
+                                                </div>
+                                                <label className="flex items-center gap-2 text-[11px] text-neutral-300">
+                                                    <input
+                                                        type="checkbox"
+                                                        className="h-4 w-4 rounded border-neutral-500 bg-transparent text-emerald-500 focus:ring-emerald-500"
+                                                        checked={state.detector.required || state.enabled}
+                                                        onChange={(event) => secureCloud.onToggleDetector(state.detector.id, event.target.checked)}
+                                                        disabled={state.detector.required}
+                                                    />
+                                                    <span className="select-none">{state.detector.required ? 'Всегда' : state.enabled ? 'Вкл.' : 'Выкл.'}</span>
+                                                </label>
+                                            </div>
+                                            {(showThresholdControl || showLanguageControl) && (
+                                                <div className="pl-1 space-y-2">
+                                                    {showThresholdControl && (
+                                                        <div>
+                                                            <div className="flex items-center justify-between text-[11px] text-neutral-400">
+                                                                <span>Порог срабатывания</span>
+                                                                <span>{Math.round(thresholdValue * 100)}%</span>
+                                                            </div>
+                                                            <input
+                                                                type="range"
+                                                                min="0.2"
+                                                                max="0.95"
+                                                                step="0.01"
+                                                                value={thresholdValue}
+                                                                onChange={(event) => {
+                                                                    const value = Number(event.target.value);
+                                                                    if (!Number.isNaN(value)) {
+                                                                        secureCloud.onUpdateDetectorConfig(state.detector.id, { threshold: value });
+                                                                    }
+                                                                }}
+                                                                disabled={configDisabled}
+                                                                className="w-full mt-1 accent-emerald-500"
+                                                            />
+                                                        </div>
+                                                    )}
+                                                    {showLanguageControl && (
+                                                        <div>
+                                                            <label className="block text-[11px] text-neutral-400 mb-1">Язык модели</label>
+                                                            <select
+                                                                value={languageValue}
+                                                                onChange={(event) => secureCloud.onUpdateDetectorConfig(state.detector.id, { language: event.target.value })}
+                                                                disabled={configDisabled}
+                                                                className="w-full rounded border border-neutral-600 bg-neutral-900/80 px-2 py-1 text-[11px] text-neutral-200 focus:border-emerald-500 focus:outline-none"
+                                                            >
+                                                                <option value="auto">Авто</option>
+                                                                <option value="ru">Русский</option>
+                                                                <option value="en">English</option>
+                                                            </select>
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            )}
+                                        </li>
+                                    );
+                                })}
+                            </ul>
+                        </div>
+                    )}
+                    {secureCloud.alerts.length > 0 ? (
+                        <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-700 space-y-2">
+                            <div className="flex items-center justify-between gap-4">
+                                <span className="font-semibold">Secure Cloud обнаружил подозрительную активность</span>
+                                <button
+                                    type="button"
+                                    onClick={() => secureCloud.roomId && secureCloud.onDismissAlert(secureCloud.roomId)}
+                                    className="text-xs uppercase tracking-wide text-amber-700/80 hover:text-amber-700"
+                                    disabled={!secureCloud.roomId}
+                                >
+                                    Очистить всё
+                                </button>
+                            </div>
+                            <ul className="space-y-2 max-h-40 overflow-auto pr-1">
+                                {secureCloud.alerts.map(alert => (
+                                    <li key={alert.eventId} className="flex items-start justify-between gap-3 text-xs text-amber-700/90">
+                                        <div className="flex-1 min-w-0">
+                                            <div className="flex items-center gap-2">
+                                                <span className="font-medium truncate">{alert.sender}</span>
+                                                <span className="text-[10px] uppercase tracking-wide">Риск {Math.round(alert.riskScore * 100)}%</span>
+                                            </div>
+                                            <p className="mt-1 break-words text-text-primary/90">{alert.summary || 'Без текста'}</p>
+                                        </div>
+                                        <button
+                                            type="button"
+                                            onClick={() => secureCloud.onDismissAlert(alert.roomId, alert.eventId)}
+                                            className="text-[10px] uppercase tracking-wide text-amber-700/70 hover:text-amber-700"
+                                        >
+                                            Скрыть
+                                        </button>
+                                    </li>
+                                ))}
+                            </ul>
+                        </div>
+                    ) : null}
+                </div>
+            )}
+
+            {verification.requests.length > 0 && (
+                <div className="px-4 pt-3">
+                    <div className="rounded-md border border-emerald-300/40 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-800 space-y-2">
+                        <div className="font-semibold">Запросы подтверждения устройств</div>
+                        <ul className="space-y-2">
+                            {verification.requests.map((req, idx) => (
+                                <li key={idx} className="flex items-center justify-between gap-4">
+                                    <span className="truncate">{String((req as any)?.sender?.userId || (req as any)?.getInitiator?.()?.userId || 'неизвестный пользователь')}</span>
+                                    <div className="flex items-center gap-2">
+                                        <button
+                                            type="button"
+                                            onClick={() => verification.onAccept(req)}
+                                            className="px-2 py-1 rounded-md border border-emerald-500/40 text-emerald-800 text-xs"
+                                        >
+                                            Начать проверку
+                                        </button>
+                                        <button
+                                            type="button"
+                                            onClick={() => verification.onDecline(req)}
+                                            className="px-2 py-1 rounded-md border border-neutral-400/60 text-neutral-700 text-xs"
+                                        >
+                                            Отклонить
+                                        </button>
+                                    </div>
+                                </li>
+                            ))}
+                        </ul>
+                    </div>
+                </div>
+            )}
+
+            <MessageView
+                messages={messages}
+                client={client}
+                onReaction={onReaction}
+                onEditMessage={onEditMessage}
+                onDeleteMessage={onDeleteMessage}
+                onSetReplyTo={onSetReplyTo}
+                onForwardMessage={onForwardMessage}
+                onImageClick={onImageClick}
+                onOpenThread={onOpenThread}
+                onPollVote={onPollVote}
+                onTranslateMessage={onTranslateMessage}
+                translatedMessages={translatedMessages}
+                scrollContainerRef={scrollContainerRef}
+                onScroll={onScroll}
+                onPaginate={onPaginate}
+                isPaginating={isPaginating}
+                canPaginate={canPaginate}
+                pinnedEventIds={pinnedEventIds}
+                canPin={canPin}
+                onPinToggle={onPinToggle}
+                highlightedMessageId={highlightedMessageId}
+                pendingMessages={pendingMessages}
+                pendingQueue={pendingQueue}
+                onRetryPending={onRetryPending}
+                onCancelPending={onCancelPending}
+            />
+
+            {showScrollToBottom && (
+                <button
+                    onClick={onScrollToBottom}
+                    className="absolute bottom-24 right-8 bg-accent text-text-inverted rounded-full h-12 w-12 flex items-center justify-center shadow-lg hover:bg-accent-hover transition"
+                    aria-label="Scroll to bottom"
+                >
+                    <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 14l-7 7m0 0l-7-7m7 7V3" />
+                    </svg>
+                </button>
+            )}
+        </>
+    );
+};
+
+const ChatComposerSection: React.FC<ChatComposerSectionProps> = ({ composer }) => {
+    const {
+        onSendMessage,
+        onSendFile,
+        onSendAudio,
+        onSendVideo,
+        onSendSticker,
+        onSendGif,
+        onOpenCreatePoll,
+        onSchedule,
+        isSending,
+        client,
+        roomId,
+        replyingTo,
+        onCancelReply,
+        roomMembers,
+        draftContent,
+        onDraftChange,
+        isOffline,
+        sendKeyBehavior,
+        pendingQueue,
+        onRetryPending,
+        onCancelPending,
+    } = composer;
+
+    return (
+        <MessageComposer
+            onSendMessage={onSendMessage}
+            onSendFile={onSendFile}
+            onSendAudio={onSendAudio}
+            onSendVideo={onSendVideo}
+            onSendSticker={onSendSticker}
+            onSendGif={onSendGif}
+            onOpenCreatePoll={onOpenCreatePoll}
+            onSchedule={onSchedule}
+            isSending={isSending}
+            client={client}
+            roomId={roomId}
+            replyingTo={replyingTo}
+            onCancelReply={onCancelReply}
+            roomMembers={roomMembers}
+            draftContent={draftContent}
+            onDraftChange={onDraftChange}
+            isOffline={isOffline}
+            sendKeyBehavior={sendKeyBehavior}
+            pendingQueue={pendingQueue}
+            onRetryPending={onRetryPending}
+            onCancelPending={onCancelPending}
+        />
+    );
+};
+
+const ChatSidePanels: React.FC<ChatSidePanelsProps> = ({
+    thread,
+    settings,
+    createRoom,
+    createPoll,
+    manageFolders,
+    schedule,
+    scheduledList,
+    hiddenRooms,
+    invite,
+    forwarding,
+    mediaViewer,
+    search,
+    plugins,
+    sharedMedia,
+    groupCall,
+    calls,
+    groupCallPermission,
+}) => {
+    return (
+        <>
+            {thread.activeThread && thread.selectedRoomId && (
+                <ThreadView
+                    room={thread.client.getRoom(thread.selectedRoomId)!}
+                    activeThread={thread.activeThread}
+                    onClose={thread.onCloseThread}
+                    client={thread.client}
+                    onSendMessage={thread.onSendMessage}
+                    onImageClick={thread.onImageClick}
+                    sendKeyBehavior={thread.sendKeyBehavior}
+                />
+            )}
+
+            {settings.isOpen && (
+                <SettingsModal
+                    isOpen={settings.isOpen}
+                    onClose={settings.onClose}
+                    onSave={settings.onSave}
+                    client={settings.client}
+                    notificationsEnabled={settings.notificationsEnabled}
+                    onSetNotificationsEnabled={settings.onSetNotificationsEnabled}
+                    chatBackground={settings.chatBackground}
+                    onSetChatBackground={settings.onSetChatBackground}
+                    onResetChatBackground={settings.onResetChatBackground}
+                    sendKeyBehavior={settings.sendKeyBehavior}
+                    onSetSendKeyBehavior={settings.onSetSendKeyBehavior}
+                    isPresenceHidden={settings.isPresenceHidden}
+                    onSetPresenceHidden={settings.onSetPresenceHidden}
+                    presenceRestricted={settings.presenceRestricted}
+                    animatedReactionsEnabled={settings.animatedReactionsEnabled}
+                    onSetAnimatedReactionsEnabled={settings.onSetAnimatedReactionsEnabled}
+                />
+            )}
+
+            {createRoom.isOpen && (
+                <CreateRoomModal
+                    isOpen={createRoom.isOpen}
+                    onClose={createRoom.onClose}
+                    onCreate={createRoom.onCreate}
+                />
+            )}
+
+            {createPoll.isOpen && (
+                <CreatePollModal
+                    isOpen={createPoll.isOpen}
+                    onClose={createPoll.onClose}
+                    onCreate={createPoll.onCreate}
+                />
+            )}
+
+            {manageFolders.isOpen && (
+                <ManageFoldersModal
+                    isOpen={manageFolders.isOpen}
+                    onClose={manageFolders.onClose}
+                    onSave={manageFolders.onSave}
+                    initialFolders={manageFolders.initialFolders}
+                    allRooms={manageFolders.rooms}
+                />
+            )}
+
+            {schedule.isOpen && (
+                <ScheduleMessageModal
+                    isOpen={schedule.isOpen}
+                    onClose={schedule.onClose}
+                    onConfirm={schedule.onConfirm}
+                    messageContent={schedule.content}
+                />
+            )}
+
+            {scheduledList.isOpen && (
+                <ViewScheduledMessagesModal
+                    isOpen={scheduledList.isOpen}
+                    onClose={scheduledList.onClose}
+                    messages={scheduledList.messages}
+                    onDelete={scheduledList.onDelete}
+                    onSendNow={scheduledList.onSendNow}
+                    onUpdate={scheduledList.onUpdate}
+                    onBulkReschedule={scheduledList.onBulkReschedule}
+                    onBulkSend={scheduledList.onBulkSend}
+                />
+            )}
+
+            {hiddenRooms.isPromptOpen && (
+                <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
+                    <div className="bg-bg-primary rounded-lg shadow-xl w-full max-w-sm p-6 space-y-4">
+                        <h3 className="text-lg font-semibold text-text-primary">Введите PIN для скрытых комнат</h3>
+                        {hiddenRooms.pinError && (
+                            <div className="text-sm text-red-400 bg-red-400/10 border border-red-400/40 rounded-md px-3 py-2">
+                                {hiddenRooms.pinError}
+                            </div>
+                        )}
+                        <input
+                            type="password"
+                            value={hiddenRooms.pinInput}
+                            onChange={(event) => hiddenRooms.onPinInputChange(event.target.value)}
+                            className="w-full rounded-md border border-border-secondary bg-bg-secondary px-3 py-2 text-text-primary focus:border-accent focus:outline-none"
+                            placeholder="Введите PIN"
+                        />
+                        <div className="flex items-center justify-between">
+                            <button
+                                type="button"
+                                onClick={hiddenRooms.onCancel}
+                                className="px-3 py-2 text-sm text-text-secondary hover:text-text-primary"
+                            >
+                                Отмена
+                            </button>
+                            {hiddenRooms.appLockEnabled && hiddenRooms.biometricEnabled && hiddenRooms.onUnlockBiometric && (
+                                <button
+                                    type="button"
+                                    onClick={hiddenRooms.onUnlockBiometric}
+                                    className="px-3 py-2 text-sm bg-purple-500/20 text-purple-200 rounded-md hover:bg-purple-500/30"
+                                >
+                                    Биометрия
+                                </button>
+                            )}
+                            <button
+                                type="button"
+                                onClick={hiddenRooms.onUnlockPin}
+                                className="px-3 py-2 text-sm bg-accent text-text-inverted rounded-md hover:bg-accent/90"
+                            >
+                                Разблокировать
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {invite.isOpen && (
+                <InviteUserModal
+                    isOpen={invite.isOpen}
+                    onClose={invite.onClose}
+                    onInvite={invite.onInvite}
+                    roomName={invite.roomName}
+                />
+            )}
+
+            {forwarding.message && (
+                <ForwardMessageModal
+                    isOpen={Boolean(forwarding.message)}
+                    onClose={forwarding.onClose}
+                    onForward={forwarding.onForward}
+                    rooms={forwarding.rooms.filter(room => room.roomId !== forwarding.currentRoomId)}
+                    message={forwarding.message}
+                    client={forwarding.client}
+                    savedMessagesRoom={forwarding.savedMessagesRoom || null}
+                />
+            )}
+
+            {mediaViewer.imageUrl && (
+                <ImageViewerModal
+                    imageUrl={mediaViewer.imageUrl}
+                    onClose={mediaViewer.onClose}
+                />
+            )}
+
+            {search.isOpen && (
+                <SearchModal
+                    isOpen={search.isOpen}
+                    onClose={search.onClose}
+                    client={search.client}
+                    rooms={search.rooms}
+                    onSelectResult={search.onSelectResult}
+                />
+            )}
+
+            <PluginCatalogModal
+                isOpen={plugins.isOpen}
+                onClose={plugins.onClose}
+            />
+
+            <SharedMediaPanel
+                isOpen={sharedMedia.isOpen}
+                onClose={sharedMedia.onClose}
+                data={sharedMedia.data}
+                isLoading={sharedMedia.isLoading}
+                isPaginating={sharedMedia.isPaginating}
+                onLoadMore={sharedMedia.onLoadMore}
+                currentUserId={sharedMedia.currentUserId}
+            />
+
+            {groupCall.activeGroupCall && (
+                <CallView
+                    call={null}
+                    client={groupCall.client}
+                    onHangup={groupCall.onHangup}
+                    participants={groupCall.participantViews}
+                    layout={groupCall.activeGroupCall.layout}
+                    onLayoutChange={groupCall.onLayoutChange}
+                    showParticipantsPanel={groupCall.showParticipantsPanel}
+                    onToggleParticipantsPanel={groupCall.onToggleParticipantsPanel}
+                    onToggleScreenshare={groupCall.onToggleScreenshare}
+                    onToggleLocalMute={groupCall.onToggleMute}
+                    onToggleLocalVideo={groupCall.onToggleVideo}
+                    isScreensharing={groupCall.activeGroupCall.isScreensharing}
+                    isMuted={groupCall.activeGroupCall.isMuted}
+                    isVideoMuted={groupCall.activeGroupCall.isVideoMuted}
+                    onToggleCoWatch={groupCall.onToggleCoWatch}
+                    coWatchActive={groupCall.activeGroupCall.coWatchActive}
+                    headerTitle={groupCall.client.getRoom(groupCall.activeGroupCall.roomId)?.name || undefined}
+                    onMuteParticipant={groupCall.onMuteParticipant}
+                    onVideoParticipantToggle={groupCall.onVideoParticipantToggle}
+                    onRemoveParticipant={groupCall.onRemoveParticipant}
+                    onPromotePresenter={groupCall.onPromotePresenter}
+                    onSpotlightParticipant={groupCall.onSpotlightParticipant}
+                    localUserId={groupCall.localUserId}
+                    canModerateParticipants={groupCall.canModerateParticipants}
+                />
+            )}
+
+            {calls.activeCall && (
+                <CallView call={calls.activeCall} onHangup={() => calls.onHangup(false)} client={calls.client} />
+            )}
+
+            {calls.incomingCall && (
+                <IncomingCallModal
+                    call={calls.incomingCall}
+                    onAccept={calls.onAccept}
+                    onDecline={calls.onDecline}
+                    client={calls.client}
+                />
+            )}
+
+            {groupCallPermission.error && (
+                <div className="fixed bottom-6 right-6 bg-red-600 text-white px-4 py-2 rounded-lg shadow-lg z-50 flex items-center gap-3">
+                    <span>{groupCallPermission.error}</span>
+                    <button
+                        type="button"
+                        className="text-sm font-semibold uppercase tracking-wide"
+                        onClick={groupCallPermission.onDismiss}
+                    >
+                        Закрыть
+                    </button>
+                </div>
+            )}
+        </>
+    );
+};
 
 const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, savedMessagesRoomId: savedRoomIdProp }) => {
     const activeRuntime = useAccountStore(state => (state.activeKey ? state.accounts[state.activeKey] : null));
@@ -129,6 +932,7 @@ const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, s
     const [isViewScheduledModalOpen, setIsViewScheduledModalOpen] = useState(false);
     const [contentToSchedule, setContentToSchedule] = useState<DraftContent | null>(null);
     const [allScheduledMessages, setAllScheduledMessages] = useState<ScheduledMessage[]>([]);
+    const [animatedReactionsEnabled, setAnimatedReactionsEnabledState] = useState<boolean>(() => isAnimatedReactionsEnabled());
     const [userProfileVersion, setUserProfileVersion] = useState(0); // Used to force-refresh components
     const [isPaginating, setIsPaginating] = useState(false);
     const [canPaginate, setCanPaginate] = useState(true);
@@ -254,8 +1058,13 @@ const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, s
     });
     const [isOffline, setIsOffline] = useState(false);
     const [isSearchOpen, setIsSearchOpen] = useState(false);
+    const [verificationRequests, setVerificationRequests] = useState<any[]>([]);
     const [secureCloudAlerts, setSecureCloudAlerts] = useState<Record<string, SuspiciousEventNotice[]>>({});
     const [secureCloudError, setSecureCloudError] = useState<string | null>(null);
+    const [secureCloudProfile, setSecureCloudProfile] = useState<SecureCloudProfile | null>(() => {
+        const profile = getSecureCloudProfileForClient(client);
+        return profile ? normaliseSecureCloudProfile(profile) : null;
+    });
     const [isSecureCloudActive, setIsSecureCloudActive] = useState(false);
     const [isSharedMediaOpen, setIsSharedMediaOpen] = useState(false);
     const [sharedMediaData, setSharedMediaData] = useState<RoomMediaSummary | null>(null);
@@ -274,6 +1083,8 @@ const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, s
     const [pinError, setPinError] = useState<string | null>(null);
     const [pendingHiddenRoomId, setPendingHiddenRoomId] = useState<string | null>(null);
     const [hiddenRoomIds, setHiddenRoomIds] = useState<string[]>([]);
+    const [highlightedMessage, setHighlightedMessage] = useState<{ roomId: string; eventId: string } | null>(null);
+    const [pendingScrollTarget, setPendingScrollTarget] = useState<{ roomId: string; eventId: string } | null>(null);
     const normalizeAttachments = (attachments: unknown): DraftAttachment[] => {
         if (!Array.isArray(attachments)) return [];
 
@@ -675,11 +1486,14 @@ const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, s
             setIsSecureCloudActive(false);
             setSecureCloudAlerts({});
             setDetectorStatuses({});
+            setSecureCloudProfile(null);
             secureSessionRef.current?.stop();
             secureSessionRef.current = null;
             return;
         }
 
+        const normalisedProfile = normaliseSecureCloudProfile(profile);
+        setSecureCloudProfile(normalisedProfile);
         setSecureCloudProfileForClient(client, normalisedProfile);
         setIsSecureCloudActive(true);
         setSecureCloudError(null);
@@ -801,6 +1615,8 @@ const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, s
         setupNotificationListeners();
     }, []);
 
+    useEffect(() => onAnimatedReactionsPreferenceChange(setAnimatedReactionsEnabledState), []);
+
     useEffect(() => {
         const handleShortcut = (event: KeyboardEvent) => {
             if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
@@ -828,28 +1644,28 @@ const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, s
                     setAllScheduledMessages(messages);
                 }
             } catch (error) {
-                console.error('Failed to load scheduled messages from account data', error);
+                console.error('Failed to load scheduled messages from state events', error);
             }
         };
 
         void loadScheduled();
 
-        const handleAccountData = (event: MatrixEvent) => {
+        const handleStateEvent = (event: MatrixEvent) => {
             if (event.getType() !== SCHEDULED_MESSAGES_EVENT_TYPE) {
                 return;
             }
 
-            const messages = parseScheduledMessagesFromEvent(event);
+            const messages = applyScheduledMessagesEvent(client, event);
             if (isMounted) {
                 setAllScheduledMessages(messages);
             }
         };
 
-        client.on(ClientEvent.AccountData, handleAccountData);
+        client.on(RoomEvent.State, handleStateEvent);
 
         return () => {
             isMounted = false;
-            client.removeListener(ClientEvent.AccountData, handleAccountData);
+            client.removeListener(RoomEvent.State, handleStateEvent);
         };
     }, [client]);
 
@@ -1101,6 +1917,10 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
         setChatBackground('');
         localStorage.removeItem('matrix-chat-bg');
     };
+
+    const handleAnimatedReactionsToggle = useCallback((enabled: boolean) => {
+        persistAnimatedReactionsEnabled(enabled);
+    }, []);
 
     const handleSendKeyBehaviorChange = useCallback((behavior: SendKeyBehavior) => {
         setSendKeyBehavior(behavior);
@@ -2703,6 +3523,238 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
         });
     }, [rooms, client, currentUserId]);
 
+    const detectorStates = secureCloudProfile?.detectors ?? [];
+
+    const timelineProps: ChatTimelineSectionProps = {
+        secureCloud: {
+            isActive: isSecureCloudActive,
+            error: secureCloudError,
+            detectors: detectorStates,
+            formatStatus: formatDetectorStatus,
+            onClearError: () => setSecureCloudError(null),
+            onToggleDetector: handleToggleDetector,
+            onUpdateDetectorConfig: handleUpdateDetectorConfig,
+            alerts: activeRoomAlerts,
+            roomId: selectedRoomId,
+            onDismissAlert: handleDismissSecureAlert,
+        },
+        verification: {
+            requests: verificationRequests,
+            onAccept: handleAcceptVerification,
+            onDecline: handleDeclineVerification,
+        },
+        messageView: {
+            messages,
+            client,
+            onReaction: handleReaction,
+            onEditMessage: handleEditMessage,
+            onDeleteMessage: handleDeleteMessage,
+            onSetReplyTo: setReplyingTo,
+            onForwardMessage: handleOpenForwardModal,
+            onImageClick: setViewingImageUrl,
+            onOpenThread: handleOpenThread,
+            onPollVote: handlePollVote,
+            onTranslateMessage: handleTranslateMessage,
+            translatedMessages,
+            scrollContainerRef,
+            onScroll: handleScroll,
+            onPaginate: handlePaginate,
+            isPaginating,
+            canPaginate,
+            pinnedEventIds,
+            canPin,
+            onPinToggle: handlePinToggle,
+            highlightedMessageId: highlightedMessage?.roomId === selectedRoomId ? highlightedMessage.eventId : null,
+            pendingMessages,
+            pendingQueue: pendingQueueForRoom,
+            onRetryPending: handleRetryPending,
+            onCancelPending: handleCancelPending,
+        },
+        showScrollToBottom,
+        onScrollToBottom: () => scrollToBottom(),
+    };
+
+    const composerProps: ChatComposerSectionProps = {
+        composer: {
+            onSendMessage: handleSendMessage,
+            onSendFile: handleSendFile,
+            onSendAudio: handleSendAudio,
+            onSendVideo: handleSendVideo,
+            onSendSticker: handleSendSticker,
+            onSendGif: handleSendGif,
+            onOpenCreatePoll: () => setIsCreatePollOpen(true),
+            onSchedule: handleOpenScheduleModal,
+            isSending,
+            client,
+            roomId: selectedRoomId,
+            replyingTo,
+            onCancelReply: () => setReplyingTo(null),
+            roomMembers,
+            draftContent: selectedRoomId ? drafts[selectedRoomId] ?? null : null,
+            onDraftChange: handleActiveDraftChange,
+            isOffline,
+            sendKeyBehavior,
+            pendingQueue: pendingQueueForRoom,
+            onRetryPending: handleRetryPending,
+            onCancelPending: handleCancelPending,
+        },
+    };
+
+    const handleHiddenPromptClose = useCallback(() => {
+        setIsPinPromptOpen(false);
+        setPinInput('');
+        setPinError(null);
+        setPendingHiddenRoomId(null);
+    }, []);
+
+    const sidePanelsProps: ChatSidePanelsProps = {
+        thread: {
+            activeThread,
+            selectedRoomId,
+            onCloseThread: handleCloseThread,
+            client,
+            onSendMessage: handleSendMessage,
+            onImageClick: setViewingImageUrl,
+            sendKeyBehavior,
+        },
+        settings: {
+            isOpen: isSettingsOpen,
+            onClose: () => setIsSettingsOpen(false),
+            onSave: handleSaveSettings,
+            client,
+            notificationsEnabled,
+            onSetNotificationsEnabled: setNotificationsEnabled,
+            chatBackground,
+            onSetChatBackground: handleSetChatBackground,
+            onResetChatBackground: handleResetChatBackground,
+            sendKeyBehavior,
+            onSetSendKeyBehavior: handleSendKeyBehaviorChange,
+            isPresenceHidden,
+            onSetPresenceHidden: setIsPresenceHidden,
+            presenceRestricted: hasPresenceRestriction,
+            animatedReactionsEnabled,
+            onSetAnimatedReactionsEnabled: handleAnimatedReactionsToggle,
+        },
+        createRoom: {
+            isOpen: isCreateRoomOpen,
+            onClose: () => setIsCreateRoomOpen(false),
+            onCreate: handleCreateRoom,
+        },
+        createPoll: {
+            isOpen: isCreatePollOpen,
+            onClose: () => setIsCreatePollOpen(false),
+            onCreate: handleCreatePoll,
+        },
+        manageFolders: {
+            isOpen: isManageFoldersOpen,
+            onClose: () => setIsManageFoldersOpen(false),
+            onSave: handleSaveFolders,
+            initialFolders: folders,
+            rooms,
+        },
+        schedule: {
+            isOpen: isScheduleModalOpen,
+            onClose: () => setIsScheduleModalOpen(false),
+            onConfirm: handleConfirmSchedule,
+            content: contentToSchedule,
+        },
+        scheduledList: {
+            isOpen: isViewScheduledModalOpen,
+            onClose: () => setIsViewScheduledModalOpen(false),
+            messages: scheduledForThisRoom,
+            onDelete: handleDeleteScheduled,
+            onSendNow: handleSendScheduledNow,
+            onUpdate: handleUpdateScheduled,
+            onBulkReschedule: handleBulkReschedule,
+            onBulkSend: handleBulkSendScheduled,
+        },
+        hiddenRooms: {
+            isPromptOpen: isPinPromptOpen,
+            pinInput,
+            onPinInputChange: (value: string) => {
+                setPinInput(value);
+                setPinError(null);
+            },
+            pinError,
+            onCancel: handleHiddenPromptClose,
+            onUnlockBiometric: appLockState.biometricEnabled ? handleUnlockByBiometric : undefined,
+            onUnlockPin: handleUnlockByPin,
+            appLockEnabled: appLockState.enabled,
+            biometricEnabled: appLockState.biometricEnabled,
+        },
+        invite: {
+            isOpen: isInviteUserOpen,
+            onClose: () => setIsInviteUserOpen(false),
+            onInvite: handleInviteUser,
+            roomName: selectedRoom?.name,
+        },
+        forwarding: {
+            message: forwardingMessage,
+            onClose: () => setForwardingMessage(null),
+            onForward: handleConfirmForward,
+            rooms,
+            client,
+            savedMessagesRoom,
+            currentRoomId: selectedRoomId,
+        },
+        mediaViewer: {
+            imageUrl: viewingImageUrl,
+            onClose: () => setViewingImageUrl(null),
+        },
+        search: {
+            isOpen: isSearchOpen,
+            onClose: () => setIsSearchOpen(false),
+            client,
+            rooms,
+            onSelectResult: handleJumpToSearchResult,
+        },
+        plugins: {
+            isOpen: isPluginCatalogOpen,
+            onClose: () => setIsPluginCatalogOpen(false),
+        },
+        sharedMedia: {
+            isOpen: isSharedMediaOpen,
+            onClose: () => setIsSharedMediaOpen(false),
+            data: sharedMediaData,
+            isLoading: isSharedMediaLoading,
+            isPaginating: isSharedMediaPaginating,
+            onLoadMore: sharedMediaData?.hasMore ? handleLoadMoreMedia : undefined,
+            currentUserId: client.getUserId() || undefined,
+        },
+        groupCall: {
+            activeGroupCall,
+            participantViews,
+            showParticipantsPanel,
+            onToggleParticipantsPanel: () => setShowParticipantsPanel(prev => !prev),
+            onLayoutChange: handleLayoutChange,
+            onToggleScreenshare: handleToggleScreenShare,
+            onToggleMute: handleGroupMuteToggle,
+            onToggleVideo: handleGroupVideoToggle,
+            onToggleCoWatch: handleToggleCoWatch,
+            onMuteParticipant: handleMuteParticipant,
+            onVideoParticipantToggle: handleVideoParticipantToggle,
+            onRemoveParticipant: handleRemoveParticipant,
+            onPromotePresenter: handlePromotePresenter,
+            onSpotlightParticipant: handleSpotlightParticipant,
+            localUserId: client.getUserId() || undefined,
+            canModerateParticipants: canStartGroupCall,
+            client,
+            onHangup: handleCloseGroupCall,
+        },
+        calls: {
+            activeCall,
+            incomingCall,
+            onHangup: handleHangupCall,
+            onAccept: handleAnswerCall,
+            onDecline: () => handleHangupCall(true),
+            client,
+        },
+        groupCallPermission: {
+            error: groupCallPermissionError,
+            onDismiss: () => setGroupCallPermissionError(null),
+        },
+    };
+
     return (
         <div className="flex h-screen">
             <RoomList
@@ -2772,491 +3824,13 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
                             presenceSummary={selectedRoomPresence}
                             presenceHidden={isPresenceHidden}
                         />
-                        {isSecureCloudActive && (
-                            <div className="px-4 pt-3 space-y-3">
-                                {secureCloudError && (
-                                    <div className="rounded-md border border-red-500/60 bg-red-500/10 px-3 py-2 text-sm text-red-600 flex items-start justify-between gap-4">
-                                        <span>Secure Cloud: {secureCloudError}</span>
-                                        <button
-                                            type="button"
-                                            onClick={() => setSecureCloudError(null)}
-                                            className="text-xs font-semibold uppercase tracking-wide text-red-600/80 hover:text-red-600"
-                                        >
-                                            Скрыть
-                                        </button>
-                                    </div>
-                                )}
-                                {detectorStates.length > 0 && (
-                                    <div className="rounded-md border border-neutral-500/40 bg-neutral-900/40 px-3 py-2 text-xs text-neutral-100 space-y-2">
-                                        <div className="flex items-center justify-between">
-                                            <span className="font-semibold text-sm">Детекторы Secure Cloud</span>
-                                        </div>
-                                        <ul className="space-y-2">
-                                            {detectorStates.map(state => {
-                                                const mergedConfig: SecureCloudDetectorConfig = {
-                                                    ...(state.detector.defaultConfig ?? {}),
-                                                    ...(state.config ?? {}),
-                                                };
-                                                const derivedThreshold = typeof mergedConfig.threshold === 'number'
-                                                    ? mergedConfig.threshold
-                                                    : typeof state.detector.defaultConfig?.threshold === 'number'
-                                                        ? state.detector.defaultConfig.threshold
-                                                        : 0.6;
-                                                const thresholdValue = Number.isFinite(derivedThreshold)
-                                                    ? Math.min(0.95, Math.max(0.2, derivedThreshold))
-                                                    : 0.6;
-                                                const languageValue = typeof mergedConfig.language === 'string'
-                                                    ? mergedConfig.language
-                                                    : 'auto';
-                                                const configDisabled = !state.enabled && !state.detector.required;
-                                                const showThresholdControl = state.detector.defaultConfig?.threshold !== undefined
-                                                    || typeof state.config?.threshold === 'number';
-                                                const showLanguageControl = state.detector.defaultConfig?.language !== undefined
-                                                    || typeof state.config?.language === 'string';
-
-                                                return (
-                                                    <li key={state.detector.id} className="flex flex-col gap-2">
-                                                        <div className="flex items-start justify-between gap-3">
-                                                            <div className="flex-1 min-w-0">
-                                                                <div className="flex items-center gap-2">
-                                                                    <span className="font-medium text-sm text-neutral-100">{state.detector.displayName}</span>
-                                                                    {state.detector.required && (
-                                                                        <span className="text-[10px] uppercase tracking-wide text-emerald-400/80">обязательный</span>
-                                                                    )}
-                                                                </div>
-                                                                {state.detector.description && (
-                                                                    <p className="text-[11px] text-neutral-400 mt-0.5">{state.detector.description}</p>
-                                                                )}
-                                                                <p className="text-[10px] text-neutral-500 mt-1">{formatDetectorStatus(state)}</p>
-                                                            </div>
-                                                            <label className="flex items-center gap-2 text-[11px] text-neutral-300">
-                                                                <input
-                                                                    type="checkbox"
-                                                                    className="h-4 w-4 rounded border-neutral-500 bg-transparent text-emerald-500 focus:ring-emerald-500"
-                                                                    checked={state.detector.required || state.enabled}
-                                                                    onChange={(event) => handleToggleDetector(state.detector.id, event.target.checked)}
-                                                                    disabled={state.detector.required}
-                                                                />
-                                                                <span className="select-none">{state.detector.required ? 'Всегда' : state.enabled ? 'Вкл.' : 'Выкл.'}</span>
-                                                            </label>
-                                                        </div>
-                                                        {(showThresholdControl || showLanguageControl) && (
-                                                            <div className="pl-1 space-y-2">
-                                                                {showThresholdControl && (
-                                                                    <div>
-                                                                        <div className="flex items-center justify-between text-[11px] text-neutral-400">
-                                                                            <span>Порог срабатывания</span>
-                                                                            <span>{Math.round(thresholdValue * 100)}%</span>
-                                                                        </div>
-                                                                        <input
-                                                                            type="range"
-                                                                            min="0.2"
-                                                                            max="0.95"
-                                                                            step="0.01"
-                                                                            value={thresholdValue}
-                                                                            onChange={(event) => {
-                                                                                const value = Number(event.target.value);
-                                                                                if (!Number.isNaN(value)) {
-                                                                                    handleUpdateDetectorConfig(state.detector.id, { threshold: value });
-                                                                                }
-                                                                            }}
-                                                                            disabled={configDisabled}
-                                                                            className="w-full mt-1 accent-emerald-500"
-                                                                        />
-                                                                    </div>
-                                                                )}
-                                                                {showLanguageControl && (
-                                                                    <div>
-                                                                        <label className="block text-[11px] text-neutral-400 mb-1">Язык модели</label>
-                                                                        <select
-                                                                            value={languageValue}
-                                                                            onChange={(event) => handleUpdateDetectorConfig(state.detector.id, { language: event.target.value })}
-                                                                            disabled={configDisabled}
-                                                                            className="w-full rounded border border-neutral-600 bg-neutral-900/80 px-2 py-1 text-[11px] text-neutral-200 focus:border-emerald-500 focus:outline-none"
-                                                                        >
-                                                                            <option value="auto">Авто</option>
-                                                                            <option value="ru">Русский</option>
-                                                                            <option value="en">English</option>
-                                                                        </select>
-                                                                    </div>
-                                                                )}
-                                                            </div>
-                                                        )}
-                                                    </li>
-                                                );
-                                            })}
-                                        </ul>
-                                    </div>
-                                )}
-                                {activeRoomAlerts.length > 0 ? (
-                                    <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-700 space-y-2">
-                                        <div className="flex items-center justify-between gap-4">
-                                            <span className="font-semibold">Secure Cloud обнаружил подозрительную активность</span>
-                                            <button
-                                                type="button"
-                                                onClick={() => selectedRoomId && handleDismissSecureAlert(selectedRoomId)}
-                                                className="text-xs uppercase tracking-wide text-amber-700/80 hover:text-amber-700"
-                                            >
-                                                Очистить всё
-                                            </button>
-                                        </div>
-                                        <ul className="space-y-2 max-h-40 overflow-auto pr-1">
-                                            {activeRoomAlerts.map(alert => (
-                                                <li key={alert.eventId} className="flex items-start justify-between gap-3 text-xs text-amber-700/90">
-                                                    <div className="flex-1 min-w-0">
-                                                        <div className="flex items-center gap-2">
-                                                            <span className="font-medium truncate">{alert.sender}</span>
-                                                            <span className="text-[10px] uppercase tracking-wide">Риск {Math.round(alert.riskScore * 100)}%</span>
-                                                        </div>
-                                                        <p className="mt-1 break-words text-text-primary/90">{alert.summary || 'Без текста'}</p>
-                                                    </div>
-                                                    <button
-                                                        type="button"
-                                                        onClick={() => handleDismissSecureAlert(alert.roomId, alert.eventId)}
-                                                        className="text-[10px] uppercase tracking-wide text-amber-700/70 hover:text-amber-700"
-                                                    >
-                                                        Скрыть
-                                                    </button>
-                                                </li>
-                                            ))}
-                                        </ul>
-                                    </div>
-                                ) : (
-                                    !secureCloudError && (
-                                        <div className="rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-700">
-                                            Secure Cloud активен. Мониторинг незашифрованных комнат выполняется локально.
-                                        </div>
-                                    )
-                                )}
-                            </div>
-                        )}
-                        
-                        {/* ===== E2EE banners ===== */}
-                        {isKeyBackupEnabled === false && (
-                            <div className="px-4 pt-3">
-                                <div className="rounded-md border border-blue-300/40 bg-blue-500/10 px-3 py-2 text-sm text-blue-800 flex items-center justify-between gap-4">
-                                    <span>Резервное копирование ключей отключено. Включите, чтобы восстановить историю при смене устройства.</span>
-                                    <button
-                                        type="button"
-                                        onClick={handleEnableKeyBackup}
-                                        className="text-xs font-semibold uppercase tracking-wide text-blue-800/80 hover:text-blue-900"
-                                    >
-                                        Включить
-                                    </button>
-                                </div>
-                            </div>
-                        )}
-                        {verificationRequests.length > 0 && (
-                            <div className="px-4 pt-3">
-                                <div className="rounded-md border border-emerald-300/40 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-800 space-y-2">
-                                    <div className="font-semibold">Запросы подтверждения устройств</div>
-                                    <ul className="space-y-2">
-                                        {verificationRequests.map((req, idx) => (
-                                            <li key={idx} className="flex items-center justify-between gap-4">
-                                                <span className="truncate">{String(req?.sender?.userId || req?.getInitiator?.()?.userId || 'неизвестный пользователь')}</span>
-                                                <div className="flex items-center gap-2">
-                                                    <button
-                                                        type="button"
-                                                        onClick={() => handleAcceptVerification(req)}
-                                                        className="px-2 py-1 rounded-md border border-emerald-500/40 text-emerald-800 text-xs"
-                                                    >
-                                                        Начать проверку
-                                                    </button>
-                                                    <button
-                                                        type="button"
-                                                        onClick={() => handleDeclineVerification(req)}
-                                                        className="px-2 py-1 rounded-md border border-neutral-400/60 text-neutral-700 text-xs"
-                                                    >
-                                                        Отклонить
-                                                    </button>
-                                                </div>
-                                            </li>
-                                        ))}
-                                    </ul>
-                                </div>
-                            </div>
-                        )}
-                        {/* ===== end E2EE banners ===== */}
-                        <MessageView
-                            messages={messages}
-                            client={client}
-                            onReaction={handleReaction}
-                            onEditMessage={handleEditMessage}
-                            onDeleteMessage={handleDeleteMessage}
-                            onSetReplyTo={setReplyingTo}
-                            onForwardMessage={handleOpenForwardModal}
-                            onImageClick={setViewingImageUrl}
-                            onOpenThread={handleOpenThread}
-                            onPollVote={handlePollVote}
-                            onTranslateMessage={handleTranslateMessage}
-                            translatedMessages={translatedMessages}
-                            scrollContainerRef={scrollContainerRef}
-                            onScroll={handleScroll}
-                            onPaginate={handlePaginate}
-                            isPaginating={isPaginating}
-                            canPaginate={canPaginate}
-                            pinnedEventIds={pinnedEventIds}
-                            canPin={canPin}
-                            onPinToggle={handlePinToggle}
-                            highlightedMessageId={highlightedMessage?.roomId === selectedRoomId ? highlightedMessage.eventId : null}
-                            pendingMessages={pendingMessages}
-                            pendingQueue={pendingQueueForRoom}
-                            onRetryPending={handleRetryPending}
-                            onCancelPending={handleCancelPending}
-                        />
-                         {showScrollToBottom && (
-                            <button
-                                onClick={() => scrollToBottom()}
-                                className="absolute bottom-24 right-8 bg-accent text-text-inverted rounded-full h-12 w-12 flex items-center justify-center shadow-lg hover:bg-accent-hover transition"
-                                aria-label="Scroll to bottom"
-                            >
-                                <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 14l-7 7m0 0l-7-7m7 7V3" />
-                                </svg>
-                            </button>
-                        )}
-                            <MessageComposer
-                                onSendMessage={handleSendMessage}
-                                onSendFile={handleSendFile}
-                                onSendAudio={handleSendAudio}
-                                onSendVideo={handleSendVideo}
-                                onSendSticker={handleSendSticker}
-                                onSendGif={handleSendGif}
-                            onOpenCreatePoll={() => setIsCreatePollOpen(true)}
-                            onSchedule={handleOpenScheduleModal}
-                            isSending={isSending}
-                            client={client}
-                            roomId={selectedRoomId}
-                            replyingTo={replyingTo}
-                            onCancelReply={() => setReplyingTo(null)}
-                            roomMembers={roomMembers}
-                            draftContent={selectedRoomId ? drafts[selectedRoomId] ?? null : null}
-                            onDraftChange={handleActiveDraftChange}
-                            isOffline={isOffline}
-                            sendKeyBehavior={sendKeyBehavior}
-                            pendingQueue={pendingQueueForRoom}
-                            onRetryPending={handleRetryPending}
-                            onCancelPending={handleCancelPending}
-                        />
+                        <ChatTimelineSection {...timelineProps} />
+                        <ChatComposerSection {...composerProps} />
                     </>
                 ) : <WelcomeView client={client} />}
             </main>
             
-            {activeThread && selectedRoomId && (
-                <ThreadView
-                    room={client.getRoom(selectedRoomId)!}
-                    activeThread={activeThread}
-                    onClose={handleCloseThread}
-                    client={client}
-                    onSendMessage={handleSendMessage}
-                    onImageClick={setViewingImageUrl}
-                    sendKeyBehavior={sendKeyBehavior}
-                />
-            )}
-
-            {isSettingsOpen && (
-                <SettingsModal
-                    isOpen={isSettingsOpen}
-                    onClose={() => setIsSettingsOpen(false)}
-                    onSave={handleSaveSettings}
-                    client={client}
-                    notificationsEnabled={notificationsEnabled}
-                    onSetNotificationsEnabled={setNotificationsEnabled}
-                    chatBackground={chatBackground}
-                    onSetChatBackground={handleSetChatBackground}
-                    onResetChatBackground={handleResetChatBackground}
-                    sendKeyBehavior={sendKeyBehavior}
-                    onSetSendKeyBehavior={handleSendKeyBehaviorChange}
-                    isPresenceHidden={isPresenceHidden}
-                    onSetPresenceHidden={setIsPresenceHidden}
-                    presenceRestricted={hasPresenceRestriction}
-                />
-            )}
-
-            {isCreateRoomOpen && (
-                <CreateRoomModal
-                    isOpen={isCreateRoomOpen}
-                    onClose={() => setIsCreateRoomOpen(false)}
-                    onCreate={handleCreateRoom}
-                />
-            )}
-             {isCreatePollOpen && (
-                <CreatePollModal
-                    isOpen={isCreatePollOpen}
-                    onClose={() => setIsCreatePollOpen(false)}
-                    onCreate={handleCreatePoll}
-                />
-            )}
-            
-            {isManageFoldersOpen && (
-                <ManageFoldersModal
-                    isOpen={isManageFoldersOpen}
-                    onClose={() => setIsManageFoldersOpen(false)}
-                    onSave={handleSaveFolders}
-                    initialFolders={folders}
-                    allRooms={rooms}
-                />
-            )}
-            
-            {isScheduleModalOpen && (
-                <ScheduleMessageModal
-                    isOpen={isScheduleModalOpen}
-                    onClose={() => setIsScheduleModalOpen(false)}
-                    onConfirm={handleConfirmSchedule}
-                    messageContent={contentToSchedule}
-                />
-            )}
-
-            {isViewScheduledModalOpen && (
-                <ViewScheduledMessagesModal
-                    isOpen={isViewScheduledModalOpen}
-                    onClose={() => setIsViewScheduledModalOpen(false)}
-                    messages={scheduledForThisRoom}
-                    onDelete={handleDeleteScheduled}
-                    onSendNow={handleSendScheduledNow}
-                    onUpdate={handleUpdateScheduled}
-                    onBulkReschedule={handleBulkReschedule}
-                    onBulkSend={handleBulkSendScheduled}
-                />
-            )}
-
-            {isPinPromptOpen && (
-                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
-                    <div className="bg-bg-primary rounded-lg shadow-xl w-full max-w-sm p-6 space-y-4">
-                        <h3 className="text-lg font-semibold text-text-primary">Разблокировать скрытые чаты</h3>
-                        <p className="text-sm text-text-secondary">
-                            Введите PIN, установленный в настройках безопасности, чтобы открыть скрытые беседы.
-                        </p>
-                        <input
-                            type="password"
-                            value={pinInput}
-                            onChange={e => setPinInput(e.target.value.replace(/\D+/g, ''))}
-                            maxLength={12}
-                            inputMode="numeric"
-                            className="w-full bg-bg-secondary text-text-primary px-3 py-2 rounded-md border border-border-primary focus:outline-none focus:ring-1 focus:ring-ring-focus"
-                            placeholder="PIN"
-                        />
-                        {pinError && <p className="text-sm text-red-400">{pinError}</p>}
-                        <div className="flex flex-wrap gap-2 justify-end">
-                            <button
-                                onClick={() => {
-                                    setIsPinPromptOpen(false);
-                                    setPendingHiddenRoomId(null);
-                                    setPinError(null);
-                                }}
-                                className="px-3 py-2 text-sm text-text-secondary hover:text-text-primary"
-                            >
-                                Отмена
-                            </button>
-                            {appLockState.biometricEnabled && (
-                                <button
-                                    onClick={handleUnlockByBiometric}
-                                    className="px-3 py-2 text-sm bg-purple-500/20 text-purple-200 rounded-md hover:bg-purple-500/30"
-                                >
-                                    Биометрия
-                                </button>
-                            )}
-                            <button
-                                onClick={handleUnlockByPin}
-                                className="px-3 py-2 text-sm bg-accent text-text-inverted rounded-md hover:bg-accent/90"
-                            >
-                                Разблокировать
-                            </button>
-                        </div>
-                    </div>
-                </div>
-            )}
-
-            {isInviteUserOpen && selectedRoom && (
-                <InviteUserModal
-                    isOpen={isInviteUserOpen}
-                    onClose={() => setIsInviteUserOpen(false)}
-                    onInvite={handleInviteUser}
-                    roomName={selectedRoom.name}
-                />
-            )}
-
-            {forwardingMessage && (
-                <ForwardMessageModal
-                    isOpen={!!forwardingMessage}
-                    onClose={() => setForwardingMessage(null)}
-                    onForward={handleConfirmForward}
-                    rooms={rooms.filter(r => r.roomId !== selectedRoomId && r.roomId !== savedMessagesRoomId)}
-                    message={forwardingMessage}
-                    client={client}
-                    savedMessagesRoom={savedMessagesRoom || null}
-                />
-            )}
-             {viewingImageUrl && (
-                <ImageViewerModal
-                    imageUrl={viewingImageUrl}
-                    onClose={() => setViewingImageUrl(null)}
-                />
-            )}
-            {isSearchOpen && (
-                <SearchModal
-                    isOpen={isSearchOpen}
-                    onClose={() => setIsSearchOpen(false)}
-                    client={client}
-                    rooms={rooms}
-                    onSelectResult={handleJumpToSearchResult}
-                />
-            )}
-            <PluginCatalogModal
-                isOpen={isPluginCatalogOpen}
-                onClose={() => setIsPluginCatalogOpen(false)}
-            />
-            <SharedMediaPanel
-                isOpen={isSharedMediaOpen}
-                onClose={() => setIsSharedMediaOpen(false)}
-                data={sharedMediaData}
-                isLoading={isSharedMediaLoading}
-                isPaginating={isSharedMediaPaginating}
-                onLoadMore={sharedMediaData?.hasMore ? handleLoadMoreMedia : undefined}
-                currentUserId={client.getUserId() || undefined}
-            />
-            {activeGroupCall && (
-                <CallView
-                    call={null}
-                    client={client}
-                    onHangup={handleCloseGroupCall}
-                    participants={participantViews}
-                    layout={activeGroupCall.layout}
-                    onLayoutChange={handleLayoutChange}
-                    showParticipantsPanel={showParticipantsPanel}
-                    onToggleParticipantsPanel={() => setShowParticipantsPanel(prev => !prev)}
-                    onToggleScreenshare={handleToggleScreenShare}
-                    onToggleLocalMute={handleGroupMuteToggle}
-                    onToggleLocalVideo={handleGroupVideoToggle}
-                    isScreensharing={activeGroupCall.isScreensharing}
-                    isMuted={activeGroupCall.isMuted}
-                    isVideoMuted={activeGroupCall.isVideoMuted}
-                    onToggleCoWatch={handleToggleCoWatch}
-                    coWatchActive={activeGroupCall.coWatchActive}
-                    headerTitle={client.getRoom(activeGroupCall.roomId)?.name || undefined}
-                    onMuteParticipant={handleMuteParticipant}
-                    onVideoParticipantToggle={handleVideoParticipantToggle}
-                    onRemoveParticipant={handleRemoveParticipant}
-                    onPromotePresenter={handlePromotePresenter}
-                    onSpotlightParticipant={handleSpotlightParticipant}
-                    localUserId={client.getUserId() || undefined}
-                    canModerateParticipants={canStartGroupCall}
-                />
-            )}
-            {activeCall && <CallView call={activeCall} onHangup={() => handleHangupCall(false)} client={client} />}
-            {incomingCall && <IncomingCallModal call={incomingCall} onAccept={handleAnswerCall} onDecline={() => handleHangupCall(true)} client={client} />}
-            {groupCallPermissionError && (
-                <div className="fixed bottom-6 right-6 bg-red-600 text-white px-4 py-2 rounded-lg shadow-lg z-50 flex items-center gap-3">
-                    <span>{groupCallPermissionError}</span>
-                    <button
-                        type="button"
-                        className="text-sm font-semibold uppercase tracking-wide"
-                        onClick={() => setGroupCallPermissionError(null)}
-                    >
-                        Закрыть
-                    </button>
-                </div>
-            )}
+            <ChatSidePanels {...sidePanelsProps} />
         </div>
     );
 };

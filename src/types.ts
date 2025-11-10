@@ -205,6 +205,21 @@ export interface DraftContent {
     msgtype?: string;
 }
 
+export interface ScheduledMessageRecurrence {
+  /**
+   * Mode of recurrence. `once` delivers the message a single time. `repeat`
+   * continues to reschedule the message using the provided interval until the
+   * limit conditions are reached.
+   */
+  mode: 'once' | 'repeat';
+  /** Interval in milliseconds between occurrences for `repeat` schedules. */
+  intervalMs?: number;
+  /** Maximum number of deliveries for this schedule (applies to `repeat`). */
+  maxOccurrences?: number;
+  /** UTC timestamp after which no further deliveries should be planned. */
+  untilUtc?: number;
+}
+
 export interface ScheduledMessage {
   id: string;
   roomId: string;
@@ -224,6 +239,12 @@ export interface ScheduledMessage {
   lastError?: string;
   sentAt?: number;
   nextRetryAt?: number;
+  /** Recurrence metadata for repeating schedules. */
+  recurrence?: ScheduledMessageRecurrence;
+  /** Number of completed occurrences for recurring schedules. */
+  occurrencesCompleted?: number;
+  /** Planned UTC timestamp for the next occurrence (if different from `sendAtUtc`). */
+  nextOccurrenceAt?: number;
 }
 
 export interface StickerInfo {
