@@ -12,6 +12,7 @@ vi.mock('../../src/services/accountManager', () => ({
         activeKey: null,
         removeAccount: vi.fn(),
         setRoomNotificationMode: vi.fn(),
+        activeCalls: {},
     }),
     useAccountListSnapshot: () => ({
         accounts: [],

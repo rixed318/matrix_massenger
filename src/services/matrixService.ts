@@ -1,4 +1,4 @@
-import { MatrixClient, MatrixEvent, MatrixRoom, MatrixUser, Sticker, Gif, RoomCreationOptions, VideoMessageMetadata } from '../types';
+import { MatrixClient, MatrixEvent, MatrixRoom, MatrixUser, Sticker, Gif, RoomCreationOptions, VideoMessageMetadata, MatrixCall } from '../types';
 import type { SecureCloudProfile } from './secureCloudService';
 import { normaliseSecureCloudProfile } from './secureCloudService';
 import GroupCallCoordinator, { GroupCallParticipant as CoordinatorParticipant } from './webrtc/groupCallCoordinator';
@@ -177,6 +177,580 @@ const idbDeleteChunks = async (attachmentId: string) => {
         tx.onerror = () => reject(tx.error);
     });
     db.close();
+};
+
+const CALL_SESSION_EVENT_TYPE = 'econix.call_session';
+
+export type CallSessionStatus = 'ringing' | 'connecting' | 'connected' | 'ended';
+
+export interface CallSessionDeviceState {
+    userId: string;
+    deviceId: string;
+    label?: string;
+    muted?: boolean;
+    connected?: boolean;
+    isRemote?: boolean;
+    lastSeenTs: number;
+}
+
+export interface CallSessionState {
+    sessionId: string;
+    roomId: string;
+    callId: string;
+    status: CallSessionStatus;
+    activeDeviceId: string | null;
+    updatedAt: number;
+    startedAt?: number;
+    devices: CallSessionDeviceState[];
+}
+
+type CallStateListener = (state: CallSessionState | null) => void;
+type CallSessionSource = 'local' | 'worker' | 'account_data';
+
+interface CallStateEntry {
+    session: CallSessionState | null;
+    updatedAt: number;
+}
+
+interface CallStateMessage {
+    accountKey: string;
+    updatedAt: number;
+    session: CallSessionState | null;
+}
+
+const callStateByAccount = new Map<string, CallStateEntry>();
+const callStateListeners = new Map<string, Set<CallStateListener>>();
+const boundCallClients = new WeakSet<MatrixClient>();
+
+let callStatePort: MessagePort | null = null;
+let callStateChannel: BroadcastChannel | null = null;
+let callStateClock = Date.now();
+
+const CALL_STATE_BROADCAST_CHANNEL = 'econix-call-state';
+
+const nextCallStateTimestamp = (): number => {
+    const now = Date.now();
+    if (now <= callStateClock) {
+        callStateClock += 1;
+        return callStateClock;
+    }
+    callStateClock = now;
+    return now;
+};
+
+const sanitiseDevices = (devices: CallSessionDeviceState[] | undefined): CallSessionDeviceState[] => {
+    if (!Array.isArray(devices)) {
+        return [];
+    }
+    const now = Date.now();
+    const deduped = new Map<string, CallSessionDeviceState>();
+    devices.forEach((device) => {
+        if (!device || typeof device.deviceId !== 'string' || device.deviceId.length === 0) {
+            return;
+        }
+        const lastSeen = Number.isFinite(device.lastSeenTs) ? device.lastSeenTs : now;
+        deduped.set(device.deviceId, {
+            userId: typeof device.userId === 'string' ? device.userId : '',
+            deviceId: device.deviceId,
+            label: typeof device.label === 'string' ? device.label : undefined,
+            muted: device.muted === true,
+            connected: device.connected === true,
+            isRemote: device.isRemote === true ? true : undefined,
+            lastSeenTs: lastSeen,
+        });
+    });
+    return Array.from(deduped.values()).sort((a, b) => (b.lastSeenTs || 0) - (a.lastSeenTs || 0));
+};
+
+const sanitiseCallSession = (session: CallSessionState): CallSessionState => {
+    const devices = sanitiseDevices(session.devices);
+    const roomId = typeof session.roomId === 'string' ? session.roomId : '';
+    const callId = typeof session.callId === 'string' ? session.callId : '';
+    const sessionId = typeof session.sessionId === 'string' && session.sessionId.length > 0
+        ? session.sessionId
+        : `${roomId}:${callId || 'call'}`;
+    const status: CallSessionStatus = ['ringing', 'connecting', 'connected', 'ended'].includes(session.status)
+        ? session.status
+        : 'connecting';
+    const updatedAt = Number.isFinite(session.updatedAt) ? session.updatedAt : nextCallStateTimestamp();
+    return {
+        sessionId,
+        roomId,
+        callId: callId || sessionId,
+        status,
+        activeDeviceId: typeof session.activeDeviceId === 'string' && session.activeDeviceId.length > 0
+            ? session.activeDeviceId
+            : null,
+        updatedAt,
+        startedAt: Number.isFinite(session.startedAt) ? session.startedAt : undefined,
+        devices,
+    };
+};
+
+const prepareCallSession = (session: CallSessionState, updatedAtOverride?: number): CallSessionState => {
+    const sanitised = sanitiseCallSession(session);
+    return {
+        ...sanitised,
+        updatedAt: updatedAtOverride ?? sanitised.updatedAt,
+    };
+};
+
+const notifyCallStateListeners = (accountKey: string) => {
+    const listeners = callStateListeners.get(accountKey);
+    if (!listeners) {
+        return;
+    }
+    const entry = callStateByAccount.get(accountKey);
+    const session = entry?.session ?? null;
+    listeners.forEach(listener => {
+        try {
+            listener(session);
+        } catch (error) {
+            console.warn('call state listener failed', error);
+        }
+    });
+};
+
+export const subscribeCallState = (accountKey: string, listener: CallStateListener): (() => void) => {
+    if (!accountKey) {
+        return () => undefined;
+    }
+    let listeners = callStateListeners.get(accountKey);
+    if (!listeners) {
+        listeners = new Set();
+        callStateListeners.set(accountKey, listeners);
+    }
+    listeners.add(listener);
+    try {
+        listener(callStateByAccount.get(accountKey)?.session ?? null);
+    } catch (error) {
+        console.warn('initial call state listener emit failed', error);
+    }
+    return () => {
+        const target = callStateListeners.get(accountKey);
+        if (!target) {
+            return;
+        }
+        target.delete(listener);
+        if (target.size === 0) {
+            callStateListeners.delete(accountKey);
+        }
+    };
+};
+
+export const getCallSessionForAccount = (accountKey: string): CallSessionState | null => {
+    return callStateByAccount.get(accountKey)?.session ?? null;
+};
+
+export const resolveAccountKeyFromClient = (client: MatrixClient): string | null => {
+    try {
+        const baseUrl = (client as any).baseUrl
+            ?? client.getHomeserverUrl?.()
+            ?? (client as any).getHomeserverUrl?.()
+            ?? '';
+        const userId = client.getUserId?.();
+        if (typeof baseUrl !== 'string' || baseUrl.length === 0 || typeof userId !== 'string' || userId.length === 0) {
+            return null;
+        }
+        return `${baseUrl.replace(/\/+$/, '')}/${userId}`;
+    } catch {
+        return null;
+    }
+};
+
+const ensureCallStateBridge = () => {
+    if (typeof window === 'undefined') {
+        return;
+    }
+    if (!callStatePort && typeof SharedWorker !== 'undefined') {
+        try {
+            const workerSource = `const ports=new Set();onconnect=function(event){const port=event.ports[0];ports.add(port);port.onmessage=function(message){ports.forEach(target=>{if(target!==port){try{target.postMessage(message.data);}catch(e){}}});};port.onclose=function(){ports.delete(port);};port.start();};`;
+            const blob = new Blob([workerSource], { type: 'application/javascript' });
+            const url = URL.createObjectURL(blob);
+            const worker = new SharedWorker(url);
+            callStatePort = worker.port;
+            callStatePort.start();
+            callStatePort.onmessage = (event) => {
+                const data = event.data as CallStateMessage;
+                if (!data || typeof data.accountKey !== 'string') {
+                    return;
+                }
+                const session = data.session ? prepareCallSession(data.session, data.updatedAt) : null;
+                const updatedAt = typeof data.updatedAt === 'number' ? data.updatedAt : nextCallStateTimestamp();
+                applyCallSessionUpdate(data.accountKey, session, updatedAt, 'worker');
+            };
+        } catch (error) {
+            console.warn('call state shared worker unavailable', error);
+            callStatePort = null;
+        }
+    }
+    if (!callStatePort && !callStateChannel && typeof BroadcastChannel !== 'undefined') {
+        try {
+            callStateChannel = new BroadcastChannel(CALL_STATE_BROADCAST_CHANNEL);
+            callStateChannel.onmessage = (event) => {
+                const data = event.data as CallStateMessage;
+                if (!data || typeof data.accountKey !== 'string') {
+                    return;
+                }
+                const session = data.session ? prepareCallSession(data.session, data.updatedAt) : null;
+                const updatedAt = typeof data.updatedAt === 'number' ? data.updatedAt : nextCallStateTimestamp();
+                applyCallSessionUpdate(data.accountKey, session, updatedAt, 'worker');
+            };
+        } catch (error) {
+            console.warn('call state broadcast channel unavailable', error);
+            callStateChannel = null;
+        }
+    }
+};
+
+const broadcastCallStateUpdate = (accountKey: string, entry: CallStateEntry) => {
+    if (typeof window === 'undefined') {
+        return;
+    }
+    ensureCallStateBridge();
+    const payload: CallStateMessage = {
+        accountKey,
+        updatedAt: entry.updatedAt,
+        session: entry.session ? prepareCallSession(entry.session, entry.updatedAt) : null,
+    };
+    if (callStatePort) {
+        try {
+            callStatePort.postMessage(payload);
+        } catch (error) {
+            console.warn('call state shared worker broadcast failed', error);
+        }
+    } else if (callStateChannel) {
+        try {
+            callStateChannel.postMessage(payload);
+        } catch (error) {
+            console.warn('call state broadcast channel failed', error);
+        }
+    }
+};
+
+const serialiseCallSession = (session: CallSessionState) => ({
+    sessionId: session.sessionId,
+    roomId: session.roomId,
+    callId: session.callId,
+    status: session.status,
+    activeDeviceId: session.activeDeviceId,
+    updatedAt: session.updatedAt,
+    startedAt: session.startedAt ?? null,
+    devices: session.devices.map(device => ({
+        userId: device.userId,
+        deviceId: device.deviceId,
+        label: device.label,
+        muted: device.muted ?? undefined,
+        connected: device.connected ?? undefined,
+        isRemote: device.isRemote ?? undefined,
+        lastSeenTs: device.lastSeenTs,
+    })),
+});
+
+const deserialiseCallSession = (payload: any): CallSessionState | null => {
+    if (!payload || typeof payload !== 'object') {
+        return null;
+    }
+    const devices = Array.isArray(payload.devices)
+        ? payload.devices.map((device: any) => ({
+            userId: typeof device?.userId === 'string' ? device.userId : '',
+            deviceId: typeof device?.deviceId === 'string' ? device.deviceId : '',
+            label: typeof device?.label === 'string' ? device.label : undefined,
+            muted: device?.muted === true,
+            connected: device?.connected === true,
+            isRemote: device?.isRemote === true ? true : undefined,
+            lastSeenTs: Number.isFinite(device?.lastSeenTs) ? device.lastSeenTs : Date.now(),
+        }))
+        : [];
+    const status = typeof payload.status === 'string' && ['ringing', 'connecting', 'connected', 'ended'].includes(payload.status)
+        ? payload.status as CallSessionStatus
+        : 'connecting';
+    const activeDeviceId = typeof payload.activeDeviceId === 'string' && payload.activeDeviceId.length > 0
+        ? payload.activeDeviceId
+        : null;
+    const updatedAt = Number.isFinite(payload.updatedAt) ? payload.updatedAt : nextCallStateTimestamp();
+    return prepareCallSession({
+        sessionId: typeof payload.sessionId === 'string' ? payload.sessionId : '',
+        roomId: typeof payload.roomId === 'string' ? payload.roomId : '',
+        callId: typeof payload.callId === 'string' ? payload.callId : '',
+        status,
+        activeDeviceId,
+        updatedAt,
+        startedAt: Number.isFinite(payload.startedAt) ? payload.startedAt : undefined,
+        devices,
+    }, updatedAt);
+};
+
+const applyCallSessionUpdate = (
+    accountKey: string,
+    session: CallSessionState | null,
+    updatedAt: number,
+    source: CallSessionSource,
+) => {
+    const previous = callStateByAccount.get(accountKey);
+    if (previous && previous.updatedAt >= updatedAt) {
+        return;
+    }
+    const entry: CallStateEntry = {
+        session: session ? prepareCallSession(session, updatedAt) : null,
+        updatedAt,
+    };
+    callStateByAccount.set(accountKey, entry);
+    notifyCallStateListeners(accountKey);
+    if (source === 'local') {
+        broadcastCallStateUpdate(accountKey, entry);
+    }
+};
+
+const persistCallSessionAccountData = (client: MatrixClient, session: CallSessionState | null, updatedAt: number) => {
+    if (typeof client.setAccountData !== 'function') {
+        return;
+    }
+    try {
+        void client.setAccountData(CALL_SESSION_EVENT_TYPE, {
+            version: 1,
+            updated_at: updatedAt,
+            session: session ? serialiseCallSession(session) : null,
+        }).catch(error => {
+            console.warn('Failed to persist call session state', error);
+        });
+    } catch (error) {
+        console.warn('Failed to schedule call session persistence', error);
+    }
+};
+
+export const bindCallStateStore = (client: MatrixClient): (() => void) => {
+    if (!client || boundCallClients.has(client)) {
+        return () => undefined;
+    }
+    boundCallClients.add(client);
+    const accountKey = resolveAccountKeyFromClient(client);
+    if (!accountKey) {
+        return () => {
+            boundCallClients.delete(client);
+        };
+    }
+
+    const emitFromContent = (content: any) => {
+        const session = content?.session ? deserialiseCallSession(content.session) : null;
+        const updatedAt = Number.isFinite(content?.updated_at) ? content.updated_at : nextCallStateTimestamp();
+        applyCallSessionUpdate(accountKey, session, updatedAt, 'account_data');
+    };
+
+    try {
+        const existing = client.getAccountData?.(CALL_SESSION_EVENT_TYPE as any);
+        if (existing) {
+            emitFromContent(existing.getContent?.() ?? {});
+        } else if (!callStateByAccount.has(accountKey)) {
+            callStateByAccount.set(accountKey, { session: null, updatedAt: nextCallStateTimestamp() });
+            notifyCallStateListeners(accountKey);
+        }
+    } catch (error) {
+        console.warn('Failed to read initial call session account data', error);
+    }
+
+    const handleAccountData = (event: MatrixEvent) => {
+        if (event.getType() !== CALL_SESSION_EVENT_TYPE) {
+            return;
+        }
+        try {
+            emitFromContent(event.getContent?.() ?? {});
+        } catch (error) {
+            console.warn('Failed to handle call session account data', error);
+        }
+    };
+
+    client.on(ClientEvent.AccountData as any, handleAccountData as any);
+
+    return () => {
+        client.removeListener(ClientEvent.AccountData as any, handleAccountData as any);
+        boundCallClients.delete(client);
+        const listeners = callStateListeners.get(accountKey);
+        if (listeners) {
+            listeners.forEach(listener => {
+                try {
+                    listener(null);
+                } catch (error) {
+                    console.warn('call state listener cleanup failed', error);
+                }
+            });
+        }
+        callStateByAccount.delete(accountKey);
+    };
+};
+
+export const setCallSessionForClient = (client: MatrixClient, session: CallSessionState | null): void => {
+    const accountKey = resolveAccountKeyFromClient(client);
+    if (!accountKey) {
+        return;
+    }
+    const timestamp = nextCallStateTimestamp();
+    const prepared = session ? prepareCallSession({ ...session, updatedAt: timestamp }, timestamp) : null;
+    applyCallSessionUpdate(accountKey, prepared, timestamp, 'local');
+    persistCallSessionAccountData(client, prepared, timestamp);
+};
+
+export const updateLocalCallDeviceState = (client: MatrixClient, patch: Partial<CallSessionDeviceState>): void => {
+    const accountKey = resolveAccountKeyFromClient(client);
+    if (!accountKey) {
+        return;
+    }
+    const current = callStateByAccount.get(accountKey)?.session;
+    if (!current) {
+        return;
+    }
+    const deviceId = client.getDeviceId?.();
+    if (!deviceId) {
+        return;
+    }
+    const now = nextCallStateTimestamp();
+    const devices = current.devices.map(device => {
+        if (device.deviceId !== deviceId) {
+            return device;
+        }
+        return {
+            ...device,
+            ...patch,
+            lastSeenTs: now,
+        };
+    });
+    if (!devices.some(device => device.deviceId === deviceId)) {
+        devices.push({
+            userId: client.getUserId?.() ?? '',
+            deviceId,
+            label: 'Это устройство',
+            muted: patch.muted ?? false,
+            connected: patch.connected ?? (current.status === 'connected'),
+            isRemote: false,
+            lastSeenTs: now,
+        });
+    }
+    const nextSession: CallSessionState = {
+        ...current,
+        devices,
+        updatedAt: now,
+    };
+    applyCallSessionUpdate(accountKey, nextSession, now, 'local');
+    persistCallSessionAccountData(client, nextSession, now);
+};
+
+export const handoverCallToCurrentDevice = async (
+    client: MatrixClient,
+    overrideSession?: CallSessionState | null,
+): Promise<void> => {
+    const accountKey = resolveAccountKeyFromClient(client);
+    if (!accountKey) {
+        return;
+    }
+    const deviceId = client.getDeviceId?.();
+    if (!deviceId) {
+        return;
+    }
+    const userId = client.getUserId?.() ?? '';
+    const currentSession = overrideSession ?? callStateByAccount.get(accountKey)?.session;
+    if (!currentSession) {
+        return;
+    }
+    const now = nextCallStateTimestamp();
+    const devices = currentSession.devices.map(device => {
+        if (device.deviceId === deviceId) {
+            return {
+                ...device,
+                userId: device.userId || userId,
+                muted: false,
+                connected: true,
+                lastSeenTs: now,
+            };
+        }
+        if (device.userId === userId && device.deviceId !== deviceId) {
+            return {
+                ...device,
+                muted: true,
+                lastSeenTs: now,
+            };
+        }
+        return device;
+    });
+    if (!devices.some(device => device.deviceId === deviceId)) {
+        devices.push({
+            userId,
+            deviceId,
+            label: 'Это устройство',
+            muted: false,
+            connected: true,
+            isRemote: false,
+            lastSeenTs: now,
+        });
+    }
+    const nextSession: CallSessionState = {
+        ...currentSession,
+        activeDeviceId: deviceId,
+        status: currentSession.status === 'ended' ? 'connected' : currentSession.status,
+        devices,
+        updatedAt: now,
+    };
+    applyCallSessionUpdate(accountKey, nextSession, now, 'local');
+    persistCallSessionAccountData(client, nextSession, now);
+};
+
+export const buildCallSessionSnapshot = (
+    client: MatrixClient,
+    call: MatrixCall,
+    status: CallSessionStatus,
+    existing?: CallSessionState | null,
+): CallSessionState => {
+    const userId = client.getUserId?.() ?? '';
+    const deviceId = client.getDeviceId?.() ?? '';
+    const now = Date.now();
+    const sessionId = existing?.sessionId ?? `${call.roomId ?? 'room'}:${call.callId ?? 'call'}`;
+    const devices = (existing?.devices ?? []).filter(device => device.deviceId !== deviceId);
+    const peerMember = (call as any)?.getOpponentMember?.() ?? (call as any)?.getPeerMember?.() ?? null;
+    const remoteUserId: string | null = peerMember?.userId ?? peerMember?.user?.userId ?? null;
+    const remoteLabel: string | undefined = peerMember?.name ?? peerMember?.user?.displayName ?? undefined;
+    if (remoteUserId) {
+        const existingRemote = devices.find(device => device.userId === remoteUserId)
+            ?? devices.find(device => device.deviceId === `remote:${remoteUserId}`);
+        const remoteDeviceId = existingRemote?.deviceId ?? `remote:${remoteUserId}`;
+        const remoteEntry: CallSessionDeviceState = {
+            userId: remoteUserId,
+            deviceId: remoteDeviceId,
+            label: remoteLabel ?? existingRemote?.label ?? remoteUserId,
+            muted: existingRemote?.muted ?? false,
+            connected: true,
+            isRemote: true,
+            lastSeenTs: now,
+        };
+        const remoteIndex = devices.findIndex(device => device.deviceId === remoteDeviceId);
+        if (remoteIndex >= 0) {
+            devices[remoteIndex] = remoteEntry;
+        } else {
+            devices.push(remoteEntry);
+        }
+    }
+    devices.push({
+        userId,
+        deviceId,
+        label: 'Это устройство',
+        muted: typeof (call as any).isMicrophoneMuted === 'function'
+            ? Boolean((call as any).isMicrophoneMuted())
+            : existing?.devices?.find(device => device.deviceId === deviceId)?.muted ?? false,
+        connected: status === 'connected'
+            ? true
+            : existing?.devices?.find(device => device.deviceId === deviceId)?.connected ?? false,
+        lastSeenTs: now,
+    });
+    return {
+        sessionId,
+        roomId: call.roomId ?? existing?.roomId ?? '',
+        callId: call.callId ?? existing?.callId ?? sessionId,
+        status,
+        activeDeviceId: status === 'connected'
+            ? (deviceId || existing?.activeDeviceId || null)
+            : existing?.activeDeviceId ?? null,
+        updatedAt: now,
+        startedAt: status === 'connected' ? existing?.startedAt ?? now : existing?.startedAt,
+        devices,
+    };
 };
 
 const idbPut = async (item: OutboxPayload) => {
@@ -1856,6 +2430,11 @@ const bootstrapAuthenticatedClient = async (client: MatrixClient, secureProfile?
         bindStickerPackWatcher(client);
     } catch (e) {
         console.warn('bindStickerPackWatcher failed', e);
+    }
+    try {
+        bindCallStateStore(client);
+    } catch (e) {
+        console.warn('bindCallStateStore failed', e);
     }
     if (secureProfile) {
         setSecureCloudProfileForClient(client, secureProfile);

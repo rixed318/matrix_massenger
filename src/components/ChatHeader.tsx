@@ -4,6 +4,7 @@ import Avatar from './Avatar';
 import PinnedMessageBar from './PinnedMessageBar';
 import type { PresenceSummary } from '../utils/presence';
 import { presenceStatusToClass } from '../utils/presence';
+import type { CallSessionState } from '../services/matrixService';
 
 interface ChatHeaderProps {
     room: Room;
@@ -35,6 +36,9 @@ interface ChatHeaderProps {
     appLockEnabled?: boolean;
     presenceSummary?: PresenceSummary;
     presenceHidden?: boolean;
+    callSession?: CallSessionState | null;
+    onHandoverCall?: () => void;
+    localDeviceId?: string | null;
 }
 
 const statusLabels: Record<NonNullable<Room['status']>, string> = {
@@ -83,6 +87,9 @@ const ChatHeader: React.FC<ChatHeaderProps> = ({
     appLockEnabled = false,
     presenceSummary,
     presenceHidden = false,
+    callSession,
+    onHandoverCall,
+    localDeviceId,
 }) => {
     const [callMenuOpen, setCallMenuOpen] = useState(false);
     const callMenuRef = useRef<HTMLDivElement>(null);
@@ -120,6 +127,17 @@ const ChatHeader: React.FC<ChatHeaderProps> = ({
                 label: 'Presence hidden',
             }
             : null;
+    const localCallDevice = callSession?.devices.find(device => device.deviceId === localDeviceId);
+    const canHandover = Boolean(
+        callSession &&
+        onHandoverCall &&
+        localDeviceId &&
+        callSession.activeDeviceId &&
+        callSession.activeDeviceId !== localDeviceId,
+    );
+    const secondaryDevices = callSession
+        ? callSession.devices.filter(device => device.deviceId !== callSession.activeDeviceId)
+        : [];
 
     const typingContent: React.ReactNode = (() => {
         const count = typingUsers.length;
@@ -207,6 +225,36 @@ const ChatHeader: React.FC<ChatHeaderProps> = ({
                         )}
                     </div>
                     <p className="text-xs text-text-secondary min-h-[16px] transition-all">{typingContent}</p>
+                    {callSession && (
+                        <div className="mt-2 flex flex-wrap items-center gap-3">
+                            <span className="text-xs text-text-secondary">
+                                {callSession.activeDeviceId && callSession.activeDeviceId === localDeviceId
+                                    ? 'Звонок активен на этом устройстве'
+                                    : 'Звонок активен на другом устройстве'}
+                            </span>
+                            {secondaryDevices.length > 0 && (
+                                <span className="text-xs text-text-tertiary truncate">
+                                    Вторичные участники:{' '}
+                                    {secondaryDevices
+                                        .map(device => device.label || device.userId || device.deviceId)
+                                        .filter(Boolean)
+                                        .join(', ')}
+                                </span>
+                            )}
+                            {localCallDevice && localCallDevice.muted && callSession.activeDeviceId !== localDeviceId && (
+                                <span className="text-xs text-text-tertiary">Микрофон этого устройства отключён</span>
+                            )}
+                            {canHandover && (
+                                <button
+                                    type="button"
+                                    onClick={onHandoverCall}
+                                    className="px-3 py-1 rounded-full bg-accent text-text-inverted text-xs font-medium hover:bg-accent-hover transition"
+                                >
+                                    Подхватить на этом устройстве
+                                </button>
+                            )}
+                        </div>
+                    )}
                 </div>
                 <div className="flex items-center gap-2">
                     {onSelfDestructChange && (

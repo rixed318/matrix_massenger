@@ -63,6 +63,13 @@ import {
     createGroupCallCoordinator,
     leaveGroupCallCoordinator,
     GroupCallParticipant,
+    buildCallSessionSnapshot,
+    CallSessionState,
+    handoverCallToCurrentDevice,
+    resolveAccountKeyFromClient,
+    getCallSessionForAccount,
+    setCallSessionForClient,
+    updateLocalCallDeviceState,
 } from '../services/matrixService';
 import GroupCallCoordinator from '../services/webrtc/groupCallCoordinator';
 import { GROUP_CALL_STATE_EVENT_TYPE } from '../services/webrtc/groupCallConstants';
@@ -317,6 +324,9 @@ interface ChatSidePanelsProps {
         onAccept: () => void;
         onDecline: () => void;
         client: MatrixClient;
+        callSession?: CallSessionState | null;
+        onHandover?: () => void;
+        localDeviceId?: string | null;
     };
     groupCallPermission: {
         error: string | null;
@@ -865,7 +875,14 @@ const ChatSidePanels: React.FC<ChatSidePanelsProps> = ({
             )}
 
             {calls.activeCall && (
-                <CallView call={calls.activeCall} onHangup={() => calls.onHangup(false)} client={calls.client} />
+                <CallView
+                    call={calls.activeCall}
+                    onHangup={() => calls.onHangup(false)}
+                    client={calls.client}
+                    callSession={calls.callSession}
+                    onHandover={calls.onHandover}
+                    localDeviceId={calls.localDeviceId}
+                />
             )}
 
             {calls.incomingCall && (
@@ -898,6 +915,8 @@ const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, s
     const removeAccount = useAccountStore(state => state.removeAccount);
     const setAccountRoomNotificationMode = useAccountStore(state => state.setRoomNotificationMode);
     const accountRoomNotificationModes = useAccountStore(state => (state.activeKey ? (state.accounts[state.activeKey]?.roomNotificationModes ?? {}) : {}));
+    const activeAccountKey = useAccountStore(state => state.activeKey);
+    const activeCalls = useAccountStore(state => state.activeCalls);
     const client = (providedClient ?? activeRuntime?.client)!;
     const [presenceState, dispatchPresence] = useReducer(presenceReducer, new Map<string, PresenceEventContent>());
     const currentUserId = client.getUserId?.() ?? null;
@@ -944,6 +963,39 @@ const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, s
     const [folders, setFolders] = useState<Folder[]>([]);
     const [activeFolderId, setActiveFolderId] = useState<string>('all');
     const [activeCall, setActiveCall] = useState<MatrixCall | null>(null);
+    const clientAccountKey = useMemo(() => (client ? resolveAccountKeyFromClient(client) : null), [client]);
+    const effectiveAccountKey = clientAccountKey ?? activeAccountKey ?? null;
+    const accountCallSession = useMemo<CallSessionState | null>(() => {
+        if (!effectiveAccountKey) {
+            return null;
+        }
+        return activeCalls[effectiveAccountKey] ?? null;
+    }, [effectiveAccountKey, activeCalls]);
+    const roomCallSession = useMemo<CallSessionState | null>(() => {
+        if (!selectedRoomId) {
+            return null;
+        }
+        return accountCallSession && accountCallSession.roomId === selectedRoomId ? accountCallSession : null;
+    }, [accountCallSession, selectedRoomId]);
+    const localDeviceId = useMemo(() => {
+        try {
+            return client?.getDeviceId?.() ?? null;
+        } catch {
+            return null;
+        }
+    }, [client]);
+    const publishCallSession = useCallback((call: MatrixCall, status: 'ringing' | 'connecting' | 'connected' | 'ended') => {
+        if (!client) {
+            return;
+        }
+        if (status === 'ended') {
+            setCallSessionForClient(client, null);
+            return;
+        }
+        const baseline = effectiveAccountKey ? getCallSessionForAccount(effectiveAccountKey) ?? accountCallSession : accountCallSession;
+        const snapshot = buildCallSessionSnapshot(client, call, status, baseline ?? undefined);
+        setCallSessionForClient(client, snapshot);
+    }, [client, effectiveAccountKey, accountCallSession]);
     // Group call state
     const [activeGroupCall, setActiveGroupCall] = useState<{
         roomId: string;
@@ -2567,6 +2619,7 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
             }
             console.log("Incoming call:", call);
             setIncomingCall(call);
+            publishCallSession(call, 'ringing');
 
             if (notificationsEnabled && !document.hasFocus()) {
                 const peerMember = (call as any).getPeerMember();
@@ -2582,7 +2635,7 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
             // FIX: The event for an incoming call on the client is 'Call.incoming', which is not in the SDK's event types. Cast to `any` to bypass the type check.
             client.removeListener('Call.incoming' as any, onCallIncoming);
         };
-    }, [client, activeCall, notificationsEnabled]);
+    }, [client, activeCall, notificationsEnabled, publishCallSession]);
 
     useEffect(() => {
         if (!activeCall) return;
@@ -2590,13 +2643,27 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
         const onHangup = () => {
             console.log("Call hung up");
             setActiveCall(null);
+            setCallSessionForClient(client, null);
         };
-        
+
+        const onStateChanged = (state: string) => {
+            if (state === 'ended') {
+                setCallSessionForClient(client, null);
+            } else if (state === 'connected') {
+                publishCallSession(activeCall, 'connected');
+            } else if (state === 'connecting' || state === 'create_offer') {
+                publishCallSession(activeCall, 'connecting');
+            }
+        };
+
+        onStateChanged((activeCall as any).state ?? '');
         activeCall.on(CallEvent.Hangup, onHangup);
+        activeCall.on(CallEvent.State, onStateChanged as any);
         return () => {
             activeCall.removeListener(CallEvent.Hangup, onHangup);
+            activeCall.removeListener(CallEvent.State, onStateChanged as any);
         };
-    }, [activeCall]);
+    }, [activeCall, client, publishCallSession]);
 
     const handleSelectRoom = useCallback(async (roomId: string) => {
         const targetRoom = client.getRoom(roomId);
@@ -3418,6 +3485,7 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
                 call = (client as any).placeVoiceCall(selectedRoomId);
             }
             setActiveCall(call);
+            publishCallSession(call, 'connecting');
         } catch (error) {
             console.error(`Failed to place ${type} call:`, error);
         }
@@ -3428,6 +3496,7 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
         incomingCall.answer();
         setActiveCall(incomingCall);
         setIncomingCall(null);
+        publishCallSession(incomingCall, 'connecting');
     };
 
     const handleHangupCall = (isIncoming: boolean) => {
@@ -3436,13 +3505,25 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
             // FIX: The `CallErrorCode` type is not exported by the SDK. Cast to `any` to bypass the type check.
             incomingCall.hangup('user_hangup' as any, false);
             setIncomingCall(null);
+            setCallSessionForClient(client, null);
         } else if (!isIncoming && activeCall) {
             // FIX: Use string literal for hangup reason as CallErrorCode is not exported.
             // FIX: The `CallErrorCode` type is not exported by the SDK. Cast to `any` to bypass the type check.
             activeCall.hangup('user_hangup' as any, true);
             setActiveCall(null);
+            setCallSessionForClient(client, null);
         }
     };
+
+    const handleHandoverCall = useCallback(() => {
+        const targetSession = roomCallSession ?? accountCallSession;
+        if (!targetSession) {
+            return;
+        }
+        handoverCallToCurrentDevice(client, targetSession).catch(error => {
+            console.error('Failed to hand over call to current device', error);
+        });
+    }, [client, roomCallSession, accountCallSession]);
 
     const handleTranslateMessage = async (messageId: string, text: string) => {
         // If translation is already shown, hide it (toggle)
@@ -3748,6 +3829,9 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
             onAccept: handleAnswerCall,
             onDecline: () => handleHangupCall(true),
             client,
+            callSession: accountCallSession,
+            onHandover: handleHandoverCall,
+            localDeviceId,
         },
         groupCallPermission: {
             error: groupCallPermissionError,
@@ -3823,6 +3907,9 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
                             appLockEnabled={appLockState.enabled}
                             presenceSummary={selectedRoomPresence}
                             presenceHidden={isPresenceHidden}
+                            callSession={roomCallSession}
+                            onHandoverCall={roomCallSession ? handleHandoverCall : undefined}
+                            localDeviceId={localDeviceId}
                         />
                         <ChatTimelineSection {...timelineProps} />
                         <ChatComposerSection {...composerProps} />

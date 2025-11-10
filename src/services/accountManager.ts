@@ -21,6 +21,7 @@ import {
 } from '../utils/chatSelectors';
 import { SCHEDULED_MESSAGES_EVENT_TYPE, parseScheduledMessagesFromEvent, getCachedScheduledMessages } from './schedulerService';
 import { getSuspiciousEvents } from './secureCloudService';
+import { bindCallStateStore, CallSessionState, getCallSessionForAccount, subscribeCallState } from './matrixService';
 
 const RESTORE_ERROR_MESSAGE = 'Не удалось восстановить сессии. Авторизуйтесь заново.';
 
@@ -28,6 +29,21 @@ const isTauriAvailable = () =>
   typeof window !== 'undefined' && typeof (window as any).__TAURI_INTERNALS__ !== 'undefined';
 
 const QUICK_FILTER_STORAGE_KEY = 'matrix-active-quick-filter';
+
+const resolveEnv = (key: string, fallback?: string): string | undefined => {
+  try {
+    const env = (import.meta as any)?.env ?? {};
+    const value = env[key];
+    if (typeof value === 'string' && value.length > 0) {
+      return value;
+    }
+  } catch {
+    /* no-op */
+  }
+  return fallback;
+};
+
+const CALL_SYNC_URL = resolveEnv('VITE_CALL_STATE_WS_URL');
 
 const readStoredQuickFilter = (): UniversalQuickFilterId | null => {
   if (typeof window === 'undefined') {
@@ -84,6 +100,7 @@ export interface AccountStoreState {
   aggregatedUnread: number;
   universalMode: InboxViewMode;
   activeQuickFilterId: UniversalQuickFilterId;
+  activeCalls: Record<string, CallSessionState | null>;
   boot: () => Promise<void>;
   addClientAccount: (client: MatrixClient) => Promise<void>;
   removeAccount: (key?: string) => Promise<void>;
@@ -105,6 +122,86 @@ export const createAccountKey = (creds: AccountCredentials) =>
 export const createAccountStore = () => {
   const sessionCleanup = new Map<string, () => void>();
   const initialQuickFilter = readStoredQuickFilter() ?? 'all';
+  let callSyncSocket: WebSocket | null = null;
+  let callSyncReady = false;
+  const callSyncQueue: string[] = [];
+
+  const ensureCallSyncSocket = () => {
+    if (typeof window === 'undefined' || typeof WebSocket === 'undefined' || !CALL_SYNC_URL) {
+      return null;
+    }
+    if (callSyncSocket && (callSyncSocket.readyState === WebSocket.OPEN || callSyncSocket.readyState === WebSocket.CONNECTING)) {
+      return callSyncSocket;
+    }
+    try {
+      callSyncSocket = new WebSocket(CALL_SYNC_URL);
+      callSyncSocket.onopen = () => {
+        callSyncReady = true;
+        while (callSyncQueue.length > 0) {
+          const payload = callSyncQueue.shift();
+          if (!payload) {
+            continue;
+          }
+          try {
+            callSyncSocket?.send(payload);
+          } catch (error) {
+            console.warn('call sync socket send failed', error);
+            callSyncQueue.unshift(payload);
+            break;
+          }
+        }
+      };
+      callSyncSocket.onclose = () => {
+        callSyncReady = false;
+        callSyncSocket = null;
+      };
+      callSyncSocket.onerror = (event) => {
+        console.warn('call sync socket error', event);
+        callSyncReady = false;
+        try { callSyncSocket?.close(); } catch { /* no-op */ }
+        callSyncSocket = null;
+      };
+    } catch (error) {
+      console.warn('call sync socket init failed', error);
+      callSyncSocket = null;
+    }
+    return callSyncSocket;
+  };
+
+  const broadcastCallSession = (accountKey: string, session: CallSessionState | null) => {
+    if (typeof navigator !== 'undefined' && navigator.serviceWorker?.controller) {
+      try {
+        navigator.serviceWorker.controller.postMessage({
+          type: 'CALL_SESSION_UPDATE',
+          accountKey,
+          session,
+        });
+      } catch (error) {
+        console.debug('Failed to post call session update to service worker', error);
+      }
+    }
+
+    if (typeof window === 'undefined' || typeof WebSocket === 'undefined' || !CALL_SYNC_URL) {
+      return;
+    }
+
+    const payload = JSON.stringify({
+      type: 'call_session',
+      accountKey,
+      session,
+    });
+
+    const socket = ensureCallSyncSocket();
+    if (socket && callSyncReady && socket.readyState === WebSocket.OPEN) {
+      try {
+        socket.send(payload);
+        return;
+      } catch (error) {
+        console.warn('call sync send failed', error);
+      }
+    }
+    callSyncQueue.push(payload);
+  };
 
   const persistAccount = async (account: StoredAccount) => {
     if (!isTauriAvailable()) {
@@ -205,6 +302,39 @@ export const createAccountStore = () => {
       };
     };
 
+    const attachCallStateListeners = (key: string) => {
+      const accountKey = key;
+      const unsubscribe = subscribeCallState(accountKey, (session) => {
+        set(state => {
+          const current = state.activeCalls[accountKey];
+          const currentStamp = current?.updatedAt ?? null;
+          const nextStamp = session?.updatedAt ?? null;
+          if (currentStamp === nextStamp && current === session) {
+            return {};
+          }
+          return {
+            activeCalls: {
+              ...state.activeCalls,
+              [accountKey]: session,
+            },
+          };
+        });
+        broadcastCallSession(accountKey, session ?? null);
+      });
+
+      return () => {
+        try { unsubscribe(); } catch (error) { console.warn('call state unsubscribe failed', error); }
+        set(state => {
+          if (!(accountKey in state.activeCalls)) {
+            return {};
+          }
+          const next = { ...state.activeCalls };
+          delete next[accountKey];
+          return { activeCalls: next };
+        });
+      };
+    };
+
     const toRuntime = async (
       account: StoredAccount,
       existingClient?: MatrixClient,
@@ -231,9 +361,18 @@ export const createAccountStore = () => {
 
       cleanupSession(account.key);
       const detachAggregated = attachAggregatedListeners(account.key, session.client);
+      const detachCallStateSubscription = attachCallStateListeners(account.key);
+      let detachCallStateBinding: (() => void) | null = null;
+      try {
+        detachCallStateBinding = bindCallStateStore(session.client);
+      } catch (error) {
+        console.warn('bindCallStateStore failed', error);
+      }
 
       sessionCleanup.set(account.key, () => {
         try { detachAggregated(); } catch (error) { console.warn('aggregation detach failed', error); }
+        try { detachCallStateSubscription(); } catch (error) { console.warn('call state subscription detach failed', error); }
+        try { detachCallStateBinding?.(); } catch (error) { console.warn('call state detach failed', error); }
         try { session.dispose(); } catch (error) { console.warn('dispose failed', error); }
         try { session.client.stopClient?.(); } catch (error) { console.warn('stopClient failed', error); }
       });
@@ -254,7 +393,7 @@ export const createAccountStore = () => {
       set({ isBooting: true, error: null });
 
       if (!isTauriAvailable()) {
-        set({ accounts: {}, activeKey: null, isBooting: false });
+        set({ accounts: {}, activeKey: null, isBooting: false, activeCalls: {} });
         refreshAggregatedState();
         return;
       }
@@ -262,7 +401,7 @@ export const createAccountStore = () => {
       try {
         const stored = await invoke<StoredAccount[]>('load_credentials');
         if (!stored || stored.length === 0) {
-          set({ accounts: {}, activeKey: null });
+        set({ accounts: {}, activeKey: null, activeCalls: {} });
           refreshAggregatedState();
           return;
         }
@@ -291,7 +430,7 @@ export const createAccountStore = () => {
         refreshAggregatedState();
       } catch (error) {
         console.error('restore failed', error);
-        set({ accounts: {}, activeKey: null, error: RESTORE_ERROR_MESSAGE });
+        set({ accounts: {}, activeKey: null, error: RESTORE_ERROR_MESSAGE, activeCalls: {} });
         refreshAggregatedState();
       } finally {
         set({ isBooting: false });
@@ -346,9 +485,12 @@ export const createAccountStore = () => {
         const nextAccounts = { ...state.accounts };
         delete nextAccounts[targetKey];
         const remainingKeys = Object.keys(nextAccounts);
+        const nextActiveCalls = { ...state.activeCalls };
+        delete nextActiveCalls[targetKey];
         return {
           accounts: nextAccounts,
           activeKey: state.activeKey === targetKey ? (remainingKeys[0] ?? null) : state.activeKey,
+          activeCalls: nextActiveCalls,
         };
       });
       refreshAggregatedState();
@@ -422,11 +564,12 @@ export const createAccountStore = () => {
       isBooting: false,
       error: null,
       isAddAccountOpen: false,
-       aggregatedRooms: [],
-       aggregatedQuickFilters: buildQuickFilterSummaries([]),
-       aggregatedUnread: 0,
-       universalMode: 'active',
-       activeQuickFilterId: initialQuickFilter,
+      aggregatedRooms: [],
+      aggregatedQuickFilters: buildQuickFilterSummaries([]),
+      aggregatedUnread: 0,
+      universalMode: 'active',
+      activeQuickFilterId: initialQuickFilter,
+      activeCalls: {},
       boot,
       addClientAccount,
       removeAccount,
