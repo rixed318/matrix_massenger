@@ -4,6 +4,7 @@ mod deployment;
 
 use deployment::{deploy_synapse_server, DeploymentConfig, DeploymentStatus};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::{collections::HashMap, fs, path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
 use tauri::AppHandle;
 use tauri_plugin_notification::NotificationExt;
@@ -234,6 +235,35 @@ struct IndexedMessageRecord {
   has_media: bool,
   #[serde(rename = "mediaTypes")]
   media_types: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BotBridgeInboundWebhook {
+  connector_id: String,
+  event: String,
+  data: serde_json::Value,
+  #[serde(default)]
+  received_at: Option<u64>,
+}
+
+#[tauri::command]
+async fn ingest_bot_bridge_webhook(app: AppHandle, payload: BotBridgeInboundWebhook) -> Result<(), String> {
+  let timestamp = payload
+    .received_at
+    .unwrap_or_else(|| SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or_default());
+
+  app
+    .emit_all(
+      "bot-bridge://webhook",
+      json!({
+        "connectorId": payload.connector_id,
+        "event": payload.event,
+        "data": payload.data,
+        "receivedAt": timestamp,
+      }),
+    )
+    .map_err(|e| format!("Failed to emit bot bridge webhook: {}", e))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -902,7 +932,8 @@ fn main() {
       load_room_index,
       get_smart_collections,
       deploy_matrix_server,
-      test_ssh_connection
+      test_ssh_connection,
+      ingest_bot_bridge_webhook
     ])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");

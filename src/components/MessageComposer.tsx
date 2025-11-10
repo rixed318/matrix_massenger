@@ -1,6 +1,6 @@
 import React from 'react';
 import MessageInput from './MessageInput';
-import { Gif, MatrixClient, MatrixUser, Message, Sticker, DraftContent, SendKeyBehavior, VideoMessageMetadata } from '../types';
+import { Gif, MatrixClient, MatrixUser, Message, Sticker, DraftContent, LocationContentPayload, SendKeyBehavior, VideoMessageMetadata } from '../types';
 import type { OutboxProgressState } from '../services/matrixService';
 
 interface PendingQueueEntry {
@@ -21,6 +21,7 @@ interface MessageComposerProps {
     onSendVideo: (file: Blob, metadata: VideoMessageMetadata) => Promise<void> | void;
     onSendSticker: (sticker: Sticker) => Promise<void> | void;
     onSendGif: (gif: Gif) => Promise<void> | void;
+    onSendLocation: (payload: LocationContentPayload) => Promise<void> | void;
     onOpenCreatePoll: () => void;
     onSchedule: (content: DraftContent) => void;
     isSending: boolean;
@@ -45,6 +46,7 @@ const MessageComposer: React.FC<MessageComposerProps> = ({
     onSendVideo,
     onSendSticker,
     onSendGif,
+    onSendLocation,
     onOpenCreatePoll,
     onSchedule,
     isSending,
@@ -138,6 +140,7 @@ const MessageComposer: React.FC<MessageComposerProps> = ({
                 onSendVideo={onSendVideo}
                 onSendSticker={onSendSticker}
                 onSendGif={onSendGif}
+                onSendLocation={onSendLocation}
                 onOpenCreatePoll={onOpenCreatePoll}
                 onSchedule={onSchedule}
                 isSending={isSending}
