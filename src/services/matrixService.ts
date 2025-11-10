@@ -2024,6 +2024,109 @@ export interface LoginOptions {
     secureProfile?: SecureCloudProfile;
     totpCode?: string;
     totpSessionId?: string;
+    onPasskeyAssertion?: (details: PasskeyAssertionDetails) => void;
+}
+
+export interface RegisterOptions {
+    onPasskeyAttestation?: (details: PasskeyAttestationDetails) => void;
+    onPasskeyAssertion?: (details: PasskeyAssertionDetails) => void;
+}
+
+interface WebAuthnPublicKeyOptions {
+    publicKey?: PublicKeyCredentialRequestOptions | PublicKeyCredentialCreationOptions;
+    public_key?: PublicKeyCredentialRequestOptions | PublicKeyCredentialCreationOptions;
+}
+
+const isPasskeyStage = (stage: string | undefined): stage is 'm.login.webauthn' | 'm.login.passkey' =>
+    stage === 'm.login.webauthn' || stage === 'm.login.passkey';
+
+const toBase64Url = (buffer: ArrayBuffer | Uint8Array): string => {
+    const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+    let binary = '';
+    for (let i = 0; i < bytes.byteLength; i += 1) {
+        binary += String.fromCharCode(bytes[i]);
+    }
+    return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/u, '');
+};
+
+const fromBase64Url = (input: string): Uint8Array => {
+    const normalized = input.replace(/-/g, '+').replace(/_/g, '/');
+    const padded = normalized + '==='.slice((normalized.length + 3) % 4);
+    const binary = atob(padded);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) {
+        bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes;
+};
+
+const normaliseRequestOptions = (raw: WebAuthnPublicKeyOptions | undefined): PublicKeyCredentialRequestOptions => {
+    const source = raw?.publicKey ?? raw?.public_key ?? raw;
+    if (!source || typeof source !== 'object') {
+        throw new Error('Сервер не предоставил параметры passkey для входа.');
+    }
+    const cloner: typeof structuredClone = typeof structuredClone === 'function'
+        ? structuredClone
+        : ((value: any) => JSON.parse(JSON.stringify(value)));
+    const options = cloner(source) as PublicKeyCredentialRequestOptions;
+    if (typeof options.challenge === 'string') {
+        options.challenge = fromBase64Url(options.challenge);
+    }
+    if (Array.isArray(options.allowCredentials)) {
+        options.allowCredentials = options.allowCredentials.map((cred) => {
+            const next = { ...cred } as PublicKeyCredentialDescriptor;
+            if (typeof next.id === 'string') {
+                next.id = fromBase64Url(next.id).buffer;
+            }
+            return next;
+        });
+    }
+    return options;
+};
+
+const normaliseCreationOptions = (raw: WebAuthnPublicKeyOptions | undefined): PublicKeyCredentialCreationOptions => {
+    const source = raw?.publicKey ?? raw?.public_key ?? raw;
+    if (!source || typeof source !== 'object') {
+        throw new Error('Сервер не предоставил параметры passkey для регистрации.');
+    }
+    const cloner: typeof structuredClone = typeof structuredClone === 'function'
+        ? structuredClone
+        : ((value: any) => JSON.parse(JSON.stringify(value)));
+    const options = cloner(source) as PublicKeyCredentialCreationOptions;
+    if (typeof options.challenge === 'string') {
+        options.challenge = fromBase64Url(options.challenge);
+    }
+    if (options.user && typeof options.user.id === 'string') {
+        options.user = { ...options.user, id: fromBase64Url(options.user.id) };
+    }
+    if (Array.isArray(options.excludeCredentials)) {
+        options.excludeCredentials = options.excludeCredentials.map((cred) => {
+            const next = { ...cred } as PublicKeyCredentialDescriptor;
+            if (typeof next.id === 'string') {
+                next.id = fromBase64Url(next.id).buffer;
+            }
+            return next;
+        });
+    }
+    return options;
+};
+
+const requireWebAuthnAvailability = () => {
+    if (typeof navigator === 'undefined' || typeof navigator.credentials?.get !== 'function') {
+        throw new Error('В этой среде недоступна аппаратная проверка passkey.');
+    }
+};
+
+export interface PasskeyAssertionDetails {
+    credentialId: string;
+    stage: 'm.login.webauthn' | 'm.login.passkey';
+    transports?: AuthenticatorTransport[];
+}
+
+export interface PasskeyAttestationDetails {
+    credentialId: string;
+    stage: 'm.login.webauthn' | 'm.login.passkey';
+    transports?: AuthenticatorTransport[];
 }
 
 export class TotpRequiredError extends Error {
@@ -2071,31 +2174,25 @@ export const login = async (
     } as const;
 
     const trimmedTotp = typeof options.totpCode === 'string' ? options.totpCode.trim() : undefined;
-    let authPayload: { type: string; code: string; session?: string } | undefined = undefined;
     let totpAttempted = false;
     let sessionHint = options.totpSessionId ?? undefined;
+    let nextAuthPayload: Record<string, any> | undefined;
+    let passkeyAttempts = 0;
+    let pendingPasskeyDetails: PasskeyAssertionDetails | null = null;
 
     const performLogin = async () => {
         const payload: Record<string, any> = {
             identifier,
             password,
         };
-        if (authPayload) {
-            payload.auth = authPayload;
+        if (nextAuthPayload) {
+            payload.auth = nextAuthPayload;
+            nextAuthPayload = undefined;
         }
         return await client.login('m.login.password', payload);
     };
 
     while (true) {
-        if (trimmedTotp && !totpAttempted && !authPayload) {
-            authPayload = {
-                type: 'm.login.totp',
-                code: trimmedTotp,
-                ...(sessionHint ? { session: sessionHint } : {}),
-            };
-            totpAttempted = true;
-        }
-
         try {
             await performLogin();
             break;
@@ -2105,41 +2202,98 @@ export const login = async (
                 ? matrixError.data.flows
                 : [];
             const sessionId = matrixError?.data?.session ?? sessionHint;
-            const requiresTotp = flows.some((flow) => Array.isArray(flow?.stages) && flow.stages.includes('m.login.totp'));
+            const completed = new Set<string>(
+                Array.isArray(matrixError?.data?.completed) ? matrixError.data.completed.filter(Boolean) : [],
+            );
+            const requiresTotp =
+                flows.some((flow) => Array.isArray(flow?.stages) && flow.stages.includes('m.login.totp')) &&
+                !completed.has('m.login.totp');
+            const passkeyStage = flows
+                .flatMap((flow) => flow.stages ?? [])
+                .find((stage) => isPasskeyStage(stage) && !completed.has(stage));
+            sessionHint = sessionId ?? sessionHint;
 
             if (matrixError?.errcode === 'M_FORBIDDEN' && requiresTotp) {
-                sessionHint = sessionId ?? sessionHint;
-                if (trimmedTotp) {
-                    if (totpAttempted && authPayload) {
-                        throw new TotpRequiredError(
-                            matrixError?.data?.error || matrixError?.message || 'Неверный одноразовый код или код истёк.',
-                            {
-                                sessionId: sessionHint,
-                                flows,
-                                validationError: true,
-                                cause: error,
-                            },
-                        );
-                    }
-
-                    authPayload = {
-                        type: 'm.login.totp',
-                        code: trimmedTotp,
-                        ...(sessionHint ? { session: sessionHint } : {}),
-                    };
-                    totpAttempted = true;
-                    continue;
+                if (!trimmedTotp) {
+                    throw new TotpRequiredError(
+                        'Эта учётная запись защищена двухфакторной аутентификацией. Введите код из приложения TOTP.',
+                        {
+                            sessionId: sessionHint,
+                            flows,
+                            validationError: false,
+                            cause: error,
+                        },
+                    );
                 }
 
-                throw new TotpRequiredError(
-                    'Эта учётная запись защищена двухфакторной аутентификацией. Введите код из приложения TOTP.',
-                    {
-                        sessionId: sessionHint,
-                        flows,
-                        validationError: false,
-                        cause: error,
+                if (totpAttempted) {
+                    throw new TotpRequiredError(
+                        matrixError?.data?.error || matrixError?.message || 'Неверный одноразовый код или код истёк.',
+                        {
+                            sessionId: sessionHint,
+                            flows,
+                            validationError: true,
+                            cause: error,
+                        },
+                    );
+                }
+
+                nextAuthPayload = {
+                    type: 'm.login.totp',
+                    code: trimmedTotp,
+                    ...(sessionHint ? { session: sessionHint } : {}),
+                };
+                totpAttempted = true;
+                continue;
+            }
+
+            if (matrixError?.errcode === 'M_FORBIDDEN' && passkeyStage && isPasskeyStage(passkeyStage)) {
+                if (passkeyAttempts > 0 && matrixError?.data?.error) {
+                    throw new Error(matrixError.data.error);
+                }
+
+                requireWebAuthnAvailability();
+                const rawParams =
+                    typeof matrixError?.data?.params === 'object' && matrixError?.data?.params !== null
+                        ? (matrixError.data.params?.[passkeyStage] ?? matrixError.data.params)
+                        : undefined;
+                const publicKey = normaliseRequestOptions(rawParams);
+
+                let credential: PublicKeyCredential | null = null;
+                try {
+                    credential = (await navigator.credentials.get({ publicKey })) as PublicKeyCredential | null;
+                } catch (getError: any) {
+                    throw new Error(getError?.message || 'Проверка passkey отменена.');
+                }
+
+                if (!credential) {
+                    throw new Error('Проверка passkey отменена пользователем.');
+                }
+
+                const response = credential.response as AuthenticatorAssertionResponse;
+                nextAuthPayload = {
+                    type: passkeyStage,
+                    session: sessionHint,
+                    response: {
+                        id: credential.id,
+                        rawId: toBase64Url(credential.rawId),
+                        type: credential.type,
+                        response: {
+                            clientDataJSON: toBase64Url(response.clientDataJSON),
+                            authenticatorData: toBase64Url(response.authenticatorData),
+                            signature: toBase64Url(response.signature),
+                            userHandle: response.userHandle ? toBase64Url(response.userHandle) : undefined,
+                        },
+                        extensions: credential.getClientExtensionResults?.() ?? undefined,
                     },
-                );
+                };
+                pendingPasskeyDetails = {
+                    credentialId: toBase64Url(credential.rawId),
+                    stage: passkeyStage,
+                    transports: undefined,
+                };
+                passkeyAttempts += 1;
+                continue;
             }
 
             throw new Error(matrixError?.data?.error || matrixError?.message || 'Вход не выполнен.');
@@ -2148,14 +2302,30 @@ export const login = async (
 
     await bootstrapAuthenticatedClient(client, options.secureProfile);
 
+    if (pendingPasskeyDetails) {
+        try {
+            options.onPasskeyAssertion?.(pendingPasskeyDetails);
+        } catch (err) {
+            console.warn('Passkey assertion handler failed', err);
+        }
+    }
+
     return client;
 };
 
-export const register = async (homeserverUrl: string, username: string, password: string): Promise<MatrixClient> => {
+export const register = async (
+    homeserverUrl: string,
+    username: string,
+    password: string,
+    options: RegisterOptions = {},
+): Promise<MatrixClient> => {
     const client = await initClient(homeserverUrl);
     let sessionId: string | null = null;
     let hasAttemptedDummy = false;
     let registerResponse: Awaited<ReturnType<typeof client.register>> | null = null;
+    let nextAuthPayload: Record<string, any> | undefined;
+    let passkeyAttempts = 0;
+    let pendingPasskeyDetails: PasskeyAttestationDetails | null = null;
 
     while (true) {
         try {
@@ -2163,11 +2333,12 @@ export const register = async (homeserverUrl: string, username: string, password
                 username,
                 password,
                 sessionId,
-                sessionId ? { type: "m.login.dummy", session: sessionId } : { type: "m.login.dummy" },
+                nextAuthPayload ?? (sessionId ? { type: "m.login.dummy", session: sessionId } : { type: "m.login.dummy" }),
                 undefined,
                 undefined,
                 true,
             );
+            nextAuthPayload = undefined;
             break;
         } catch (error: any) {
             const matrixError = error ?? {};
@@ -2175,11 +2346,64 @@ export const register = async (homeserverUrl: string, username: string, password
                 ? matrixError.data.flows
                 : [];
             const stages = flows.flatMap((flow) => flow.stages ?? []);
+            const completed = new Set<string>(
+                Array.isArray(matrixError?.data?.completed) ? matrixError.data.completed.filter(Boolean) : [],
+            );
 
             if (!hasAttemptedDummy && matrixError?.data?.session && flows.length > 0) {
                 if (stages.every((stage) => stage === "m.login.dummy") && stages.includes("m.login.dummy")) {
                     sessionId = matrixError.data.session;
                     hasAttemptedDummy = true;
+                    continue;
+                }
+
+                const passkeyStage = stages.find((stage) => isPasskeyStage(stage) && !completed.has(stage));
+                if (matrixError?.errcode === 'M_FORBIDDEN' && passkeyStage && isPasskeyStage(passkeyStage)) {
+                    if (passkeyAttempts > 0 && matrixError?.data?.error) {
+                        throw new Error(matrixError.data.error);
+                    }
+
+                    requireWebAuthnAvailability();
+                    sessionId = matrixError?.data?.session ?? sessionId;
+                    const rawParams =
+                        typeof matrixError?.data?.params === 'object' && matrixError?.data?.params !== null
+                            ? (matrixError.data.params?.[passkeyStage] ?? matrixError.data.params)
+                            : undefined;
+                    const publicKey = normaliseCreationOptions(rawParams);
+
+                    let credential: PublicKeyCredential | null = null;
+                    try {
+                        credential = (await navigator.credentials.create({ publicKey })) as PublicKeyCredential | null;
+                    } catch (createError: any) {
+                        throw new Error(createError?.message || 'Регистрация passkey отменена.');
+                    }
+
+                    if (!credential) {
+                        throw new Error('Регистрация passkey отменена пользователем.');
+                    }
+
+                    const response = credential.response as AuthenticatorAttestationResponse;
+                    const transports = typeof response.getTransports === 'function' ? response.getTransports() : undefined;
+                    nextAuthPayload = {
+                        type: passkeyStage,
+                        session: matrixError?.data?.session,
+                        response: {
+                            id: credential.id,
+                            rawId: toBase64Url(credential.rawId),
+                            type: credential.type,
+                            response: {
+                                clientDataJSON: toBase64Url(response.clientDataJSON),
+                                attestationObject: toBase64Url(response.attestationObject),
+                            },
+                            transports,
+                        },
+                    };
+                    pendingPasskeyDetails = {
+                        credentialId: toBase64Url(credential.rawId),
+                        stage: passkeyStage,
+                        transports: transports ?? undefined,
+                    };
+                    passkeyAttempts += 1;
                     continue;
                 }
 
@@ -2226,7 +2450,19 @@ export const register = async (homeserverUrl: string, username: string, password
     }
 
     const userId = registerResponse?.user_id || username;
-    return await login(homeserverUrl, userId, password);
+    if (pendingPasskeyDetails) {
+        try {
+            options.onPasskeyAttestation?.(pendingPasskeyDetails);
+        } catch (err) {
+            console.warn('Passkey attestation handler failed', err);
+        }
+    }
+    const followupLoginOptions = options.onPasskeyAssertion
+        ? { onPasskeyAssertion: options.onPasskeyAssertion }
+        : undefined;
+    return followupLoginOptions
+        ? await login(homeserverUrl, userId, password, followupLoginOptions)
+        : await login(homeserverUrl, userId, password);
 };
 
 export const loginWithToken = async (homeserverUrl: string, loginToken: string): Promise<MatrixClient> => {

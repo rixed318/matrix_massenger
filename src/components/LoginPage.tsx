@@ -10,7 +10,14 @@ import {
   getSecureCloudDetectorCatalog,
 } from '@matrix-messenger/core';
 import ServerDeploymentWizard from './ServerDeploymentWizard';
-import { useAccountStore } from '../services/accountManager';
+import { useAccountStore, createAccountKey } from '../services/accountManager';
+import {
+  listPasskeyDevices,
+  removePasskeyDevice,
+  savePasskeyDevice,
+  touchPasskeyDevice,
+  type StoredPasskeyDevice,
+} from '../services/passkeyStore';
 
 interface LoginPageProps {
   onLoginSuccess?: (client: MatrixClient) => void;
@@ -31,6 +38,36 @@ const getDefaultHomeserver = (connectionType: ConnectionType) => {
     case 'selfhosted':
     default:
       return '';
+  }
+};
+
+const deriveAccountKey = (homeserverUrl: string, username: string): string | null => {
+  const trimmedHomeserver = homeserverUrl.trim();
+  const trimmedUsername = username.trim();
+  if (!trimmedHomeserver || !trimmedUsername) return null;
+  try {
+    const url = new URL(trimmedHomeserver);
+    const hasDomain = trimmedUsername.includes(':');
+    const normalisedUserId = hasDomain
+      ? trimmedUsername.startsWith('@')
+        ? trimmedUsername
+        : `@${trimmedUsername}`
+      : `@${trimmedUsername.replace(/^@/, '')}:${url.host}`;
+    return createAccountKey({ homeserver_url: trimmedHomeserver, user_id: normalisedUserId, access_token: '' });
+  } catch {
+    return null;
+  }
+};
+
+const describePasskeyType = (value?: string | null): string => {
+  switch (value) {
+    case 'security-key':
+      return 'Аппаратный ключ';
+    case 'webauthn':
+      return 'WebAuthn';
+    case 'passkey':
+    default:
+      return 'Passkey';
   }
 };
 
@@ -106,6 +143,51 @@ const LoginForm: React.FC<{
   const [selectedModels, setSelectedModels] = useState<Record<string, string>>(defaultModelMapping);
   const [userSensitivity, setUserSensitivity] = useState<'low' | 'medium' | 'high'>('medium');
   const [organizationSensitivity, setOrganizationSensitivity] = useState<'low' | 'medium' | 'high'>('medium');
+
+  const [passkeyDevices, setPasskeyDevices] = useState<StoredPasskeyDevice[]>([]);
+  const [passkeyLoading, setPasskeyLoading] = useState(false);
+  const [passkeyError, setPasskeyError] = useState<string | null>(null);
+
+  const refreshPasskeys = useCallback(async () => {
+    const key = deriveAccountKey(homeserverUrl, username);
+    if (!key) {
+      setPasskeyDevices([]);
+      setPasskeyError(null);
+      return;
+    }
+    setPasskeyLoading(true);
+    try {
+      const devices = await listPasskeyDevices(key);
+      setPasskeyDevices(devices);
+      setPasskeyError(null);
+    } catch (err: any) {
+      setPasskeyDevices([]);
+      setPasskeyError(err?.message ? `Не удалось загрузить passkey: ${err.message}` : 'Не удалось загрузить passkey.');
+    } finally {
+      setPasskeyLoading(false);
+    }
+  }, [homeserverUrl, username]);
+
+  useEffect(() => {
+    void refreshPasskeys();
+  }, [refreshPasskeys]);
+
+  const handleRemovePasskey = useCallback(
+    async (credentialId: string) => {
+      const key = deriveAccountKey(homeserverUrl, username);
+      if (!key) return;
+      try {
+        await removePasskeyDevice(key, credentialId);
+        await refreshPasskeys();
+      } catch (err) {
+        console.warn('Failed to remove passkey device', err);
+      }
+    },
+    [homeserverUrl, username, refreshPasskeys],
+  );
+
+  const shouldShowPasskeys = Boolean(homeserverUrl.trim() && username.trim());
+  const hasAccountKey = shouldShowPasskeys && deriveAccountKey(homeserverUrl, username) !== null;
 
   // Reset form fields when connection type changes
   useEffect(() => {
@@ -367,6 +449,56 @@ const handleSubmit = (e: FormEvent) => {
             {totpValidationError && (
               <p className="text-xs text-error" role="alert">{totpValidationError}</p>
             )}
+          </div>
+        )}
+        {shouldShowPasskeys && (
+          <div className="space-y-2 border border-border-primary rounded-md p-3 bg-bg-tertiary/30">
+            <div className="flex items-center justify-between text-xs">
+              <span className="font-semibold uppercase tracking-wide text-text-primary">Passkey устройства</span>
+              <button
+                type="button"
+                className="text-text-accent hover:underline disabled:opacity-50"
+                onClick={() => void refreshPasskeys()}
+                disabled={passkeyLoading || !hasAccountKey}
+              >
+                Обновить
+              </button>
+            </div>
+            {passkeyError && <p className="text-xs text-error" role="alert">{passkeyError}</p>}
+            {passkeyLoading ? (
+              <p className="text-xs text-text-secondary">Загрузка списка устройств...</p>
+            ) : passkeyDevices.length > 0 ? (
+              <ul className="space-y-2 text-xs">
+                {passkeyDevices.map((device) => (
+                  <li key={device.credentialId} className="flex items-start justify-between gap-2">
+                    <div>
+                      <div className="font-medium text-text-primary">{device.label}</div>
+                      <div className="text-text-secondary">
+                        {describePasskeyType((device as any).deviceType ?? (device as any).device_type)} ·{' '}
+                        {device.lastUsedAt
+                          ? new Date(device.lastUsedAt).toLocaleString()
+                          : 'ещё не использовалось'}
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      className="text-red-400 hover:underline disabled:opacity-40"
+                      onClick={() => void handleRemovePasskey(device.credentialId)}
+                      disabled={passkeyLoading}
+                    >
+                      Удалить
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p className="text-xs text-text-secondary">
+                Passkey устройства для этой учётной записи не найдены.
+              </p>
+            )}
+            <p className="text-[11px] text-text-secondary leading-snug">
+              Passkey будет запрошен автоматически, когда сервер потребует подтверждение WebAuthn вместе с паролем.
+            </p>
           </div>
         )}
         {(connectionType === 'secure' || connectionType === 'selfhosted') && (
@@ -733,6 +865,46 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess, initialError, sav
     applyError(initialErrorValue);
   }, [initialErrorValue]);
 
+  const persistPasskeyRecord = useCallback(
+    async (
+      client: MatrixClient,
+      details: PasskeyAssertionDetails | PasskeyAttestationDetails | null,
+    ) => {
+      if (!details) return;
+      try {
+        const homeserver = client.getHomeserverUrl?.() ?? '';
+        const userId = client.getUserId?.() ?? '';
+        if (!homeserver || !userId) return;
+        const accountKey = createAccountKey({
+          homeserver_url: homeserver,
+          user_id: userId,
+          access_token: client.getAccessToken?.() ?? '',
+        });
+        const existing = await listPasskeyDevices(accountKey);
+        const deviceType = details.stage === 'm.login.passkey' ? 'passkey' : 'webauthn';
+        const now = Date.now();
+        const matched = existing.find(device => device.credentialId === details.credentialId);
+        if (matched) {
+          await touchPasskeyDevice(accountKey, details.credentialId);
+          return;
+        }
+        const labelBase = deviceType === 'passkey' ? 'Passkey' : 'WebAuthn';
+        await savePasskeyDevice(accountKey, {
+          credentialId: details.credentialId,
+          userId,
+          label: `${labelBase} ${existing.length + 1}`,
+          addedAt: now,
+          lastUsedAt: now,
+          transports: details.transports ?? undefined,
+          deviceType,
+        });
+      } catch (err) {
+        console.warn('Failed to persist passkey metadata', err);
+      }
+    },
+    [],
+  );
+
   const handleLogin = async (
     homeserverInput: string,
     username: string,
@@ -742,6 +914,7 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess, initialError, sav
     applyError(null);
     setTotpValidationError(null);
     setIsLoading(true);
+    let capturedPasskey: PasskeyAssertionDetails | null = null;
     try {
       const baseUrl = await resolveHomeserverBaseUrl(homeserverInput);
       const options: LoginOptions = {};
@@ -751,10 +924,15 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess, initialError, sav
         options.totpCode = trimmedTotp;
         if (totpSessionId) options.totpSessionId = totpSessionId;
       }
+      options.onPasskeyAssertion = (details) => {
+        capturedPasskey = details;
+        loginOptions?.onPasskeyAssertion?.(details);
+      };
 
       const client = Object.keys(options).length
         ? await login(baseUrl, username, password, options)
         : await login(baseUrl, username, password);
+      await persistPasskeyRecord(client, capturedPasskey);
       await resolvedOnLoginSuccess(client);
       resetTotpState();
     } catch (err: any) {
@@ -789,8 +967,20 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess, initialError, sav
   const handleRegister = async (homeserverUrl: string, username: string, password: string) => {
     applyError(null);
     setIsLoading(true);
+    let capturedAttestation: PasskeyAttestationDetails | null = null;
+    let capturedAssertion: PasskeyAssertionDetails | null = null;
     try {
-      const client = await registerAccount(homeserverUrl, username, password);
+      const registerOptions: RegisterOptions = {
+        onPasskeyAttestation: (details) => {
+          capturedAttestation = details;
+        },
+        onPasskeyAssertion: (details) => {
+          capturedAssertion = details;
+        },
+      };
+      const client = await registerAccount(homeserverUrl, username, password, registerOptions);
+      await persistPasskeyRecord(client, capturedAttestation);
+      await persistPasskeyRecord(client, capturedAssertion);
       await resolvedOnLoginSuccess(client);
     } catch (err: any) {
       console.error(err);

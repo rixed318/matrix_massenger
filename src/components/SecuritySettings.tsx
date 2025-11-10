@@ -52,6 +52,7 @@ interface DeviceSummary {
   lastSeenTs?: number;
   verified: boolean;
   crossSigningVerified: boolean;
+  deviceType?: string | null;
 }
 
 const qrScale = 4;
@@ -279,6 +280,12 @@ const SecuritySettings: React.FC<SecuritySettingsProps> = ({ client, isOpen, onC
           lastSeenTs: raw?.last_seen_ts ?? raw?.lastSeenTs ?? stored?.lastSeenTs,
           verified,
           crossSigningVerified: Boolean(trust?.isCrossSigningVerified?.()),
+          deviceType:
+            stored?.deviceType ??
+            stored?.device_type ??
+            raw?.device_type ??
+            raw?.deviceType ??
+            null,
         } satisfies DeviceSummary;
       };
 
@@ -1009,7 +1016,10 @@ const SecuritySettings: React.FC<SecuritySettingsProps> = ({ client, isOpen, onC
                     <tr key={device.deviceId}>
                       <td className="px-4 py-2">
                         <div className="font-medium text-text-primary">{device.displayName}</div>
-                        <div className="text-xs text-text-secondary">ID: {device.deviceId}</div>
+                        <div className="text-xs text-text-secondary">
+                          ID: {device.deviceId}
+                          {device.deviceType ? ` · ${describeDeviceType(device.deviceType)}` : ''}
+                        </div>
                       </td>
                       <td className="px-4 py-2 text-text-secondary">
                         {device.lastSeenTs
@@ -1533,3 +1543,15 @@ const SecuritySettings: React.FC<SecuritySettingsProps> = ({ client, isOpen, onC
 };
 
 export default SecuritySettings;
+const describeDeviceType = (value?: string | null): string => {
+  switch (value) {
+    case 'passkey':
+      return 'Passkey';
+    case 'webauthn':
+      return 'WebAuthn';
+    case 'security-key':
+      return 'Аппаратный ключ';
+    default:
+      return 'Устройство';
+  }
+};
