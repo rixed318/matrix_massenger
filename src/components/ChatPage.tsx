@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo, useReducer } from 'react';
 // FIX: Import MatrixRoom to correctly type room objects from the SDK.
-import { Room as UIRoom, Message, MatrixEvent, Reaction, ReplyInfo, MatrixClient, MatrixRoom, ActiveThread, MatrixUser, Poll, PollResult, Folder, ScheduledMessage, ScheduledMessageScheduleUpdate, ScheduledMessageUpdatePayload, MatrixCall, LinkPreviewData, Sticker, Gif, RoomNotificationMode } from '@matrix-messenger/core';
+import { Room as UIRoom, Message, MatrixEvent, Reaction, ReplyInfo, MatrixClient, MatrixRoom, ActiveThread, MatrixUser, Poll, PollResult, Folder, ScheduledMessage, ScheduledMessageScheduleUpdate, ScheduledMessageUpdatePayload, MatrixCall, LinkPreviewData, Sticker, Gif, RoomNotificationMode, Story } from '@matrix-messenger/core';
 import RoomList from './RoomList';
 import MessageView from './MessageView';
 import ChatHeader from './ChatHeader';
@@ -34,6 +34,8 @@ import IncomingCallModal from './IncomingCallModal';
 import CallView from './CallView';
 import SearchModal from './SearchModal';
 import PluginCatalogModal from './PluginCatalogModal';
+import StoriesTray from './StoriesTray';
+import StoryViewer from './StoryViewer';
 import { SearchResultItem } from '@matrix-messenger/core';
 import type { DraftContent, SendKeyBehavior, DraftAttachment, DraftAttachmentKind, VideoMessageMetadata } from '../types';
 import SharedMediaPanel from './SharedMediaPanel';
@@ -70,6 +72,7 @@ import type { CallLayout } from './CallView';
 import { useAccountStore } from '../services/accountManager';
 import { getAppLockSnapshot, unlockWithPin, unlockWithBiometric, isSessionUnlocked, ensureAppLockConsistency } from '../services/appLockService';
 import { presenceReducer, PresenceEventContent } from '../state/presenceReducer';
+import { useStoryStore, markActiveStoryAsRead, toggleActiveStoryReaction } from '../state/storyStore';
 import {
     describePresence,
     canSharePresenceInRoom,
@@ -961,6 +964,11 @@ const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, s
     const [spotlightParticipantId, setSpotlightParticipantId] = useState<string | null>(null);
     const previousParticipantIdsRef = useRef<Set<string>>(new Set());
     const [groupCallPermissionError, setGroupCallPermissionError] = useState<string | null>(null);
+    const stories = useStoryStore<Story[]>(state => state.stories);
+    const storiesHydrated = useStoryStore(state => state.isHydrated);
+    const [activeStoryAuthorId, setActiveStoryAuthorId] = useState<string | null>(null);
+    const [activeStoryIndex, setActiveStoryIndex] = useState(0);
+    const [isStoryViewerOpen, setIsStoryViewerOpen] = useState(false);
 
     const normalisePresenceContent = useCallback((content: PresenceEventContent): PresenceEventContent => {
         const enriched: PresenceEventContent = { ...content };
@@ -984,11 +992,113 @@ const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, s
         dispatchPresence({ type: 'replace', userId, content: normalisePresenceContent(content) });
     }, [currentUserId, dispatchPresence, isPresenceHidden, normalisePresenceContent]);
 
+    const storyGroups = useMemo(() => {
+        if (!stories || stories.length === 0) {
+            return [] as Array<{ authorId: string; authorDisplayName?: string; stories: Story[] }>;
+        }
+        const map = new Map<string, { authorId: string; authorDisplayName?: string; stories: Story[] }>();
+        stories.forEach(story => {
+            const entry = map.get(story.authorId);
+            if (entry) {
+                entry.stories.push(story);
+                if (!entry.authorDisplayName && story.authorDisplayName) {
+                    entry.authorDisplayName = story.authorDisplayName;
+                }
+            } else {
+                map.set(story.authorId, {
+                    authorId: story.authorId,
+                    authorDisplayName: story.authorDisplayName,
+                    stories: [story],
+                });
+            }
+        });
+        return Array.from(map.values())
+            .map(group => ({
+                ...group,
+                stories: [...group.stories].sort((a, b) => b.createdAt - a.createdAt),
+            }))
+            .sort((a, b) => (b.stories[0]?.createdAt ?? 0) - (a.stories[0]?.createdAt ?? 0));
+    }, [stories]);
+
+    const activeStoryGroup = useMemo(() => storyGroups.find(group => group.authorId === activeStoryAuthorId) ?? null, [storyGroups, activeStoryAuthorId]);
+
     useEffect(() => {
         if (!groupCallPermissionError) return;
         const timer = window.setTimeout(() => setGroupCallPermissionError(null), 5000);
         return () => window.clearTimeout(timer);
     }, [groupCallPermissionError]);
+
+    useEffect(() => {
+        if (!isStoryViewerOpen) {
+            return;
+        }
+        if (!activeStoryGroup) {
+            setIsStoryViewerOpen(false);
+            setActiveStoryIndex(0);
+            return;
+        }
+        if (activeStoryIndex >= activeStoryGroup.stories.length) {
+            setActiveStoryIndex(0);
+        }
+    }, [isStoryViewerOpen, activeStoryGroup, activeStoryIndex]);
+
+    const handleOpenStory = useCallback((authorId: string, index: number) => {
+        setActiveStoryAuthorId(authorId);
+        setActiveStoryIndex(index);
+        setIsStoryViewerOpen(true);
+    }, []);
+
+    const handleCloseStoryViewer = useCallback(() => {
+        setIsStoryViewerOpen(false);
+    }, []);
+
+    const handleStorySeen = useCallback((storyId: string) => {
+        void markActiveStoryAsRead(storyId);
+    }, []);
+
+    const handleStoryReaction = useCallback((storyId: string, emoji: string) => {
+        void toggleActiveStoryReaction(storyId, emoji);
+    }, []);
+
+    const handleStoryNext = useCallback(() => {
+        if (!activeStoryGroup) {
+            setIsStoryViewerOpen(false);
+            return;
+        }
+        setActiveStoryIndex(prevIndex => {
+            if (prevIndex < activeStoryGroup.stories.length - 1) {
+                return prevIndex + 1;
+            }
+            const currentGroupIndex = storyGroups.findIndex(group => group.authorId === activeStoryGroup.authorId);
+            if (currentGroupIndex >= 0 && currentGroupIndex < storyGroups.length - 1) {
+                const nextGroup = storyGroups[currentGroupIndex + 1];
+                setActiveStoryAuthorId(nextGroup.authorId);
+                return 0;
+            }
+            setIsStoryViewerOpen(false);
+            return prevIndex;
+        });
+    }, [activeStoryGroup, storyGroups]);
+
+    const handleStoryPrevious = useCallback(() => {
+        if (!activeStoryGroup) {
+            setIsStoryViewerOpen(false);
+            return;
+        }
+        setActiveStoryIndex(prevIndex => {
+            if (prevIndex > 0) {
+                return prevIndex - 1;
+            }
+            const currentGroupIndex = storyGroups.findIndex(group => group.authorId === activeStoryGroup.authorId);
+            if (currentGroupIndex > 0) {
+                const previousGroup = storyGroups[currentGroupIndex - 1];
+                setActiveStoryAuthorId(previousGroup.authorId);
+                return Math.max(previousGroup.stories.length - 1, 0);
+            }
+            setIsStoryViewerOpen(false);
+            return prevIndex;
+        });
+    }, [activeStoryGroup, storyGroups]);
 
     useEffect(() => {
         if (!currentUserId) {
@@ -3789,6 +3899,9 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
             <main
                 style={{ backgroundImage: chatBackground ? `url(${chatBackground})` : 'none' }}
                 className={`flex-1 flex flex-col bg-bg-tertiary relative transition-all duration-300 bg-cover bg-center ${activeThread ? 'w-1/2' : 'w-full'}`}>
+                {storiesHydrated && storyGroups.length > 0 && (
+                    <StoriesTray client={client} stories={stories} onSelect={handleOpenStory} />
+                )}
                 {selectedRoom ? (
                     <>
                         <ChatHeader
@@ -3829,8 +3942,20 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
                     </>
                 ) : <WelcomeView client={client} />}
             </main>
-            
+
             <ChatSidePanels {...sidePanelsProps} />
+            {isStoryViewerOpen && activeStoryGroup && (
+                <StoryViewer
+                    client={client}
+                    stories={activeStoryGroup.stories}
+                    initialIndex={activeStoryIndex}
+                    onClose={handleCloseStoryViewer}
+                    onStorySeen={handleStorySeen}
+                    onReact={handleStoryReaction}
+                    onRequestNext={handleStoryNext}
+                    onRequestPrevious={handleStoryPrevious}
+                />
+            )}
         </div>
     );
 };
