@@ -11,6 +11,7 @@ export * from '../../../src/services/notificationService';
 export * from '../../../src/services/pushService';
 export * from '../../../src/services/roomNotificationService';
 export * from '../../../src/services/searchService';
+export * from '../../../src/services/universalSearchService';
 export * from '../../../src/hooks/useChats';
 export * from '../../../src/hooks/useRoomTimeline';
 export * from '../../../src/services/matrixRuntime';
