@@ -20,7 +20,12 @@ import {
   isUniversalQuickFilterId,
 } from '../utils/chatSelectors';
 import { attachStoriesToAccount, detachStoriesFromAccount, setActiveStoryAccount } from '../state/storyStore';
-import { SCHEDULED_MESSAGES_EVENT_TYPE, parseScheduledMessagesFromEvent, getCachedScheduledMessages } from './schedulerService';
+import {
+  SCHEDULED_MESSAGES_EVENT_TYPE,
+  parseScheduledMessagesFromEvent,
+  getCachedScheduledMessages,
+  startAutomationRuntime,
+} from './schedulerService';
 import { getSuspiciousEvents } from './secureCloudService';
 import { bindCallStateStore, CallSessionState, getCallSessionForAccount, subscribeCallState } from './matrixService';
 
@@ -364,16 +369,23 @@ export const createAccountStore = () => {
       const detachAggregated = attachAggregatedListeners(account.key, session.client);
       const detachCallStateSubscription = attachCallStateListeners(account.key);
       let detachCallStateBinding: (() => void) | null = null;
+      let detachAutomationRuntime: (() => void) | null = null;
       try {
         detachCallStateBinding = bindCallStateStore(session.client);
       } catch (error) {
         console.warn('bindCallStateStore failed', error);
+      }
+      try {
+        detachAutomationRuntime = startAutomationRuntime(session.client);
+      } catch (error) {
+        console.warn('startAutomationRuntime failed', error);
       }
 
       sessionCleanup.set(account.key, () => {
         try { detachAggregated(); } catch (error) { console.warn('aggregation detach failed', error); }
         try { detachCallStateSubscription(); } catch (error) { console.warn('call state subscription detach failed', error); }
         try { detachCallStateBinding?.(); } catch (error) { console.warn('call state detach failed', error); }
+        try { detachAutomationRuntime?.(); } catch (error) { console.warn('automation runtime detach failed', error); }
         try { session.dispose(); } catch (error) { console.warn('dispose failed', error); }
         try { session.client.stopClient?.(); } catch (error) { console.warn('stopClient failed', error); }
       });

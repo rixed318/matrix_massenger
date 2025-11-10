@@ -1,6 +1,7 @@
-import { MatrixClient } from '../types';
+import { MatrixClient, DraftContent } from '../types';
 import { getAccountStore } from './accountManager';
-import { sendNotification } from './notificationService';
+import { generateSmartReplies, getSmartReplySettings } from './aiComposeService';
+import type { SmartReplySuggestion } from './aiComposeService';
 
 const isBrowser = typeof window !== 'undefined';
 
@@ -198,4 +199,39 @@ export const registerMatrixWebPush = async (
   }
 
   return serialized;
+};
+
+export interface NotificationSmartReplyOptions {
+  roomId: string;
+  accountKey?: string | null;
+  draft?: DraftContent | null;
+  limit?: number;
+  signal?: AbortSignal;
+}
+
+export const generateNotificationSmartReplies = async (
+  options: NotificationSmartReplyOptions,
+): Promise<SmartReplySuggestion[]> => {
+  const store = getAccountStore();
+  const targetKey = options.accountKey ?? store.getState().activeKey;
+  if (!targetKey) {
+    return [];
+  }
+  const account = store.getState().accounts[targetKey];
+  if (!account) {
+    return [];
+  }
+  const settings = getSmartReplySettings(account.client);
+  if (!settings.enabled) {
+    return [];
+  }
+  try {
+    return await generateSmartReplies(account.client, options.roomId, options.draft, {
+      limit: options.limit ?? 3,
+      signal: options.signal,
+    });
+  } catch (error) {
+    console.warn('smart-reply: failed to compose notification suggestions', error);
+    return [];
+  }
 };

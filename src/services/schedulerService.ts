@@ -1,5 +1,8 @@
+import { ClientEvent, RoomEvent } from 'matrix-js-sdk';
 import { MatrixClient, MatrixEvent, ScheduledMessage, ScheduledMessageRecurrence, DraftAttachment, DraftContent, DraftAttachmentKind, LocationContentPayload } from '../types';
 import { computeLocalTimestamp } from '../utils/timezone';
+import { onBotBridgeWebhook, BotBridgeWebhookPayload } from './botBridgeWebhook';
+import { sendNotification } from './notificationService';
 
 export const SCHEDULED_MESSAGES_EVENT_TYPE = 'com.matrix_messenger.scheduled';
 
@@ -788,6 +791,854 @@ export const applyScheduledMessagesEvent = (client: MatrixClient, event: MatrixE
         updateCacheForRoom(client, roomId, messages);
     }
     return getCachedScheduledMessages(client);
+};
+
+
+// ===================== Automations =====================
+
+export type AutomationTrigger =
+    | {
+        type: 'room_event';
+        eventType: string;
+        roomId?: string;
+        stateKey?: string;
+        sender?: string;
+    }
+    | {
+        type: 'webhook';
+        event: string;
+        connectorId?: string;
+    };
+
+export type AutomationConditionOperator = 'equals' | 'contains' | 'matches';
+
+export interface AutomationCondition {
+    field: string;
+    operator: AutomationConditionOperator;
+    value: string;
+}
+
+export interface AutomationActionSendMessage {
+    type: 'send_message';
+    roomId?: string;
+    content?: DraftContent;
+}
+
+export interface AutomationActionAssignRole {
+    type: 'assign_role';
+    roomId: string;
+    userId: string;
+    role: string;
+    reason?: string;
+}
+
+export interface AutomationActionInvokePlugin {
+    type: 'invoke_plugin';
+    pluginId: string;
+    event?: string;
+    payload?: Record<string, unknown>;
+}
+
+export type AutomationAction = AutomationActionSendMessage | AutomationActionAssignRole | AutomationActionInvokePlugin;
+
+export type AutomationExecutionStatus = 'idle' | 'pending' | 'running' | 'success' | 'error';
+
+export interface AutomationRule {
+    id: string;
+    name: string;
+    description?: string;
+    enabled: boolean;
+    triggers: AutomationTrigger[];
+    conditions: AutomationCondition[];
+    actions: AutomationAction[];
+    status?: AutomationExecutionStatus;
+    lastRunAt?: number;
+    lastError?: string;
+}
+
+type AutomationAccountState = {
+    version: number;
+    updatedAt: number;
+    rules: AutomationRule[];
+};
+
+type AutomationExecutionContext =
+    | { kind: 'room_event'; event: MatrixEvent }
+    | { kind: 'webhook'; payload: BotBridgeWebhookPayload };
+
+type AutomationExecutionJob = {
+    ruleId: string;
+    context: AutomationExecutionContext;
+};
+
+type AutomationRuntime = {
+    rules: AutomationRule[];
+    queue: AutomationExecutionJob[];
+    processing: boolean;
+    webhookUnsubscribe?: () => void;
+};
+
+const AUTOMATION_EVENT_TYPE = 'com.matrix_messenger.automation';
+const AUTOMATION_EVENT_VERSION = 1;
+
+const automationRuntimeStore = new WeakMap<MatrixClient, AutomationRuntime>();
+
+const cloneDraftContentValue = (content?: DraftContent): DraftContent | undefined => {
+    if (!content) {
+        return undefined;
+    }
+    return {
+        plain: content.plain,
+        formatted: content.formatted,
+        msgtype: content.msgtype,
+        location: content.location ? { ...content.location } : undefined,
+        attachments: content.attachments.map(attachment => ({
+            ...attachment,
+            waveform: attachment.waveform ? [...attachment.waveform] : undefined,
+        })),
+    };
+};
+
+const cloneAutomationRule = (rule: AutomationRule): AutomationRule => ({
+    ...rule,
+    triggers: rule.triggers.map(trigger => ({ ...trigger })),
+    conditions: rule.conditions.map(condition => ({ ...condition })),
+    actions: rule.actions.map(action => {
+        if (action.type === 'send_message') {
+            return {
+                ...action,
+                content: cloneDraftContentValue(action.content),
+            } satisfies AutomationActionSendMessage;
+        }
+        if (action.type === 'assign_role') {
+            return { ...action } satisfies AutomationActionAssignRole;
+        }
+        return {
+            ...action,
+            payload: action.payload ? { ...action.payload } : undefined,
+        } satisfies AutomationActionInvokePlugin;
+    }),
+});
+
+const getAutomationRuntime = (client: MatrixClient): AutomationRuntime => {
+    let runtime = automationRuntimeStore.get(client);
+    if (!runtime) {
+        const initial = readAutomationState(client);
+        runtime = {
+            rules: initial.rules.map(cloneAutomationRule),
+            queue: [],
+            processing: false,
+        };
+        automationRuntimeStore.set(client, runtime);
+    }
+    return runtime;
+};
+
+const normalizeAutomationTrigger = (raw: any): AutomationTrigger | null => {
+    if (!raw || typeof raw !== 'object') {
+        return null;
+    }
+    const type = typeof raw.type === 'string'
+        ? raw.type
+        : typeof raw.kind === 'string'
+            ? raw.kind
+            : null;
+    if (type === 'room_event') {
+        const eventType = typeof raw.eventType === 'string'
+            ? raw.eventType
+            : typeof raw.event === 'string'
+                ? raw.event
+                : null;
+        if (!eventType) {
+            return null;
+        }
+        const roomId = typeof raw.roomId === 'string' && raw.roomId.length > 0 ? raw.roomId : undefined;
+        const stateKey = typeof raw.stateKey === 'string' && raw.stateKey.length > 0 ? raw.stateKey : undefined;
+        const sender = typeof raw.sender === 'string' && raw.sender.length > 0 ? raw.sender : undefined;
+        return { type: 'room_event', eventType, roomId, stateKey, sender };
+    }
+    if (type === 'webhook') {
+        const eventName = typeof raw.event === 'string' && raw.event.length > 0
+            ? raw.event
+            : typeof raw.eventName === 'string'
+                ? raw.eventName
+                : null;
+        if (!eventName) {
+            return null;
+        }
+        const connectorId = typeof raw.connectorId === 'string' && raw.connectorId.length > 0 ? raw.connectorId : undefined;
+        return { type: 'webhook', event: eventName, connectorId };
+    }
+    return null;
+};
+
+const normalizeAutomationCondition = (raw: any): AutomationCondition | null => {
+    if (!raw || typeof raw !== 'object') {
+        return null;
+    }
+    const field = typeof raw.field === 'string'
+        ? raw.field
+        : typeof raw.path === 'string'
+            ? raw.path
+            : null;
+    if (!field) {
+        return null;
+    }
+    const operator: AutomationConditionOperator = raw.operator === 'contains'
+        ? 'contains'
+        : raw.operator === 'matches'
+            ? 'matches'
+            : 'equals';
+    const value = typeof raw.value === 'string'
+        ? raw.value
+        : raw.value != null
+            ? String(raw.value)
+            : '';
+    return { field, operator, value };
+};
+
+const normalizeAutomationAction = (raw: any): AutomationAction | null => {
+    if (!raw || typeof raw !== 'object') {
+        return null;
+    }
+    const type = typeof raw.type === 'string'
+        ? raw.type
+        : typeof raw.kind === 'string'
+            ? raw.kind
+            : null;
+    if (type === 'send_message') {
+        const roomId = typeof raw.roomId === 'string' && raw.roomId.length > 0 ? raw.roomId : undefined;
+        const content = raw.content ? normalizeDraftContent(raw.content) : undefined;
+        return { type: 'send_message', roomId, content } satisfies AutomationActionSendMessage;
+    }
+    if (type === 'assign_role') {
+        const roomId = typeof raw.roomId === 'string' && raw.roomId.length > 0 ? raw.roomId : null;
+        const userId = typeof raw.userId === 'string' && raw.userId.length > 0 ? raw.userId : null;
+        const role = typeof raw.role === 'string' && raw.role.length > 0
+            ? raw.role
+            : typeof raw.roleId === 'string' && raw.roleId.length > 0
+                ? raw.roleId
+                : null;
+        if (!roomId || !userId || !role) {
+            return null;
+        }
+        const reason = typeof raw.reason === 'string' && raw.reason.length > 0 ? raw.reason : undefined;
+        return { type: 'assign_role', roomId, userId, role, reason } satisfies AutomationActionAssignRole;
+    }
+    if (type === 'invoke_plugin') {
+        const pluginId = typeof raw.pluginId === 'string' && raw.pluginId.length > 0
+            ? raw.pluginId
+            : typeof raw.id === 'string' && raw.id.length > 0
+                ? raw.id
+                : null;
+        if (!pluginId) {
+            return null;
+        }
+        const event = typeof raw.event === 'string' && raw.event.length > 0 ? raw.event : undefined;
+        const payload = raw.payload && typeof raw.payload === 'object'
+            ? { ...raw.payload }
+            : undefined;
+        return { type: 'invoke_plugin', pluginId, event, payload } satisfies AutomationActionInvokePlugin;
+    }
+    return null;
+};
+
+const normalizeAutomationRule = (raw: any): AutomationRule | null => {
+    if (!raw || typeof raw !== 'object') {
+        return null;
+    }
+    const id = typeof raw.id === 'string' && raw.id.length > 0
+        ? raw.id
+        : typeof raw.key === 'string' && raw.key.length > 0
+            ? raw.key
+            : `automation_${Date.now()}`;
+    const name = typeof raw.name === 'string' && raw.name.length > 0
+        ? raw.name
+        : 'Automation';
+    const description = typeof raw.description === 'string' && raw.description.length > 0
+        ? raw.description
+        : undefined;
+    const enabled = raw.enabled === false ? false : raw.disabled === true ? false : true;
+    const triggersRaw = Array.isArray(raw.triggers)
+        ? raw.triggers
+        : raw.trigger
+            ? [raw.trigger]
+            : [];
+    const triggers = triggersRaw
+        .map(entry => normalizeAutomationTrigger(entry))
+        .filter((entry): entry is AutomationTrigger => Boolean(entry));
+    if (triggers.length === 0) {
+        return null;
+    }
+    const conditionsRaw = Array.isArray(raw.conditions) ? raw.conditions : [];
+    const conditions = conditionsRaw
+        .map(entry => normalizeAutomationCondition(entry))
+        .filter((entry): entry is AutomationCondition => Boolean(entry));
+    const actionsRaw = Array.isArray(raw.actions)
+        ? raw.actions
+        : raw.action
+            ? [raw.action]
+            : [];
+    const actions = actionsRaw
+        .map(entry => normalizeAutomationAction(entry))
+        .filter((entry): entry is AutomationAction => Boolean(entry));
+    if (actions.length === 0) {
+        return null;
+    }
+    const status: AutomationExecutionStatus = raw.status === 'pending'
+        || raw.status === 'running'
+        || raw.status === 'success'
+        || raw.status === 'error'
+        ? raw.status
+        : 'idle';
+    const lastRunAt = typeof raw.lastRunAt === 'number' && Number.isFinite(raw.lastRunAt) ? raw.lastRunAt : undefined;
+    const lastError = typeof raw.lastError === 'string' && raw.lastError.length > 0 ? raw.lastError : undefined;
+    return {
+        id,
+        name,
+        description,
+        enabled,
+        triggers,
+        conditions,
+        actions,
+        status,
+        lastRunAt,
+        lastError,
+    } satisfies AutomationRule;
+};
+
+const serializeAutomationTrigger = (trigger: AutomationTrigger): Record<string, unknown> => {
+    if (trigger.type === 'room_event') {
+        return {
+            type: 'room_event',
+            eventType: trigger.eventType,
+            roomId: trigger.roomId,
+            stateKey: trigger.stateKey,
+            sender: trigger.sender,
+        };
+    }
+    return {
+        type: 'webhook',
+        event: trigger.event,
+        connectorId: trigger.connectorId,
+    };
+};
+
+const serializeAutomationCondition = (condition: AutomationCondition): Record<string, unknown> => ({
+    field: condition.field,
+    operator: condition.operator,
+    value: condition.value,
+});
+
+const serializeAutomationAction = (action: AutomationAction): Record<string, unknown> => {
+    if (action.type === 'send_message') {
+        return {
+            type: 'send_message',
+            roomId: action.roomId,
+            content: action.content ? serializeDraftContent(action.content) : undefined,
+        };
+    }
+    if (action.type === 'assign_role') {
+        return {
+            type: 'assign_role',
+            roomId: action.roomId,
+            userId: action.userId,
+            role: action.role,
+            reason: action.reason,
+        };
+    }
+    return {
+        type: 'invoke_plugin',
+        pluginId: action.pluginId,
+        event: action.event,
+        payload: action.payload,
+    };
+};
+
+const serializeAutomationRule = (rule: AutomationRule): Record<string, unknown> => ({
+    id: rule.id,
+    name: rule.name,
+    description: rule.description,
+    enabled: rule.enabled,
+    triggers: rule.triggers.map(serializeAutomationTrigger),
+    conditions: rule.conditions.map(serializeAutomationCondition),
+    actions: rule.actions.map(serializeAutomationAction),
+    status: rule.status,
+    lastRunAt: rule.lastRunAt,
+    lastError: rule.lastError,
+});
+
+const readAutomationState = (client: MatrixClient): AutomationAccountState => {
+    try {
+        const event = client.getAccountData?.(AUTOMATION_EVENT_TYPE as any);
+        if (!event) {
+            return { version: AUTOMATION_EVENT_VERSION, updatedAt: 0, rules: [] };
+        }
+        const content = event.getContent?.() ?? {};
+        const rulesRaw = Array.isArray((content as any).rules) ? (content as any).rules : [];
+        const rules = rulesRaw
+            .map(entry => normalizeAutomationRule(entry))
+            .filter((entry): entry is AutomationRule => Boolean(entry));
+        const version = typeof (content as any).version === 'number'
+            ? (content as any).version
+            : AUTOMATION_EVENT_VERSION;
+        const updatedAt = typeof (content as any).updatedAt === 'number'
+            ? (content as any).updatedAt
+            : 0;
+        return { version, updatedAt, rules };
+    } catch (error) {
+        console.warn('Failed to read automation configuration from account data', error);
+        return { version: AUTOMATION_EVENT_VERSION, updatedAt: 0, rules: [] };
+    }
+};
+
+const persistAutomationState = async (client: MatrixClient, rules: AutomationRule[]): Promise<AutomationRule[]> => {
+    if (typeof client.setAccountData !== 'function') {
+        throw new Error('Matrix client does not support account data operations');
+    }
+    const payload = {
+        version: AUTOMATION_EVENT_VERSION,
+        updatedAt: Date.now(),
+        rules: rules.map(serializeAutomationRule),
+    };
+    await client.setAccountData(AUTOMATION_EVENT_TYPE as any, payload as any);
+    const runtime = getAutomationRuntime(client);
+    runtime.rules = rules.map(cloneAutomationRule);
+    return runtime.rules;
+};
+
+const mutateAutomationRules = async (
+    client: MatrixClient,
+    mutator: (rules: AutomationRule[]) => AutomationRule[],
+): Promise<AutomationRule[]> => {
+    const runtime = getAutomationRuntime(client);
+    const base = runtime.rules.map(cloneAutomationRule);
+    const next = mutator(base);
+    return persistAutomationState(client, next);
+};
+
+export const getAutomationRules = (client: MatrixClient): AutomationRule[] => {
+    const runtime = getAutomationRuntime(client);
+    return runtime.rules.map(cloneAutomationRule);
+};
+
+export const setAutomationRules = async (
+    client: MatrixClient,
+    rules: AutomationRule[],
+): Promise<AutomationRule[]> => persistAutomationState(client, rules.map(cloneAutomationRule));
+
+export const upsertAutomationRule = async (
+    client: MatrixClient,
+    rule: AutomationRule,
+): Promise<AutomationRule[]> => mutateAutomationRules(client, current => {
+    const existingIndex = current.findIndex(entry => entry.id === rule.id);
+    const prepared = cloneAutomationRule(rule);
+    if (existingIndex >= 0) {
+        const next = [...current];
+        next.splice(existingIndex, 1, prepared);
+        return next;
+    }
+    return [...current, prepared];
+});
+
+export const removeAutomationRule = async (
+    client: MatrixClient,
+    ruleId: string,
+): Promise<AutomationRule[]> => mutateAutomationRules(client, current => current.filter(entry => entry.id !== ruleId));
+
+export const toggleAutomationRule = async (
+    client: MatrixClient,
+    ruleId: string,
+    enabled: boolean,
+): Promise<AutomationRule[]> => mutateAutomationRules(client, current => current.map(entry => (
+    entry.id === ruleId
+        ? { ...entry, enabled }
+        : entry
+)));
+
+const extractFieldValue = (source: any, field: string): unknown => {
+    if (!field) {
+        return undefined;
+    }
+    const segments = field.split('.').map(segment => segment.trim()).filter(Boolean);
+    let current: any = source;
+    for (const segment of segments) {
+        if (current == null) {
+            return undefined;
+        }
+        current = current[segment];
+    }
+    return current;
+};
+
+const evaluateCondition = (condition: AutomationCondition, context: any): boolean => {
+    const actual = extractFieldValue(context, condition.field);
+    if (actual == null) {
+        return false;
+    }
+    const actualString = typeof actual === 'string'
+        ? actual
+        : (() => {
+            try { return JSON.stringify(actual); } catch (_) { return String(actual); }
+        })();
+    switch (condition.operator) {
+        case 'contains':
+            return actualString.includes(condition.value);
+        case 'matches':
+            try {
+                const regex = new RegExp(condition.value);
+                return regex.test(actualString);
+            } catch (error) {
+                console.warn('Invalid automation regex condition', condition.value, error);
+                return false;
+            }
+        case 'equals':
+        default:
+            return actualString === condition.value;
+    }
+};
+
+const evaluateConditions = (conditions: AutomationCondition[], context: any): boolean => {
+    if (!conditions || conditions.length === 0) {
+        return true;
+    }
+    return conditions.every(condition => evaluateCondition(condition, context));
+};
+
+const triggerMatchesEvent = (trigger: AutomationTrigger, event: MatrixEvent): boolean => {
+    if (trigger.type !== 'room_event') {
+        return false;
+    }
+    if (trigger.eventType && trigger.eventType !== event.getType?.()) {
+        return false;
+    }
+    if (trigger.roomId && trigger.roomId !== event.getRoomId?.()) {
+        return false;
+    }
+    if (trigger.stateKey && trigger.stateKey !== event.getStateKey?.()) {
+        return false;
+    }
+    if (trigger.sender && trigger.sender !== event.getSender?.()) {
+        return false;
+    }
+    return true;
+};
+
+const triggerMatchesWebhook = (trigger: AutomationTrigger, payload: BotBridgeWebhookPayload): boolean => {
+    if (trigger.type !== 'webhook') {
+        return false;
+    }
+    if (trigger.event !== payload.event) {
+        return false;
+    }
+    if (trigger.connectorId && trigger.connectorId !== payload.connectorId) {
+        return false;
+    }
+    return true;
+};
+
+const setAutomationRuleStatus = async (
+    client: MatrixClient,
+    ruleId: string,
+    status: AutomationExecutionStatus,
+    errorMessage?: string,
+): Promise<void> => {
+    await mutateAutomationRules(client, current => current.map(rule => {
+        if (rule.id !== ruleId) {
+            return rule;
+        }
+        const timestamp = Date.now();
+        if (status === 'success') {
+            return { ...rule, status, lastRunAt: timestamp, lastError: undefined };
+        }
+        if (status === 'error') {
+            return { ...rule, status, lastRunAt: timestamp, lastError: errorMessage ?? 'Неизвестная ошибка' };
+        }
+        if (status === 'running') {
+            return { ...rule, status, lastRunAt: timestamp, lastError: undefined };
+        }
+        return { ...rule, status };
+    }));
+};
+
+const resolveRoomFromContext = (context: AutomationExecutionContext): string | undefined => {
+    if (context.kind === 'room_event') {
+        return context.event.getRoomId?.() ?? undefined;
+    }
+    const data = context.payload.data as Record<string, unknown> | undefined;
+    const roomId = typeof data?.roomId === 'string' ? data.roomId : undefined;
+    return roomId;
+};
+
+const executeSendMessageAction = async (
+    client: MatrixClient,
+    action: AutomationActionSendMessage,
+    context: AutomationExecutionContext,
+): Promise<void> => {
+    const targetRoomId = action.roomId ?? resolveRoomFromContext(context);
+    if (!targetRoomId) {
+        throw new Error('Не удалось определить комнату для отправки сообщения');
+    }
+    const content = action.content ?? { plain: 'Автоматическое сообщение', formatted: undefined, attachments: [], msgtype: 'm.text' };
+    const body = content.plain && content.plain.trim().length > 0 ? content.plain : 'Автоматическое сообщение';
+    const payload: Record<string, unknown> = {
+        msgtype: content.msgtype ?? 'm.text',
+        body,
+    };
+    if (content.formatted) {
+        payload.format = 'org.matrix.custom.html';
+        payload.formatted_body = content.formatted;
+    }
+    if (content.location) {
+        payload.geo_uri = `geo:${content.location.latitude},${content.location.longitude}`;
+        payload['org.matrix.msc3488.location'] = content.location;
+    }
+    await client.sendEvent(targetRoomId, 'm.room.message' as any, payload);
+};
+
+const executeAssignRoleAction = async (
+    client: MatrixClient,
+    action: AutomationActionAssignRole,
+): Promise<void> => {
+    await client.sendStateEvent(action.roomId, 'com.matrix_messenger.roles', {
+        userId: action.userId,
+        role: action.role,
+        reason: action.reason,
+    }, action.userId);
+};
+
+const buildSerializableContext = (context: AutomationExecutionContext): Record<string, unknown> => {
+    if (context.kind === 'room_event') {
+        return {
+            kind: 'room_event',
+            event: {
+                type: context.event.getType?.(),
+                roomId: context.event.getRoomId?.(),
+                eventId: context.event.getId?.(),
+                sender: context.event.getSender?.(),
+                content: context.event.getContent?.(),
+            },
+        };
+    }
+    return {
+        kind: 'webhook',
+        payload: context.payload,
+    };
+};
+
+const executeInvokePluginAction = async (
+    action: AutomationActionInvokePlugin,
+    context: AutomationExecutionContext,
+): Promise<void> => {
+    if (typeof window === 'undefined') {
+        console.warn('Automation plugin invocation skipped: window is undefined');
+        return;
+    }
+    const detail = {
+        pluginId: action.pluginId,
+        event: action.event,
+        payload: action.payload ?? {},
+        context: buildSerializableContext(context),
+    };
+    window.dispatchEvent(new CustomEvent('automation://invoke-plugin', { detail }));
+};
+
+const executeAutomationActions = async (
+    client: MatrixClient,
+    rule: AutomationRule,
+    context: AutomationExecutionContext,
+): Promise<void> => {
+    for (const action of rule.actions) {
+        if (action.type === 'send_message') {
+            await executeSendMessageAction(client, action, context);
+        } else if (action.type === 'assign_role') {
+            await executeAssignRoleAction(client, action);
+        } else if (action.type === 'invoke_plugin') {
+            await executeInvokePluginAction(action, context);
+        }
+    }
+};
+
+const processAutomationQueue = async (client: MatrixClient, runtime: AutomationRuntime): Promise<void> => {
+    if (runtime.processing) {
+        return;
+    }
+    runtime.processing = true;
+    try {
+        while (runtime.queue.length > 0) {
+            const job = runtime.queue.shift();
+            if (!job) {
+                continue;
+            }
+            const currentRuntime = getAutomationRuntime(client);
+            const rule = currentRuntime.rules.find(entry => entry.id === job.ruleId);
+            if (!rule || !rule.enabled) {
+                continue;
+            }
+            try {
+                await setAutomationRuleStatus(client, rule.id, 'running');
+            } catch (error) {
+                console.warn('Failed to set automation status to running', error);
+            }
+            try {
+                await executeAutomationActions(client, rule, job.context);
+                await setAutomationRuleStatus(client, rule.id, 'success');
+                void sendNotification('Автоматизация выполнена', `Правило «${rule.name}» выполнено успешно.`, {
+                    roomId: resolveRoomFromContext(job.context),
+                });
+            } catch (error) {
+                const message = error instanceof Error ? error.message : String(error);
+                await setAutomationRuleStatus(client, rule.id, 'error', message);
+                void sendNotification('Ошибка автоматизации', `Правило «${rule.name}» завершилось с ошибкой: ${message}`);
+            }
+        }
+    } finally {
+        runtime.processing = false;
+    }
+};
+
+const enqueueAutomationJob = (
+    client: MatrixClient,
+    rule: AutomationRule,
+    context: AutomationExecutionContext,
+) => {
+    const runtime = getAutomationRuntime(client);
+    runtime.queue.push({ ruleId: rule.id, context });
+    void processAutomationQueue(client, runtime);
+};
+
+const handleAutomationMatrixEvent = (client: MatrixClient, event: MatrixEvent): void => {
+    const runtime = getAutomationRuntime(client);
+    if (runtime.rules.length === 0) {
+        return;
+    }
+    const matching = runtime.rules.filter(rule => (
+        rule.enabled
+        && rule.triggers.some(trigger => triggerMatchesEvent(trigger, event))
+    ));
+    if (matching.length === 0) {
+        return;
+    }
+    const context = {
+        event: {
+            type: event.getType?.(),
+            roomId: event.getRoomId?.(),
+            sender: event.getSender?.(),
+            stateKey: event.getStateKey?.(),
+            eventId: event.getId?.(),
+        },
+        content: event.getContent?.() ?? {},
+    };
+    matching.forEach(rule => {
+        if (!evaluateConditions(rule.conditions, context)) {
+            return;
+        }
+        enqueueAutomationJob(client, rule, { kind: 'room_event', event });
+    });
+};
+
+const handleAutomationWebhook = (client: MatrixClient, payload: BotBridgeWebhookPayload): void => {
+    const runtime = getAutomationRuntime(client);
+    if (runtime.rules.length === 0) {
+        return;
+    }
+    const matching = runtime.rules.filter(rule => (
+        rule.enabled
+        && rule.triggers.some(trigger => triggerMatchesWebhook(trigger, payload))
+    ));
+    if (matching.length === 0) {
+        return;
+    }
+    const context = {
+        webhook: {
+            event: payload.event,
+            connectorId: payload.connectorId,
+            receivedAt: payload.receivedAt,
+        },
+        data: payload.data,
+    };
+    matching.forEach(rule => {
+        if (!evaluateConditions(rule.conditions, context)) {
+            return;
+        }
+        enqueueAutomationJob(client, rule, { kind: 'webhook', payload });
+    });
+};
+
+export const startAutomationRuntime = (client: MatrixClient): (() => void) => {
+    const runtime = getAutomationRuntime(client);
+    runtime.rules = readAutomationState(client).rules.map(cloneAutomationRule);
+
+    const timelineListener = (
+        event: MatrixEvent,
+        _room: unknown,
+        toStartOfTimeline?: boolean,
+        removed?: boolean,
+        data?: { liveEvent?: boolean },
+    ) => {
+        if (!event || removed) {
+            return;
+        }
+        if (toStartOfTimeline) {
+            return;
+        }
+        if (data && data.liveEvent === false) {
+            return;
+        }
+        try {
+            handleAutomationMatrixEvent(client, event);
+        } catch (error) {
+            console.warn('Automation timeline handler failed', error);
+        }
+    };
+
+    const accountDataListener = (event: MatrixEvent) => {
+        try {
+            if (event.getType?.() !== AUTOMATION_EVENT_TYPE) {
+                return;
+            }
+            const content = event.getContent?.();
+            const rulesRaw = Array.isArray((content as any)?.rules) ? (content as any).rules : [];
+            runtime.rules = rulesRaw
+                .map(entry => normalizeAutomationRule(entry))
+                .filter((entry): entry is AutomationRule => Boolean(entry))
+                .map(cloneAutomationRule);
+        } catch (error) {
+            console.warn('Failed to refresh automation rules from account data event', error);
+        }
+    };
+
+    client.on(RoomEvent.Timeline as any, timelineListener as any);
+    client.on(ClientEvent.AccountData as any, accountDataListener as any);
+
+    const unsubscribeWebhook = onBotBridgeWebhook((payload) => {
+        try {
+            handleAutomationWebhook(client, payload);
+        } catch (error) {
+            console.warn('Automation webhook handler failed', error);
+        }
+    });
+
+    runtime.webhookUnsubscribe = unsubscribeWebhook;
+
+    return () => {
+        try {
+            client.removeListener(RoomEvent.Timeline as any, timelineListener as any);
+        } catch (error) {
+            console.warn('Failed to detach automation timeline listener', error);
+        }
+        try {
+            client.removeListener(ClientEvent.AccountData as any, accountDataListener as any);
+        } catch (error) {
+            console.warn('Failed to detach automation account data listener', error);
+        }
+        try {
+            runtime.webhookUnsubscribe?.();
+        } catch (error) {
+            console.warn('Failed to detach automation webhook listener', error);
+        }
+        automationRuntimeStore.delete(client);
+    };
 };
 
 
