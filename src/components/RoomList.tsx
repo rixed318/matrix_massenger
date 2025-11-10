@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useMemo, useState, useEffect, useRef, useCallback } from 'react';
 import { Room, MatrixClient, Folder } from '@matrix-messenger/core';
 import RoomListItem from './RoomListItem';
 import Avatar from './Avatar';
@@ -11,6 +11,11 @@ import {
   type UniversalQuickFilterId,
 } from '../utils/chatSelectors';
 import { buildSearchIndexFromRooms, type RoomSearchResult } from '../utils/roomSearchIndex';
+import {
+  useDigestStore,
+  generateRoomDigest,
+  DEFAULT_DIGEST_ACCOUNT_KEY,
+} from '../services/digestService';
 
 interface RoomListProps {
   rooms: Room[];
@@ -168,6 +173,30 @@ const RoomList: React.FC<RoomListProps> = ({
     return searchIndex.search(trimmed, 8);
   }, [searchIndex, searchQuery]);
 
+  const digestSummaries = useDigestStore(state => state.digests);
+  const generatingRooms = useDigestStore(state => state.generatingRooms);
+  const [isDigestMenuOpen, setIsDigestMenuOpen] = useState(false);
+  const digestMenuRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!isDigestMenuOpen) return;
+    const handler = (event: MouseEvent) => {
+      if (!digestMenuRef.current) return;
+      if (!digestMenuRef.current.contains(event.target as Node)) {
+        setIsDigestMenuOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [isDigestMenuOpen]);
+
+  const normalizedAccountKey = activeAccountKey ?? DEFAULT_DIGEST_ACCOUNT_KEY;
+
+  const totalDigestUnread = useMemo(
+    () => digestSummaries.reduce((acc, digest) => acc + (digest.unreadCount ?? 0), 0),
+    [digestSummaries],
+  );
+
   const roomById = useMemo(() => {
     const map = new Map<string, Room>();
     roomsMatchingFilter.forEach(room => {
@@ -175,6 +204,25 @@ const RoomList: React.FC<RoomListProps> = ({
     });
     return map;
   }, [roomsMatchingFilter]);
+
+  const handleGenerateDigest = useCallback(
+    (roomId: string) => {
+      const unread = roomById.get(roomId)?.unreadCount ?? 0;
+      void generateRoomDigest({
+        accountKey: activeAccountKey ?? DEFAULT_DIGEST_ACCOUNT_KEY,
+        client,
+        roomId,
+        unreadCount: unread,
+        force: true,
+      });
+    },
+    [activeAccountKey, client, roomById],
+  );
+
+  const isRoomGenerating = useCallback(
+    (roomId: string) => Boolean(generatingRooms[`${normalizedAccountKey}::${roomId}`]),
+    [generatingRooms, normalizedAccountKey],
+  );
 
   const orderedRooms = useMemo(() => {
     const trimmed = searchQuery.trim();
@@ -350,7 +398,7 @@ const RoomList: React.FC<RoomListProps> = ({
       </div>
 
       <div className="px-2 py-2 border-b border-border-primary">
-        <div className="flex flex-wrap gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           {quickFilterSummaries.map(summary => (
             <button
               key={summary.id}
@@ -365,6 +413,80 @@ const RoomList: React.FC<RoomListProps> = ({
               </span>
             </button>
           ))}
+          <div className="relative" ref={digestMenuRef}>
+            <button
+              type="button"
+              onClick={() => setIsDigestMenuOpen(prev => !prev)}
+              className={quickFilterChipClass(isDigestMenuOpen)}
+              title="Последние дайджесты комнаты"
+            >
+              <span>Наверстать</span>
+              <span className="ml-2 inline-flex min-w-[1.5rem] items-center justify-center rounded-full bg-bg-secondary px-1.5 text-[11px] font-semibold">
+                {totalDigestUnread}
+              </span>
+            </button>
+            {isDigestMenuOpen && (
+              <div className="absolute z-30 mt-2 w-80 max-h-96 overflow-y-auto rounded-lg border border-border-primary bg-bg-primary p-3 shadow-xl">
+                {digestSummaries.length === 0 ? (
+                  <p className="text-xs text-text-secondary">Дайджесты появятся после чтения новых сообщений.</p>
+                ) : (
+                  <ul className="space-y-2">
+                    {digestSummaries.map(digest => {
+                      const room = roomById.get(digest.roomId);
+                      const unread = digest.unreadCount ?? 0;
+                      return (
+                        <li key={digest.roomId} className="rounded-md border border-border-secondary bg-bg-secondary/60 p-2">
+                          <button
+                            type="button"
+                            className="w-full text-left"
+                            onClick={() => {
+                              onSelectRoom(digest.roomId);
+                              setIsDigestMenuOpen(false);
+                            }}
+                          >
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="text-sm font-semibold text-text-primary truncate">
+                                {room?.name ?? 'Комната'}
+                              </span>
+                              <span className="inline-flex items-center rounded-full bg-chip-selected px-2 py-0.5 text-[11px] font-semibold text-text-inverted">
+                                {unread}
+                              </span>
+                            </div>
+                            <p className="mt-1 text-xs text-text-secondary line-clamp-3">
+                              {digest.summary || 'Пустой дайджест'}
+                            </p>
+                          </button>
+                          {digest.participants.length > 0 && (
+                            <div className="mt-2 flex flex-wrap gap-1">
+                              {digest.participants.map(participant => (
+                                <span key={participant} className="rounded-full bg-bg-tertiary px-2 py-0.5 text-[10px] text-text-secondary">
+                                  {participant}
+                                </span>
+                              ))}
+                            </div>
+                          )}
+                          <div className="mt-2 flex items-center justify-between text-[11px] text-text-secondary">
+                            <span>{new Date(digest.generatedAt).toLocaleTimeString()}</span>
+                            <button
+                              type="button"
+                              className="text-accent hover:underline"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                handleGenerateDigest(digest.roomId);
+                              }}
+                              disabled={isRoomGenerating(digest.roomId)}
+                            >
+                              {isRoomGenerating(digest.roomId) ? 'Обновляем…' : 'Обновить'}
+                            </button>
+                          </div>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                )}
+              </div>
+            )}
+          </div>
         </div>
       </div>
 

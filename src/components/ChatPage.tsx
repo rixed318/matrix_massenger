@@ -92,7 +92,14 @@ import {
     setAnimatedReactionsEnabled as persistAnimatedReactionsEnabled,
     onAnimatedReactionsPreferenceChange,
 } from '../services/animatedReactions';
-import { notifyStageInvite, notifyStageRequest, notifyStageAutoDemote, shouldAutoDemoteParticipant } from '../services/pushService';
+import {
+    useDigestStore,
+    setActiveDigestAccount,
+    hydrateDigestsForAccount,
+    updateDigestUnreadCounts,
+    generateRoomDigest,
+    DEFAULT_DIGEST_ACCOUNT_KEY,
+} from '../services/digestService';
 
 interface ChatPageProps {
     client?: MatrixClient;
@@ -963,6 +970,11 @@ const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, s
     const [contentToSchedule, setContentToSchedule] = useState<DraftContent | null>(null);
     const [allScheduledMessages, setAllScheduledMessages] = useState<ScheduledMessage[]>([]);
     const [animatedReactionsEnabled, setAnimatedReactionsEnabledState] = useState<boolean>(() => isAnimatedReactionsEnabled());
+    const digestState = useDigestStore(state => ({
+        digestMap: state.digestMap,
+        generatingRooms: state.generatingRooms,
+        isHydrated: state.isHydrated,
+    }));
     const [userProfileVersion, setUserProfileVersion] = useState(0); // Used to force-refresh components
     const [isPaginating, setIsPaginating] = useState(false);
     const [canPaginate, setCanPaginate] = useState(true);
@@ -1789,6 +1801,28 @@ const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, s
     }, []);
 
     useEffect(() => onAnimatedReactionsPreferenceChange(setAnimatedReactionsEnabledState), []);
+
+    useEffect(() => {
+        setActiveDigestAccount(activeAccountKey ?? null);
+        if (activeAccountKey) {
+            void hydrateDigestsForAccount(activeAccountKey).catch(error => {
+                console.debug('Failed to hydrate digests for account', error);
+            });
+        }
+    }, [activeAccountKey]);
+
+    useEffect(() => {
+        if (!activeAccountKey || rooms.length === 0) {
+            return;
+        }
+        const counts: Record<string, number> = {};
+        rooms.forEach(room => {
+            counts[room.roomId] = room.unreadCount ?? 0;
+        });
+        void updateDigestUnreadCounts(activeAccountKey, counts).catch(error => {
+            console.debug('Failed to sync digest unread counts', error);
+        });
+    }, [rooms, activeAccountKey]);
 
     useEffect(() => {
         const handleShortcut = (event: KeyboardEvent) => {
@@ -3824,6 +3858,92 @@ const handleSendParticipantToAudience = useCallback((participantId: string) => {
         ? Object.values(sharedMediaData.countsByCategory).reduce((acc, value) => acc + value, 0)
         : 0;
 
+    const digestForSelectedRoom = selectedRoomId ? (digestState.digestMap[selectedRoomId] ?? null) : null;
+    const digestGeneratingKey = selectedRoomId
+        ? `${(activeAccountKey ?? DEFAULT_DIGEST_ACCOUNT_KEY)}::${selectedRoomId}`
+        : null;
+    const isDigestGenerating = digestGeneratingKey ? Boolean(digestState.generatingRooms[digestGeneratingKey]) : false;
+
+    useEffect(() => {
+        if (!selectedRoomId || !activeAccountKey) {
+            return;
+        }
+        if (!digestState.isHydrated && !isDigestGenerating) {
+            return;
+        }
+        const unread = selectedRoom?.unreadCount ?? 0;
+        if (unread <= 0) {
+            return;
+        }
+        if (digestForSelectedRoom) {
+            const recentEnough = Date.now() - digestForSelectedRoom.generatedAt < 2 * 60 * 1000;
+            if (digestForSelectedRoom.unreadCount === unread && recentEnough) {
+                return;
+            }
+        }
+        void generateRoomDigest({
+            accountKey: activeAccountKey,
+            client,
+            roomId: selectedRoomId,
+            unreadCount: unread,
+        }).catch(error => {
+            console.debug('Failed to generate room digest', error);
+        });
+    }, [selectedRoomId, activeAccountKey, client, selectedRoom?.unreadCount, digestForSelectedRoom, digestState.isHydrated, isDigestGenerating]);
+
+    const catchUpPrompts = useMemo(() => {
+        if (!selectedRoomId) return null;
+        if (!digestState.isHydrated && !isDigestGenerating) return null;
+        const unread = digestForSelectedRoom?.unreadCount ?? selectedRoom?.unreadCount ?? 0;
+        if (!digestForSelectedRoom && !isDigestGenerating) {
+            return null;
+        }
+        const participants = digestForSelectedRoom?.participants ?? [];
+        const summaryText = digestForSelectedRoom?.summary
+            ?? 'Собираем дайджест по последним сообщениям...';
+        return (
+            <div className="border-b border-border-primary bg-bg-secondary/60 px-4 py-3">
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                    <div className="flex-1">
+                        <p className="text-sm font-semibold text-text-primary">Дайджест комнаты</p>
+                        <p className="mt-1 text-xs text-text-secondary line-clamp-3">{summaryText}</p>
+                        {participants.length > 0 && (
+                            <div className="mt-2 flex flex-wrap gap-1">
+                                {participants.map(participant => (
+                                    <span key={participant} className="rounded-full bg-bg-tertiary px-2 py-0.5 text-[10px] text-text-secondary">
+                                        {participant}
+                                    </span>
+                                ))}
+                            </div>
+                        )}
+                    </div>
+                    <div className="flex items-center gap-2 self-start sm:self-auto">
+                        <span className="inline-flex items-center rounded-full bg-chip-selected px-2 py-0.5 text-xs font-semibold text-text-inverted">
+                            {unread}
+                        </span>
+                        <button
+                            type="button"
+                            className="rounded-md bg-accent px-3 py-1.5 text-xs font-semibold text-text-inverted hover:bg-accent-hover disabled:opacity-60"
+                            disabled={isDigestGenerating}
+                            onClick={() => {
+                                if (!selectedRoomId || !activeAccountKey) return;
+                                void generateRoomDigest({
+                                    accountKey: activeAccountKey,
+                                    client,
+                                    roomId: selectedRoomId,
+                                    unreadCount: selectedRoom?.unreadCount ?? 0,
+                                    force: true,
+                                });
+                            }}
+                        >
+                            {isDigestGenerating ? 'Обновляем…' : 'Наверстать'}
+                        </button>
+                    </div>
+                </div>
+            </div>
+        );
+    }, [selectedRoomId, digestState.isHydrated, digestForSelectedRoom, isDigestGenerating, selectedRoom?.unreadCount, activeAccountKey, client]);
+
     const roomPresenceSummaries = useMemo(() => {
         const summaries = new Map<string, PresenceSummary>();
         rooms.forEach(room => {
@@ -4181,6 +4301,7 @@ const handleSendParticipantToAudience = useCallback((participantId: string) => {
                             onHandoverCall={roomCallSession ? handleHandoverCall : undefined}
                             localDeviceId={localDeviceId}
                         />
+                        {catchUpPrompts}
                         <ChatTimelineSection {...timelineProps} />
                         <PluginSurfaceHost
                             location="chat.panel"

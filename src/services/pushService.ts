@@ -1,5 +1,7 @@
-import { MatrixClient } from '../types';
+import { MatrixClient, DraftContent } from '../types';
 import { getAccountStore } from './accountManager';
+import { generateSmartReplies, getSmartReplySettings } from './aiComposeService';
+import type { SmartReplySuggestion } from './aiComposeService';
 
 const isBrowser = typeof window !== 'undefined';
 
@@ -59,6 +61,45 @@ export interface StoredPushSubscription {
   expiration_time?: number | null;
   updated_at?: number;
 }
+
+export interface DailyDigestNotificationPayload {
+  title?: string;
+  body: string;
+  roomId?: string;
+  accountKey?: string | null;
+  unreadCount?: number;
+  url?: string;
+}
+
+export const sendDailyDigestNotification = async (
+  payload: DailyDigestNotificationPayload,
+): Promise<void> => {
+  const effectiveTitle = payload.title?.trim() || 'Ежедневный дайджест';
+  const effectiveBody = payload.body?.trim() || 'Посмотрите, что произошло в комнатах за день.';
+  try {
+    await sendNotification(effectiveTitle, effectiveBody, { roomId: payload.roomId });
+  } catch (error) {
+    console.debug('Failed to deliver daily digest notification via Notification API', error);
+  }
+
+  if (typeof navigator !== 'undefined' && navigator.serviceWorker?.controller) {
+    try {
+      navigator.serviceWorker.controller.postMessage({
+        type: 'DAILY_DIGEST_NOTIFICATION',
+        payload: {
+          title: effectiveTitle,
+          body: effectiveBody,
+          roomId: payload.roomId ?? null,
+          accountKey: payload.accountKey ?? null,
+          unreadCount: payload.unreadCount ?? null,
+          url: payload.url ?? null,
+        },
+      });
+    } catch (error) {
+      console.debug('Failed to forward daily digest notification to service worker', error);
+    }
+  }
+};
 
 const buildDeviceDisplayName = () => {
   if (defaultDeviceDisplayName) {
@@ -172,51 +213,37 @@ export const registerMatrixWebPush = async (
   return serialized;
 };
 
-export interface StageNotificationPayload {
+export interface NotificationSmartReplyOptions {
   roomId: string;
-  sessionId: string;
-  userId: string;
-  displayName?: string;
-  inviterId?: string;
-  reason: 'hand_raise' | 'invite' | 'auto_demote';
+  accountKey?: string | null;
+  draft?: DraftContent | null;
+  limit?: number;
+  signal?: AbortSignal;
 }
 
-export const notifyStageInvite = (payload: StageNotificationPayload) => {
-  postToServiceWorker('GROUP_CALL_STAGE_INVITE', payload);
-};
-
-export const notifyStageRequest = (payload: StageNotificationPayload) => {
-  postToServiceWorker('GROUP_CALL_STAGE_REQUEST', payload);
-};
-
-export const notifyStageAutoDemote = (payload: StageNotificationPayload) => {
-  postToServiceWorker('GROUP_CALL_STAGE_AUTO_DEMOTE', payload);
-};
-
-export interface StageModerationSnapshot {
-  role?: string | null;
-  isMuted?: boolean;
-  isVideoMuted?: boolean;
-  lastActive?: number | null;
-}
-
-export const shouldAutoDemoteParticipant = (
-  participant: StageModerationSnapshot,
-  now: number = Date.now(),
-): boolean => {
-  const role = participant.role ?? 'participant';
-  if (role === 'host' || role === 'moderator') {
-    return false;
+export const generateNotificationSmartReplies = async (
+  options: NotificationSmartReplyOptions,
+): Promise<SmartReplySuggestion[]> => {
+  const store = getAccountStore();
+  const targetKey = options.accountKey ?? store.getState().activeKey;
+  if (!targetKey) {
+    return [];
   }
-  if (role !== 'participant' && role !== 'presenter') {
-    return false;
+  const account = store.getState().accounts[targetKey];
+  if (!account) {
+    return [];
   }
-  const muted = participant.isMuted ?? false;
-  const videoMuted = participant.isVideoMuted ?? true;
-  if (!muted && !videoMuted) {
-    return false;
+  const settings = getSmartReplySettings(account.client);
+  if (!settings.enabled) {
+    return [];
   }
-  const lastActive = participant.lastActive ?? now;
-  const idleMs = now - lastActive;
-  return idleMs > 90_000;
+  try {
+    return await generateSmartReplies(account.client, options.roomId, options.draft, {
+      limit: options.limit ?? 3,
+      signal: options.signal,
+    });
+  } catch (error) {
+    console.warn('smart-reply: failed to compose notification suggestions', error);
+    return [];
+  }
 };

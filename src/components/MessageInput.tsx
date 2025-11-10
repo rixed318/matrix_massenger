@@ -9,6 +9,12 @@ import {
     renderMarkdown,
     VIDEO_MAX_DURATION_SECONDS,
 } from '@matrix-messenger/ui/message-input';
+import {
+    generateSmartReplies,
+    observeSmartReplySettings,
+    getSmartReplySettings,
+} from '../services/aiComposeService';
+import type { SmartReplySuggestion, SmartReplySettings } from '../services/aiComposeService';
 import MentionSuggestions from './MentionSuggestions';
 import StickerGifPicker from './StickerGifPicker';
 import type { DraftAttachment, DraftContent, LocationContentPayload, SendKeyBehavior, VideoMessageMetadata } from '../types';
@@ -83,6 +89,11 @@ const MessageInput: React.FC<MessageInputProps> = ({
     const [locationDraft, setLocationDraft] = useState<{ latitude: number; longitude: number; accuracy?: number } | null>(null);
     const [isLocating, setIsLocating] = useState(false);
     const [locationError, setLocationError] = useState<string | null>(null);
+    const [smartReplySettings, setSmartReplySettingsState] = useState<SmartReplySettings>(() => getSmartReplySettings(client));
+    const [smartReplies, setSmartReplies] = useState<SmartReplySuggestion[]>([]);
+    const [smartReplyLoading, setSmartReplyLoading] = useState(false);
+    const [smartReplyError, setSmartReplyError] = useState<string | null>(null);
+    const [smartReplySelection, setSmartReplySelection] = useState<number>(-1);
     const ttlMenuRef = useRef<HTMLDivElement>(null);
 
 
@@ -98,6 +109,14 @@ const MessageInput: React.FC<MessageInputProps> = ({
     const videoStreamRef = useRef<MediaStream | null>(null);
     const liveVideoRef = useRef<HTMLVideoElement>(null);
     const contextMenuRef = useRef<HTMLDivElement>(null);
+    const smartReplyAbortRef = useRef<AbortController | null>(null);
+    const smartReplyTimerRef = useRef<number | null>(null);
+
+    const hotkeyPrefix = useMemo(() => {
+        if (typeof navigator === 'undefined') return 'Ctrl';
+        const platform = navigator.platform || navigator.userAgent || '';
+        return /mac|iphone|ipad|ipod/i.test(platform) ? '⌘' : 'Ctrl';
+    }, []);
 
     useEffect(() => {
         if (replyingTo) {
@@ -119,6 +138,14 @@ const MessageInput: React.FC<MessageInputProps> = ({
         }
     }, [isLocationDialogOpen, locationDraft]);
 
+    useEffect(() => {
+        setSmartReplySettingsState(getSmartReplySettings(client));
+        const unsubscribe = observeSmartReplySettings(client, setSmartReplySettingsState);
+        return () => {
+            unsubscribe();
+        };
+    }, [client]);
+
     const formattedHtml = useMemo(() => renderMarkdown(content, roomMembers), [content, roomMembers]);
 
     const currentDraft = useMemo<DraftContent>(() => ({
@@ -131,6 +158,18 @@ const MessageInput: React.FC<MessageInputProps> = ({
         if (!roomId) return;
         onDraftChange(currentDraft);
     }, [currentDraft, roomId, onDraftChange]);
+
+    useEffect(() => {
+        if (!smartReplySettings.enabled) {
+            setSmartReplySelection(-1);
+            return;
+        }
+        if (!smartReplies.length) {
+            setSmartReplySelection(-1);
+            return;
+        }
+        setSmartReplySelection(prev => (prev >= 0 && prev < smartReplies.length ? prev : 0));
+    }, [smartReplies, smartReplySettings.enabled]);
 
     useEffect(() => {
         if (!roomId) return;
@@ -161,6 +200,71 @@ const MessageInput: React.FC<MessageInputProps> = ({
             }
         };
     }, [content, roomId, client]);
+
+    useEffect(() => {
+        if (!roomId || !smartReplySettings.enabled) {
+            if (smartReplyTimerRef.current !== null) {
+                window.clearTimeout(smartReplyTimerRef.current);
+                smartReplyTimerRef.current = null;
+            }
+            if (smartReplyAbortRef.current) {
+                smartReplyAbortRef.current.abort();
+                smartReplyAbortRef.current = null;
+            }
+            setSmartReplyLoading(false);
+            setSmartReplyError(null);
+            setSmartReplies([]);
+            return;
+        }
+
+        if (smartReplyTimerRef.current !== null) {
+            window.clearTimeout(smartReplyTimerRef.current);
+            smartReplyTimerRef.current = null;
+        }
+        smartReplyAbortRef.current?.abort();
+        const controller = new AbortController();
+        smartReplyAbortRef.current = controller;
+
+        const timerId = window.setTimeout(() => {
+            smartReplyTimerRef.current = null;
+            setSmartReplyLoading(true);
+            setSmartReplyError(null);
+            void generateSmartReplies(client, roomId, currentDraft, { limit: 3, signal: controller.signal })
+                .then(results => {
+                    if (controller.signal.aborted) return;
+                    setSmartReplies(results);
+                    setSmartReplyError(null);
+                })
+                .catch(error => {
+                    if (controller.signal.aborted) return;
+                    console.error('Failed to fetch smart replies', error);
+                    setSmartReplies([]);
+                    setSmartReplyError('Не удалось получить подсказки');
+                })
+                .finally(() => {
+                    if (!controller.signal.aborted) {
+                        setSmartReplyLoading(false);
+                    }
+                });
+        }, 400);
+        smartReplyTimerRef.current = timerId;
+
+        return () => {
+            controller.abort();
+            if (smartReplyTimerRef.current !== null) {
+                window.clearTimeout(smartReplyTimerRef.current);
+                smartReplyTimerRef.current = null;
+            }
+        };
+    }, [client, roomId, currentDraft, smartReplySettings]);
+
+    useEffect(() => () => {
+        if (smartReplyTimerRef.current !== null) {
+            window.clearTimeout(smartReplyTimerRef.current);
+            smartReplyTimerRef.current = null;
+        }
+        smartReplyAbortRef.current?.abort();
+    }, []);
 
     useEffect(() => {
         if (!isVideoRecording) {
@@ -455,7 +559,68 @@ const MessageInput: React.FC<MessageInputProps> = ({
         });
     };
 
+    const applySmartReplySuggestion = useCallback((index: number) => {
+        if (index < 0 || index >= smartReplies.length) return;
+        const suggestion = smartReplies[index];
+        setContent(suggestion.text);
+        setShowMentions(false);
+        setMentionQuery('');
+        setMentionCursor(suggestion.text.length);
+        setSmartReplySelection(index);
+        requestAnimationFrame(() => {
+            const textarea = inputRef.current;
+            if (textarea) {
+                textarea.focus();
+                textarea.selectionStart = textarea.selectionEnd = suggestion.text.length;
+            }
+            adjustTextareaHeight();
+        });
+    }, [smartReplies, adjustTextareaHeight]);
+
     const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
+        const hasSmartReplies = smartReplySettings.enabled && smartReplies.length > 0;
+        if (hasSmartReplies && !showMentions) {
+            const textarea = inputRef.current;
+            const caretAtEnd = textarea
+                ? (textarea.selectionStart ?? 0) === (textarea.selectionEnd ?? 0)
+                    && (textarea.selectionStart ?? 0) === textarea.value.length
+                : false;
+            if (caretAtEnd && e.key === 'ArrowDown') {
+                e.preventDefault();
+                setSmartReplySelection(prev => {
+                    if (!smartReplies.length) return -1;
+                    const next = prev < smartReplies.length - 1 && prev >= 0 ? prev + 1 : 0;
+                    return next;
+                });
+                return;
+            }
+            if (caretAtEnd && e.key === 'ArrowUp') {
+                e.preventDefault();
+                setSmartReplySelection(prev => {
+                    if (!smartReplies.length) return -1;
+                    const next = prev > 0 ? prev - 1 : smartReplies.length - 1;
+                    return next;
+                });
+                return;
+            }
+            if (e.key === 'Tab' && !e.shiftKey) {
+                if (smartReplies.length) {
+                    e.preventDefault();
+                    const target = smartReplySelection >= 0 ? smartReplySelection : 0;
+                    applySmartReplySuggestion(target);
+                }
+                return;
+            }
+            if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey) {
+                const index = Number.parseInt(e.key, 10);
+                if (Number.isFinite(index) && index >= 1 && index <= smartReplies.length) {
+                    e.preventDefault();
+                    applySmartReplySuggestion(index - 1);
+                    return;
+                }
+            }
+        }
+
         if (e.key === 'Enter') {
             const isCtrlLike = e.ctrlKey || e.metaKey;
             const shouldSend = (() => {
@@ -1087,20 +1252,68 @@ const MessageInput: React.FC<MessageInputProps> = ({
                                 dangerouslySetInnerHTML={{ __html: formattedHtml || '<span class="text-text-secondary">Nothing to preview yet.</span>' }}
                             />
                         ) : (
-                            <textarea
-                                ref={inputRef}
-                                value={content}
-                                onChange={handleTextareaChange}
-                                onKeyDown={handleKeyDown}
-                                onKeyUp={handleCaretChange}
-                                onClick={handleCaretChange}
-                                onSelect={handleCaretChange}
-                                placeholder="Type a message..."
-                                className="flex-1 bg-transparent px-3 pb-3 text-text-primary placeholder-text-secondary focus:outline-none resize-none"
-                                disabled={isSending || !roomId}
-                                rows={1}
-                                style={{ minHeight: '48px', maxHeight: '240px' }}
-                            />
+                            <>
+                                {smartReplySettings.enabled && (smartReplyLoading || smartReplyError || smartReplies.length > 0) ? (
+                                    <div className="px-3 pt-2 pb-2 border-b border-border-secondary/60 bg-bg-tertiary/40">
+                                        {smartReplyLoading ? (
+                                            <div className="text-xs text-text-secondary italic">Генерируем умные ответы...</div>
+                                        ) : smartReplyError ? (
+                                            <div className="text-xs text-red-400">{smartReplyError}</div>
+                                        ) : (
+                                            <div className="flex flex-wrap gap-2">
+                                                {smartReplies.map((suggestion, idx) => {
+                                                    const isSelected = idx === smartReplySelection;
+                                                    const hotkeyLabel = idx < 9 ? `${hotkeyPrefix}+${idx + 1}` : null;
+                                                    const hasWarnings = suggestion.safety.reasons.length > 0
+                                                        || (suggestion.safety.categories?.length ?? 0) > 0;
+                                                    return (
+                                                        <button
+                                                            key={suggestion.id}
+                                                            type="button"
+                                                            onMouseEnter={() => setSmartReplySelection(idx)}
+                                                            onFocus={() => setSmartReplySelection(idx)}
+                                                            onClick={() => applySmartReplySuggestion(idx)}
+                                                            className={`px-3 py-1 rounded-full border text-sm transition focus:outline-none ${isSelected
+                                                                ? 'bg-accent text-white border-accent shadow-sm'
+                                                                : 'border-border-secondary text-text-secondary hover:border-accent hover:text-text-primary'}`}
+                                                        >
+                                                            <span>{suggestion.text}</span>
+                                                            {hotkeyLabel ? (
+                                                                <span className="ml-2 text-[10px] uppercase opacity-70">{hotkeyLabel}</span>
+                                                            ) : null}
+                                                            {isSelected ? (
+                                                                <span className="ml-2 text-[10px] uppercase opacity-70">Tab</span>
+                                                            ) : null}
+                                                            {hasWarnings ? (
+                                                                <span
+                                                                    className="ml-1 text-[10px] text-yellow-400"
+                                                                    title={suggestion.safety.reasons.join(', ') || suggestion.safety.categories?.join(', ') || undefined}
+                                                                >
+                                                                    !
+                                                                </span>
+                                                            ) : null}
+                                                        </button>
+                                                    );
+                                                })}
+                                            </div>
+                                        )}
+                                    </div>
+                                ) : null}
+                                <textarea
+                                    ref={inputRef}
+                                    value={content}
+                                    onChange={handleTextareaChange}
+                                    onKeyDown={handleKeyDown}
+                                    onKeyUp={handleCaretChange}
+                                    onClick={handleCaretChange}
+                                    onSelect={handleCaretChange}
+                                    placeholder="Type a message..."
+                                    className="flex-1 bg-transparent px-3 pb-3 text-text-primary placeholder-text-secondary focus:outline-none resize-none"
+                                    disabled={isSending || !roomId}
+                                    rows={1}
+                                    style={{ minHeight: '48px', maxHeight: '240px' }}
+                                />
+                            </>
                         )}
                     </div>
                 )}
