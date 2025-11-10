@@ -1,6 +1,7 @@
 import React from 'react';
 import MessageInput from './MessageInput';
 import { Gif, MatrixClient, MatrixUser, Message, Sticker, DraftContent, SendKeyBehavior, VideoMessageMetadata } from '../types';
+import type { OutboxProgressState } from '../services/matrixService';
 
 interface PendingQueueEntry {
     id: string;
@@ -10,6 +11,7 @@ interface PendingQueueEntry {
     error?: string;
     attachments?: { name?: string; kind?: string }[];
     ts?: number;
+    progress?: OutboxProgressState;
 }
 
 interface MessageComposerProps {
@@ -91,32 +93,41 @@ const MessageComposer: React.FC<MessageComposerProps> = ({
                         <span className="text-amber-200/70">{pendingQueue.length}</span>
                     </div>
                     <div className="flex flex-wrap gap-2">
-                        {pendingQueue.map(entry => (
-                            <div
-                                key={entry.id}
-                                className="flex items-center gap-2 rounded-full bg-amber-500/20 px-3 py-1"
-                            >
-                                <span className="truncate max-w-[160px] text-amber-100">{renderQueueLabel(entry)}</span>
-                                {onRetryPending && (
-                                    <button
-                                        type="button"
-                                        onClick={() => onRetryPending(entry.id)}
-                                        className="text-[10px] uppercase tracking-wide text-amber-100/90 hover:text-amber-50"
-                                    >
-                                        ↻
-                                    </button>
-                                )}
-                                {onCancelPending && (
-                                    <button
-                                        type="button"
-                                        onClick={() => onCancelPending(entry.id)}
-                                        className="text-[10px] uppercase tracking-wide text-amber-100/70 hover:text-amber-50"
-                                    >
-                                        ✕
-                                    </button>
-                                )}
-                            </div>
-                        ))}
+                        {pendingQueue.map(entry => {
+                            const progress = entry.progress;
+                            const percent = progress && progress.totalBytes > 0
+                                ? Math.min(100, Math.round((progress.uploadedBytes / progress.totalBytes) * 100))
+                                : null;
+                            return (
+                                <div
+                                    key={entry.id}
+                                    className="flex items-center gap-2 rounded-full bg-amber-500/20 px-3 py-1"
+                                >
+                                    <span className="truncate max-w-[160px] text-amber-100">{renderQueueLabel(entry)}</span>
+                                    {percent !== null && (
+                                        <span className="text-[10px] text-amber-100/80">{percent}%</span>
+                                    )}
+                                    {onRetryPending && (
+                                        <button
+                                            type="button"
+                                            onClick={() => onRetryPending(entry.id)}
+                                            className="text-[10px] uppercase tracking-wide text-amber-100/90 hover:text-amber-50"
+                                        >
+                                            ↻
+                                        </button>
+                                    )}
+                                    {onCancelPending && (
+                                        <button
+                                            type="button"
+                                            onClick={() => onCancelPending(entry.id)}
+                                            className="text-[10px] uppercase tracking-wide text-amber-100/70 hover:text-amber-50"
+                                        >
+                                            ✕
+                                        </button>
+                                    )}
+                                </div>
+                            );
+                        })}
                     </div>
                 </div>
             )}

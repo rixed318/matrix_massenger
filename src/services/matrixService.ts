@@ -30,25 +30,49 @@ import type { HierarchyRoom } from 'matrix-js-sdk';
 
 
 // ===== Offline Outbox Queue (IndexedDB/SQLite) =====
-export interface OutboxAttachment {
+export interface OutboxAttachmentCheckpoint {
+    uploadedBytes: number;
+    uploadedChunks: number;
+    completed?: boolean;
+    mxcUrl?: string;
+}
+
+interface OutboxAttachmentBase {
     id: string;
     name: string;
     size: number;
     mimeType: string;
-    /**
-     * Serialized payload for the attachment. We use data URLs because they
-     * are self-contained and work in browsers without FileSystem Access.
-     */
-    dataUrl?: string;
-    /** Remote URL to fetch when flushing, used if dataUrl is not available. */
-    remoteUrl?: string;
+    sha256?: string;
     /**
      * Where in the event content the uploaded MXC URL should be injected.
      * Accepts dot-notation (e.g. "url" or "file.url").
      */
     contentPath?: string;
     kind?: 'file' | 'image' | 'audio' | 'video' | 'sticker' | 'voice' | 'other';
+    checkpoint?: OutboxAttachmentCheckpoint;
 }
+
+export interface OutboxAttachmentFilePath extends OutboxAttachmentBase {
+    mode: 'filePath';
+    filePath: string;
+}
+
+export interface OutboxAttachmentChunks extends OutboxAttachmentBase {
+    mode: 'chunks';
+    chunkSize: number;
+    chunkCount: number;
+    chunkHashes: string[];
+}
+
+export interface OutboxAttachmentRemote extends OutboxAttachmentBase {
+    mode: 'remote';
+    remoteUrl: string;
+}
+
+export type OutboxAttachment =
+    | OutboxAttachmentFilePath
+    | OutboxAttachmentChunks
+    | OutboxAttachmentRemote;
 
 export type OutboxPayload = {
     id: string;                 // local id (txn-like)
@@ -62,10 +86,16 @@ export type OutboxPayload = {
     attachments?: OutboxAttachment[];
 };
 
+export interface OutboxProgressState {
+    totalBytes: number;
+    uploadedBytes: number;
+    attachmentId?: string;
+}
+
 export type OutboxEvent =
   | { kind: 'status'; online: boolean; syncing: boolean }
   | { kind: 'enqueued'; item: OutboxPayload }
-  | { kind: 'progress'; id: string; attempts: number }
+  | { kind: 'progress'; id: string; attempts: number; progress?: OutboxProgressState; item?: OutboxPayload }
   | { kind: 'sent'; id: string; serverEventId: string }
   | { kind: 'error'; id: string; error: any }
   | { kind: 'cancelled'; id: string };
@@ -86,16 +116,68 @@ const OUTBOX_DB = 'econix-outbox';
 const OUTBOX_STORE = 'events';
 
 const idbOpen = (): Promise<IDBDatabase> => new Promise((resolve, reject) => {
-    const req = indexedDB.open(OUTBOX_DB, 1);
+    const req = indexedDB.open(OUTBOX_DB, 2);
     req.onupgradeneeded = () => {
         const db = req.result;
         if (!db.objectStoreNames.contains(OUTBOX_STORE)) {
             db.createObjectStore(OUTBOX_STORE, { keyPath: 'id' });
         }
+        if (!db.objectStoreNames.contains('attachment_chunks')) {
+            db.createObjectStore('attachment_chunks');
+        }
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
 });
+
+const ATTACHMENT_STORE = 'attachment_chunks';
+
+const chunkKey = (attachmentId: string, index: number) => `${attachmentId}::${index}`;
+
+const idbPutChunk = async (attachmentId: string, index: number, data: ArrayBuffer) => {
+    const db = await idbOpen();
+    await new Promise<void>((resolve, reject) => {
+        const tx = db.transaction(ATTACHMENT_STORE, 'readwrite');
+        tx.objectStore(ATTACHMENT_STORE).put(data, chunkKey(attachmentId, index));
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+    });
+    db.close();
+};
+
+const idbGetChunk = async (attachmentId: string, index: number): Promise<ArrayBuffer | null> => {
+    const db = await idbOpen();
+    const data: ArrayBuffer | undefined = await new Promise((resolve, reject) => {
+        const tx = db.transaction(ATTACHMENT_STORE, 'readonly');
+        const req = tx.objectStore(ATTACHMENT_STORE).get(chunkKey(attachmentId, index));
+        req.onsuccess = () => resolve(req.result as ArrayBuffer | undefined);
+        req.onerror = () => reject(req.error);
+    });
+    db.close();
+    return data ?? null;
+};
+
+const idbDeleteChunks = async (attachmentId: string) => {
+    const db = await idbOpen();
+    await new Promise<void>((resolve, reject) => {
+        const tx = db.transaction(ATTACHMENT_STORE, 'readwrite');
+        const store = tx.objectStore(ATTACHMENT_STORE);
+        const request = store.openKeyCursor();
+        request.onsuccess = (event: any) => {
+            const cursor: IDBCursor | null = event.target.result;
+            if (!cursor) {
+                return;
+            }
+            if (typeof cursor.key === 'string' && cursor.key.startsWith(`${attachmentId}::`)) {
+                store.delete(cursor.key);
+            }
+            cursor.continue();
+        };
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+    });
+    db.close();
+};
 
 const idbPut = async (item: OutboxPayload) => {
     const db = await idbOpen();
@@ -141,33 +223,6 @@ const idbGet = async (id: string): Promise<OutboxPayload | null> => {
     });
     db.close();
     return item ?? null;
-};
-
-const blobToDataUrl = (blob: Blob): Promise<string> => new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result as string);
-    reader.onerror = () => reject(reader.error);
-    reader.readAsDataURL(blob);
-});
-
-const dataUrlToBlob = (dataUrl: string): Blob => {
-    const [meta, base64] = dataUrl.split(',');
-    const mimeMatch = /data:([^;]+);base64/.exec(meta);
-    const mimeType = mimeMatch ? mimeMatch[1] : 'application/octet-stream';
-    let binary: string;
-    if (typeof atob === 'function') {
-        binary = atob(base64);
-    } else if (typeof Buffer !== 'undefined') {
-        binary = Buffer.from(base64, 'base64').toString('binary');
-    } else {
-        throw new Error('Unable to decode dataUrl in this environment');
-    }
-    const len = binary.length;
-    const bytes = new Uint8Array(len);
-    for (let i = 0; i < len; i += 1) {
-        bytes[i] = binary.charCodeAt(i);
-    }
-    return new Blob([bytes], { type: mimeType });
 };
 
 const setContentPath = (target: any, path: string | undefined, value: any) => {
@@ -664,6 +719,41 @@ const shouldQueueFromError = (error: unknown) => {
     return /network|fetch|timeout|offline|abort/i.test(message);
 };
 
+const isTauriRuntime = () => typeof window !== 'undefined' && Boolean((window as any).__TAURI__?.invoke);
+
+const sanitizeFileName = (value: string) => value.replace(/[\\/:*?"<>|]+/g, '_');
+
+const bufferToHex = (buffer: ArrayBuffer | Uint8Array) => {
+    const view = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+    return Array.from(view).map(byte => byte.toString(16).padStart(2, '0')).join('');
+};
+
+const getSubtleCrypto = async (): Promise<SubtleCrypto | null> => {
+    const globalCrypto: Crypto | undefined = (globalThis as any).crypto;
+    if (globalCrypto?.subtle) {
+        return globalCrypto.subtle;
+    }
+    try {
+        const nodeCrypto = await import('crypto');
+        return nodeCrypto.webcrypto?.subtle ?? null;
+    } catch (error) {
+        console.warn('Unable to access SubtleCrypto', error);
+        return null;
+    }
+};
+
+const digestSha256 = async (data: ArrayBuffer): Promise<string | undefined> => {
+    try {
+        const subtle = await getSubtleCrypto();
+        if (!subtle) return undefined;
+        const digest = await subtle.digest('SHA-256', data);
+        return bufferToHex(digest);
+    } catch (error) {
+        console.warn('Failed to compute sha256 digest', error);
+        return undefined;
+    }
+};
+
 export const getOutboxPending = async (roomId?: string): Promise<OutboxPayload[]> => {
     const all = await idbGetAll();
     return roomId ? all.filter(i => i.roomId === roomId) : all;
@@ -674,37 +764,37 @@ export const flushOutbox = async () => {
     if (!navigator.onLine) return;
     const items = (await idbGetAll()).sort((a,b) => a.ts - b.ts);
     for (const item of items) {
+        let workingItem: OutboxPayload = item;
         try {
-            _outboxEmitter.emit({ kind: 'progress', id: item.id, attempts: (item.attempts||0)+1 });
+            const attempts = (item.attempts || 0) + 1;
+            _outboxEmitter.emit({ kind: 'progress', id: item.id, attempts, item });
             const baseContent = item.content ? JSON.parse(JSON.stringify(item.content)) : {};
             if (Array.isArray(item.attachments) && item.attachments.length > 0) {
-                for (const attachment of item.attachments) {
-                    try {
-                        let blob: Blob;
-                        if (attachment.dataUrl) {
-                            blob = dataUrlToBlob(attachment.dataUrl);
-                        } else if (attachment.remoteUrl) {
-                            const response = await fetch(attachment.remoteUrl);
-                            blob = await response.blob();
-                        } else {
-                            throw new Error('Attachment payload missing data');
-                        }
-                        const fileName = attachment.name || 'attachment';
-                        const uploadSource = (typeof File !== 'undefined')
-                            ? new File([blob], fileName, { type: attachment.mimeType, lastModified: Date.now() })
-                            : blob;
-                        const { content_uri } = await _boundClient.uploadContent(uploadSource as any, {
-                            name: fileName,
-                            type: attachment.mimeType,
-                        });
-                        setContentPath(baseContent, attachment.contentPath ?? 'url', content_uri);
-                    } catch (uploadError) {
-                        throw uploadError;
+                const attachments = [...item.attachments];
+                for (let index = 0; index < attachments.length; index += 1) {
+                    const attachment = attachments[index];
+                    const { attachment: updatedAttachment, mxcUrl } = await uploadAttachmentWithResume(attachment, async (nextAttachment, progress) => {
+                        attachments[index] = nextAttachment;
+                        workingItem = { ...workingItem, attachments: [...attachments] };
+                        await idbPut(workingItem);
+                        _outboxEmitter.emit({ kind: 'progress', id: workingItem.id, attempts, progress, item: workingItem });
+                    });
+                    attachments[index] = updatedAttachment;
+                    workingItem = { ...workingItem, attachments: [...attachments] };
+                    await idbPut(workingItem);
+                    const targetUrl = updatedAttachment.checkpoint?.mxcUrl ?? mxcUrl;
+                    if (targetUrl) {
+                        setContentPath(baseContent, updatedAttachment.contentPath ?? 'url', targetUrl);
                     }
                 }
             }
             const sendRes = await _boundClient.sendEvent(item.roomId, item.type as any, baseContent);
             await idbDelete(item.id);
+            if (Array.isArray(workingItem.attachments)) {
+                for (const attachment of workingItem.attachments) {
+                    await cleanupAttachmentStorage(attachment);
+                }
+            }
             _outboxEmitter.emit({ kind: 'sent', id: item.id, serverEventId: sendRes.event_id });
         } catch (e) {
             // likely still offline or server error. increase attempts and stop.
@@ -760,17 +850,71 @@ export const serializeOutboxAttachment = async (
     blob: Blob,
     options?: { name?: string; contentPath?: string; kind?: OutboxAttachment['kind']; mimeTypeOverride?: string }
 ): Promise<OutboxAttachment> => {
+    const id = randomId();
     const name = options?.name ?? (blob instanceof File ? blob.name : 'attachment');
     const mimeType = options?.mimeTypeOverride ?? (blob.type || 'application/octet-stream');
+    const arrayBuffer = await blob.arrayBuffer();
+    const sha256 = await digestSha256(arrayBuffer);
+    const checkpoint: OutboxAttachmentCheckpoint = {
+        uploadedBytes: 0,
+        uploadedChunks: 0,
+    };
+
+    if (isTauriRuntime()) {
+        try {
+            const [{ appDataDir, join }, { createDir, writeBinaryFile }] = await Promise.all([
+                import('@tauri-apps/api/path'),
+                import('@tauri-apps/api/fs'),
+            ]);
+            const baseDir = await join(await appDataDir(), 'outbox');
+            await createDir(baseDir, { recursive: true });
+            const fileName = `${id}-${sanitizeFileName(name)}`;
+            const filePath = await join(baseDir, fileName);
+            await writeBinaryFile(filePath, new Uint8Array(arrayBuffer));
+            return {
+                id,
+                name,
+                size: blob.size,
+                mimeType,
+                mode: 'filePath',
+                filePath,
+                checkpoint,
+                sha256,
+                contentPath: options?.contentPath ?? 'url',
+                kind: options?.kind ?? 'file',
+            } satisfies OutboxAttachmentFilePath;
+        } catch (error) {
+            console.warn('Failed to persist attachment via Tauri fs, falling back to chunk store', error);
+        }
+    }
+
+    const normalizedSize = Math.max(blob.size || arrayBuffer.byteLength, arrayBuffer.byteLength);
+    const chunkSize = Math.max(256 * 1024, Math.min(4 * 1024 * 1024, normalizedSize));
+    const chunkCount = Math.max(1, Math.ceil(arrayBuffer.byteLength / chunkSize));
+    const chunkHashes: string[] = [];
+    for (let index = 0; index < chunkCount; index += 1) {
+        const start = index * chunkSize;
+        const end = Math.min(start + chunkSize, arrayBuffer.byteLength);
+        const slice = arrayBuffer.slice(start, end);
+        await idbPutChunk(id, index, slice);
+        const chunkHash = await digestSha256(slice);
+        chunkHashes.push(chunkHash ?? '');
+    }
+
     return {
-        id: randomId(),
+        id,
         name,
         size: blob.size,
         mimeType,
-        dataUrl: await blobToDataUrl(blob),
+        mode: 'chunks',
+        chunkSize,
+        chunkCount,
+        chunkHashes,
+        checkpoint,
+        sha256,
         contentPath: options?.contentPath ?? 'url',
         kind: options?.kind ?? 'file',
-    };
+    } satisfies OutboxAttachmentChunks;
 };
 
 export const createRemoteOutboxAttachment = (
@@ -781,10 +925,215 @@ export const createRemoteOutboxAttachment = (
     name: options?.name ?? 'attachment',
     size: options?.size ?? 0,
     mimeType: options?.mimeType ?? 'application/octet-stream',
+    mode: 'remote',
     remoteUrl: url,
     contentPath: options?.contentPath ?? 'url',
     kind: options?.kind ?? 'file',
 });
+
+const resolveUploadEndpoint = () => {
+    if (!_boundClient) {
+        throw new Error('Matrix client is not bound');
+    }
+    const baseUrl: string | undefined = (typeof (_boundClient as any).baseUrl === 'string')
+        ? (_boundClient as any).baseUrl
+        : typeof (_boundClient as any).getHomeserverUrl === 'function'
+            ? (_boundClient as any).getHomeserverUrl()
+            : undefined;
+    const token: string | undefined = typeof (_boundClient as any).getAccessToken === 'function'
+        ? (_boundClient as any).getAccessToken()
+        : undefined;
+    if (!baseUrl || !token) {
+        throw new Error('Unable to resolve upload endpoint');
+    }
+    return { baseUrl, token };
+};
+
+const parseUploadedBytesFromRange = (value: string | null): number | null => {
+    if (!value) return null;
+    const match = /bytes\s+(\d+)-(\d+)/.exec(value);
+    if (!match) return null;
+    const end = Number(match[2]);
+    if (Number.isFinite(end)) {
+        return end + 1;
+    }
+    return null;
+};
+
+const uploadChunkToHomeserver = async (
+    attachment: OutboxAttachment,
+    chunk: ArrayBuffer,
+    chunkIndex: number,
+    chunkSize: number,
+): Promise<{ uploadedBytes: number; mxcUrl?: string }> => {
+    const { baseUrl, token } = resolveUploadEndpoint();
+    const start = chunkIndex * chunkSize;
+    const end = start + chunk.byteLength - 1;
+    const endpoint = new URL('/_matrix/media/v3/upload', baseUrl.replace(/\/$/, ''));
+    if (attachment.name) {
+        endpoint.searchParams.set('filename', attachment.name);
+    }
+    endpoint.searchParams.set('upload_id', attachment.id);
+    const response = await fetch(endpoint.toString(), {
+        method: 'POST',
+        headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': attachment.mimeType || 'application/octet-stream',
+            'Content-Range': `bytes ${start}-${end}/${attachment.size}`,
+        },
+        body: chunk,
+    });
+
+    if (response.status === 308) {
+        const range = parseUploadedBytesFromRange(response.headers.get('Range'));
+        return { uploadedBytes: range ?? (end + 1) };
+    }
+
+    if (!response.ok) {
+        throw new Error(`Upload failed with status ${response.status}`);
+    }
+
+    let payload: any = null;
+    try {
+        payload = await response.json();
+    } catch (error) {
+        payload = null;
+    }
+
+    return {
+        uploadedBytes: end + 1,
+        mxcUrl: payload?.content_uri,
+    };
+};
+
+const cleanupAttachmentStorage = async (attachment: OutboxAttachment) => {
+    if (attachment.mode === 'chunks') {
+        await idbDeleteChunks(attachment.id);
+    } else if (attachment.mode === 'filePath') {
+        try {
+            const fs = await import('@tauri-apps/api/fs');
+            await fs.removeFile(attachment.filePath);
+        } catch (error) {
+            console.warn('Failed to cleanup attachment file', error);
+        }
+    }
+};
+
+const uploadAttachmentWithResume = async (
+    attachment: OutboxAttachment,
+    update: (attachment: OutboxAttachment, progress: OutboxProgressState) => Promise<void>,
+): Promise<{ attachment: OutboxAttachment; mxcUrl: string }> => {
+    if (!_boundClient) {
+        throw new Error('Matrix client is not bound');
+    }
+
+    if (attachment.mode === 'remote') {
+        const response = await fetch(attachment.remoteUrl);
+        if (!response.ok) {
+            throw new Error(`Failed to fetch remote attachment: ${response.status}`);
+        }
+        const blob = await response.blob();
+        const { content_uri } = await _boundClient.uploadContent(blob as any, {
+            name: attachment.name,
+            type: attachment.mimeType,
+        });
+        const checkpoint: OutboxAttachmentCheckpoint = {
+            uploadedBytes: blob.size,
+            uploadedChunks: 1,
+            completed: true,
+            mxcUrl: content_uri,
+        };
+        const nextAttachment: OutboxAttachment = { ...attachment, checkpoint };
+        await update(nextAttachment, {
+            totalBytes: attachment.size,
+            uploadedBytes: blob.size,
+            attachmentId: attachment.id,
+        });
+        return { attachment: nextAttachment, mxcUrl: content_uri };
+    }
+
+    const chunkSize = attachment.mode === 'chunks'
+        ? attachment.chunkSize
+        : Math.max(256 * 1024, Math.min(4 * 1024 * 1024, attachment.size));
+    const chunkCount = attachment.mode === 'chunks'
+        ? attachment.chunkCount
+        : Math.max(1, Math.ceil(attachment.size / chunkSize));
+
+    let currentCheckpoint: OutboxAttachmentCheckpoint = attachment.checkpoint ?? {
+        uploadedBytes: 0,
+        uploadedChunks: 0,
+    };
+
+    let binaryForFilePath: ArrayBuffer | null = null;
+    if (attachment.mode === 'filePath') {
+        try {
+            const fs = await import('@tauri-apps/api/fs');
+            const content = await fs.readBinaryFile(attachment.filePath);
+            binaryForFilePath = content.buffer.slice(content.byteOffset, content.byteOffset + content.byteLength);
+        } catch (error) {
+            console.error('Failed to read attachment file from disk', error);
+            throw error;
+        }
+    }
+
+    let mxcUrl = currentCheckpoint.mxcUrl;
+
+    for (let index = currentCheckpoint.uploadedChunks ?? 0; index < chunkCount; index += 1) {
+        let chunk: ArrayBuffer | null = null;
+        if (attachment.mode === 'chunks') {
+            chunk = await idbGetChunk(attachment.id, index);
+        } else if (attachment.mode === 'filePath') {
+            if (!binaryForFilePath) throw new Error('Attachment buffer not available');
+            const start = index * chunkSize;
+            const end = Math.min(start + chunkSize, binaryForFilePath.byteLength);
+            chunk = binaryForFilePath.slice(start, end);
+        }
+        if (!chunk) {
+            throw new Error(`Missing chunk ${index} for attachment ${attachment.id}`);
+        }
+
+        const uploadResult = await uploadChunkToHomeserver(attachment, chunk, index, chunkSize);
+        currentCheckpoint = {
+            ...currentCheckpoint,
+            uploadedChunks: index + 1,
+            uploadedBytes: uploadResult.uploadedBytes,
+            mxcUrl: uploadResult.mxcUrl ?? currentCheckpoint.mxcUrl,
+            completed: uploadResult.mxcUrl ? (index + 1 >= chunkCount) : currentCheckpoint.completed,
+        };
+        const updatedAttachment: OutboxAttachment = { ...attachment, checkpoint: currentCheckpoint } as OutboxAttachment;
+        await update(updatedAttachment, {
+            totalBytes: attachment.size,
+            uploadedBytes: currentCheckpoint.uploadedBytes,
+            attachmentId: attachment.id,
+        });
+        attachment = updatedAttachment;
+        if (uploadResult.mxcUrl) {
+            mxcUrl = uploadResult.mxcUrl;
+        }
+    }
+
+    if (!mxcUrl) {
+        throw new Error('Upload did not complete successfully');
+    }
+
+    const finalAttachment: OutboxAttachment = {
+        ...attachment,
+        checkpoint: {
+            ...(attachment.checkpoint ?? { uploadedBytes: 0, uploadedChunks: 0 }),
+            uploadedBytes: attachment.size,
+            uploadedChunks: chunkCount,
+            completed: true,
+            mxcUrl,
+        },
+    };
+    await update(finalAttachment, {
+        totalBytes: attachment.size,
+        uploadedBytes: attachment.size,
+        attachmentId: attachment.id,
+    });
+
+    return { attachment: finalAttachment, mxcUrl };
+};
 // ===== Translation settings and utilities =====
 export interface TranslationSettings {
     baseUrl: string;                // Full endpoint like https://host/api/translate
