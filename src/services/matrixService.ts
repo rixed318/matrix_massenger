@@ -793,6 +793,7 @@ export interface TranslationSettings {
 }
 const TRANSLATION_ACCOUNT_EVENT = 'com.econix.translation.settings';
 const TRANSLATION_LOCAL_KEY = 'econix.translation.settings';
+const GIF_FAVORITES_ACCOUNT_EVENT = 'com.econix.gif_favorites';
 
 let _translationSettingsCache: TranslationSettings | null = null;
 
@@ -849,6 +850,102 @@ let _translationErrorHandler: TranslationErrorHandler | null = null;
 export function setTranslationErrorHandler(handler: TranslationErrorHandler | null) {
     _translationErrorHandler = handler;
 }
+
+const sanitizeGifFavoriteFromAccount = (value: unknown): GifFavorite | null => {
+    if (!value || typeof value !== 'object') {
+        return null;
+    }
+    const candidate = value as Partial<GifFavorite> & { dims?: [number, number] };
+    if (!candidate.id || !candidate.url) {
+        return null;
+    }
+    const dims = Array.isArray(candidate.dims) && candidate.dims.length === 2
+        ? ([Number(candidate.dims[0]) || 0, Number(candidate.dims[1]) || 0] as [number, number])
+        : ([0, 0] as [number, number]);
+    return {
+        id: String(candidate.id),
+        url: String(candidate.url),
+        previewUrl: typeof candidate.previewUrl === 'string' ? candidate.previewUrl : String(candidate.url),
+        title: typeof candidate.title === 'string' ? candidate.title : 'GIF',
+        dims,
+        addedAt: typeof candidate.addedAt === 'number' ? candidate.addedAt : Date.now(),
+    };
+};
+
+const extractGifFavorites = (content: unknown): GifFavorite[] => {
+    if (!content || typeof content !== 'object') {
+        return [];
+    }
+    const payload: unknown = Array.isArray((content as any).favorites)
+        ? (content as any).favorites
+        : Array.isArray(content)
+            ? content
+            : [];
+    if (!Array.isArray(payload)) {
+        return [];
+    }
+    return payload
+        .map(item => sanitizeGifFavoriteFromAccount(item))
+        .filter((item): item is GifFavorite => Boolean(item));
+};
+
+export const loadGifFavoritesFromAccountData = async (client: MatrixClient): Promise<GifFavorite[] | null> => {
+    try {
+        const event = client.getAccountData(GIF_FAVORITES_ACCOUNT_EVENT as any);
+        const content = event?.getContent?.() ?? (event as any)?.event?.content;
+        if (!content) {
+            return null;
+        }
+        return extractGifFavorites(content);
+    } catch (error) {
+        console.warn('Failed to read GIF favorites from account data', error);
+        return null;
+    }
+};
+
+export const persistGifFavoritesToAccountData = async (
+    client: MatrixClient,
+    favorites: GifFavorite[],
+): Promise<void> => {
+    try {
+        const payload = {
+            favorites: favorites.map(fav => ({
+                id: fav.id,
+                url: fav.url,
+                previewUrl: fav.previewUrl,
+                title: fav.title,
+                dims: fav.dims,
+                addedAt: fav.addedAt,
+            })),
+            updated_at: Date.now(),
+        };
+        await client.setAccountData(GIF_FAVORITES_ACCOUNT_EVENT as any, payload as any);
+    } catch (error) {
+        console.error('Failed to persist GIF favorites to account data', error);
+        throw error;
+    }
+};
+
+export const subscribeToGifFavoritesAccountData = (
+    client: MatrixClient,
+    handler: (favorites: GifFavorite[]) => void,
+): (() => void) => {
+    const listener = (event: MatrixEvent) => {
+        if (event.getType?.() !== GIF_FAVORITES_ACCOUNT_EVENT) {
+            return;
+        }
+        try {
+            const favorites = extractGifFavorites(event.getContent?.());
+            handler(favorites);
+        } catch (error) {
+            console.warn('Failed to handle GIF favorites account data update', error);
+        }
+    };
+    client.on(ClientEvent.AccountData, listener);
+    return () => {
+        client.removeListener(ClientEvent.AccountData, listener);
+    };
+};
 
 
 const secureCloudProfiles = new WeakMap<MatrixClient, SecureCloudProfile>();
