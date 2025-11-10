@@ -7,6 +7,7 @@ import ReactionsDisplay from './ReactionsDisplay';
 import ReplyQuote from './ReplyQuote';
 import { mxcToHttp } from '@matrix-messenger/core';
 import VoiceMessagePlayer from './VoiceMessagePlayer';
+import VideoMessagePlayer from './VideoMessagePlayer';
 import PollView from './PollView';
 import { EventType } from 'matrix-js-sdk';
 import LinkPreview from './LinkPreview';
@@ -215,6 +216,20 @@ const ChatMessage: React.FC<ChatMessageProps> = ({
             const duration = message.content.info?.duration;
             if (!audioUrl) return <p className="text-text-secondary italic">Could not load audio.</p>
             return <VoiceMessagePlayer src={audioUrl} durationMs={duration} />;
+        }
+
+        if (message.content.msgtype === 'm.video') {
+            const videoUrl = message.localUrl || mxcToHttp(client, message.content.url);
+            const info = message.content.info;
+            const thumbCandidate = message.localThumbnailUrl
+                || info?.thumbnail_url
+                || (typeof info?.thumbnail_file === 'object' ? (info?.thumbnail_file as any)?.url : undefined);
+            const posterUrl = message.localThumbnailUrl || (thumbCandidate ? mxcToHttp(client, thumbCandidate, 512) : null);
+            const duration = typeof info?.duration === 'number' ? info.duration : undefined;
+            if (!videoUrl) {
+                return <p className="text-text-secondary italic">Could not load video.</p>;
+            }
+            return <VideoMessagePlayer src={videoUrl} poster={posterUrl} durationMs={duration} />;
         }
 
         if (message.content.msgtype === 'm.file') {

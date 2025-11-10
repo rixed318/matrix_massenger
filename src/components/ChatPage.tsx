@@ -5,7 +5,7 @@ import RoomList from './RoomList';
 import MessageView from './MessageView';
 import ChatHeader from './ChatHeader';
 import MessageInput from './MessageInput';
-import { mxcToHttp, sendReaction, sendTypingIndicator, editMessage, sendMessage, deleteMessage, sendImageMessage, sendReadReceipt, sendFileMessage, setDisplayName, setAvatar, createRoom, inviteUser, forwardMessage, paginateRoomHistory, sendAudioMessage, setPinnedMessages, sendPollStart, sendPollResponse, translateText, sendStickerMessage, sendGifMessage, getSecureCloudProfileForClient, getRoomNotificationMode, setRoomNotificationMode as updateRoomPushRule, RoomCreationOptions, getRoomTTL, setRoomTTL, isRoomHidden, setRoomHidden } from '@matrix-messenger/core';
+import { mxcToHttp, sendReaction, sendTypingIndicator, editMessage, sendMessage, deleteMessage, sendImageMessage, sendReadReceipt, sendFileMessage, setDisplayName, setAvatar, createRoom, inviteUser, forwardMessage, paginateRoomHistory, sendAudioMessage, sendVideoMessage, setPinnedMessages, sendPollStart, sendPollResponse, translateText, sendStickerMessage, sendGifMessage, getSecureCloudProfileForClient, getRoomNotificationMode, setRoomNotificationMode as updateRoomPushRule, RoomCreationOptions, getRoomTTL, setRoomTTL, isRoomHidden, setRoomHidden } from '@matrix-messenger/core';
 import { startGroupCall, joinGroupCall, getDisplayMedia, enumerateDevices } from '@matrix-messenger/core';
 import {
     getScheduledMessages,
@@ -33,7 +33,7 @@ import CallView from './CallView';
 import SearchModal from './SearchModal';
 import PluginCatalogModal from './PluginCatalogModal';
 import { SearchResultItem } from '@matrix-messenger/core';
-import type { DraftContent, SendKeyBehavior, DraftAttachment, DraftAttachmentKind } from '../types';
+import type { DraftContent, SendKeyBehavior, DraftAttachment, DraftAttachmentKind, VideoMessageMetadata } from '../types';
 import SharedMediaPanel from './SharedMediaPanel';
 import type { RoomMediaSummary, SharedMediaCategory, RoomMediaItem } from '@matrix-messenger/core';
 // FIX: The `matrix-js-sdk` exports event names as enums. Import them to use with the event emitter.
@@ -1998,6 +1998,62 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
             URL.revokeObjectURL(localUrl);
         }
     };
+
+    const handleSendVideo = async (file: Blob, metadata: VideoMessageMetadata) => {
+        if (!selectedRoomId) return;
+
+        const tempId = `temp-video-${Date.now()}`;
+        const localUrl = URL.createObjectURL(file);
+        const localThumbnailUrl = URL.createObjectURL(metadata.thumbnail);
+        const user = client.getUser(client.getUserId()!);
+
+        const tempMessage: Message = {
+            id: tempId,
+            sender: {
+                id: client.getUserId()!,
+                name: user?.displayName || 'Me',
+                avatarUrl: mxcToHttp(client, user?.avatarUrl),
+            },
+            content: {
+                body: 'Video message',
+                msgtype: MsgType.Video,
+                info: {
+                    mimetype: metadata.mimeType,
+                    size: file.size,
+                    duration: metadata.durationMs,
+                    w: metadata.width,
+                    h: metadata.height,
+                    thumbnail_url: localThumbnailUrl,
+                    thumbnail_info: {
+                        mimetype: metadata.thumbnailMimeType,
+                        size: metadata.thumbnail.size,
+                        w: metadata.thumbnailWidth,
+                        h: metadata.thumbnailHeight,
+                    },
+                },
+            },
+            timestamp: Date.now(),
+            isOwn: true,
+            reactions: null, isEdited: false, isRedacted: false, replyTo: null, readBy: {},
+            isUploading: true,
+            localUrl,
+            localThumbnailUrl,
+            threadReplyCount: 0,
+        };
+
+        setMessages(prev => [...prev, tempMessage]);
+        scrollToBottom();
+
+        try {
+            await sendVideoMessage(client, selectedRoomId, file, metadata);
+        } catch (error) {
+            console.error('Failed to send video message:', error);
+            setMessages(prev => prev.filter(m => m.id !== tempId));
+        } finally {
+            URL.revokeObjectURL(localUrl);
+            URL.revokeObjectURL(localThumbnailUrl);
+        }
+    };
     
     const handleSendSticker = async (sticker: Sticker) => {
         if (!selectedRoomId) return;
@@ -2549,12 +2605,13 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
                                 </svg>
                             </button>
                         )}
-                        <MessageComposer
-                            onSendMessage={handleSendMessage}
-                            onSendFile={handleSendFile}
-                            onSendAudio={handleSendAudio}
-                            onSendSticker={handleSendSticker}
-                            onSendGif={handleSendGif}
+                            <MessageComposer
+                                onSendMessage={handleSendMessage}
+                                onSendFile={handleSendFile}
+                                onSendAudio={handleSendAudio}
+                                onSendVideo={handleSendVideo}
+                                onSendSticker={handleSendSticker}
+                                onSendGif={handleSendGif}
                             onOpenCreatePoll={() => setIsCreatePollOpen(true)}
                             onSchedule={handleOpenScheduleModal}
                             isSending={isSending}
@@ -2740,6 +2797,7 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
                 isLoading={isSharedMediaLoading}
                 isPaginating={isSharedMediaPaginating}
                 onLoadMore={sharedMediaData?.hasMore ? handleLoadMoreMedia : undefined}
+                currentUserId={client.getUserId() || undefined}
             />
             {activeGroupCall && (
                 <CallView

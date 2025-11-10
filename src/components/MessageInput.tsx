@@ -1,9 +1,12 @@
-import React, { useState, KeyboardEvent, useEffect, useRef, useMemo, ChangeEvent } from 'react';
+import React, { useState, KeyboardEvent, useEffect, useRef, useMemo, ChangeEvent, useCallback } from 'react';
 import { MatrixClient, Message, MatrixUser, Sticker, Gif } from '@matrix-messenger/core';
 import { sendTypingIndicator, getRoomTTL, setRoomTTL, setNextMessageTTL } from '@matrix-messenger/core';
 import MentionSuggestions from './MentionSuggestions';
 import StickerGifPicker from './StickerGifPicker';
-import type { DraftAttachment, DraftContent, SendKeyBehavior } from '../types';
+import type { DraftAttachment, DraftContent, SendKeyBehavior, VideoMessageMetadata } from '../types';
+import { pickSupportedVideoMimeType, readVideoMetadata } from '../utils/media';
+
+const VIDEO_MAX_DURATION_SECONDS = 30;
 
 const deserializeAttachment = async (attachment: DraftAttachment): Promise<File> => {
     const response = await fetch(attachment.dataUrl);
@@ -71,10 +74,25 @@ const renderMarkdown = (value: string, roomMembers: MatrixUser[]): string => {
     return html.replace(/\n/g, '<br/>');
 };
 
+interface RecordedVideoDraft {
+    blob: Blob;
+    url: string;
+    durationMs: number;
+    width: number;
+    height: number;
+    mimeType: string;
+    thumbnailBlob: Blob;
+    thumbnailUrl: string;
+    thumbnailWidth: number;
+    thumbnailHeight: number;
+    thumbnailMimeType: string;
+}
+
 interface MessageInputProps {
     onSendMessage: (content: { body: string; formattedBody?: string }) => void | Promise<void>;
     onSendFile: (file: File) => void;
     onSendAudio: (file: Blob, duration: number) => void;
+    onSendVideo: (file: Blob, metadata: VideoMessageMetadata) => void;
     onSendSticker: (sticker: Sticker) => void;
     onSendGif: (gif: Gif) => void;
     onOpenCreatePoll: () => void;
@@ -91,15 +109,18 @@ interface MessageInputProps {
 }
 
 const MessageInput: React.FC<MessageInputProps> = ({
-    onSendMessage, onSendFile, onSendAudio, onSendSticker, onSendGif, onOpenCreatePoll, onSchedule,
+    onSendMessage, onSendFile, onSendAudio, onSendVideo, onSendSticker, onSendGif, onOpenCreatePoll, onSchedule,
     isSending, client, roomId, replyingTo, onCancelReply, roomMembers, draftContent, onDraftChange,
     sendKeyBehavior
 }) => {
     const [content, setContent] = useState(draftContent?.plain ?? '');
     const [attachments, setAttachments] = useState<DraftAttachment[]>(draftContent?.attachments ?? []);
     const [showPreview, setShowPreview] = useState(false);
-    const [isRecording, setIsRecording] = useState(false);
-    const [recordingTime, setRecordingTime] = useState(0);
+    const [isAudioRecording, setIsAudioRecording] = useState(false);
+    const [audioRecordingTime, setAudioRecordingTime] = useState(0);
+    const [isVideoRecording, setIsVideoRecording] = useState(false);
+    const [videoRecordingTime, setVideoRecordingTime] = useState(0);
+    const [videoDraft, setVideoDraft] = useState<RecordedVideoDraft | null>(null);
     const [showMentions, setShowMentions] = useState(false);
     const [mentionQuery, setMentionQuery] = useState('');
     const [mentionCursor, setMentionCursor] = useState(0);
@@ -115,9 +136,14 @@ const MessageInput: React.FC<MessageInputProps> = ({
     const typingTimeoutRef = useRef<number | null>(null);
     const inputRef = useRef<HTMLTextAreaElement>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
-    const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+    const audioRecorderRef = useRef<MediaRecorder | null>(null);
     const audioChunksRef = useRef<Blob[]>([]);
-    const recordingTimerRef = useRef<number | null>(null);
+    const audioRecordingTimerRef = useRef<number | null>(null);
+    const videoRecorderRef = useRef<MediaRecorder | null>(null);
+    const videoChunksRef = useRef<Blob[]>([]);
+    const videoRecordingTimerRef = useRef<number | null>(null);
+    const videoStreamRef = useRef<MediaStream | null>(null);
+    const liveVideoRef = useRef<HTMLVideoElement>(null);
     const contextMenuRef = useRef<HTMLDivElement>(null);
 
     useEffect(() => {
@@ -130,7 +156,9 @@ const MessageInput: React.FC<MessageInputProps> = ({
         setContent(draftContent?.plain ?? '');
         setAttachments(draftContent?.attachments ?? []);
         setShowPreview(false);
-    }, [draftContent, roomId]);
+        resetVideoRecordingState();
+        discardVideoDraft();
+    }, [discardVideoDraft, draftContent, resetVideoRecordingState, roomId]);
 
     const formattedHtml = useMemo(() => renderMarkdown(content, roomMembers), [content, roomMembers]);
 
@@ -174,8 +202,28 @@ const MessageInput: React.FC<MessageInputProps> = ({
             }
         };
     }, [content, roomId, client]);
-    
-    
+
+    useEffect(() => {
+        if (!isVideoRecording) {
+            if (liveVideoRef.current) {
+                liveVideoRef.current.srcObject = null;
+            }
+            return;
+        }
+        const element = liveVideoRef.current;
+        if (element && videoStreamRef.current) {
+            element.srcObject = videoStreamRef.current;
+            element.play?.().catch(error => {
+                console.warn('Unable to start live video preview', error);
+            });
+        }
+        return () => {
+            if (element) {
+                element.srcObject = null;
+            }
+        };
+    }, [isVideoRecording]);
+
     useEffect(() => {
         const loadRoomTTL = async () => {
             if (!client || !roomId) return;
@@ -410,27 +458,28 @@ const MessageInput: React.FC<MessageInputProps> = ({
     };
 
     const startRecording = async () => {
+        if (isAudioRecording || isVideoRecording || videoDraft) return;
         try {
             const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-            mediaRecorderRef.current = new MediaRecorder(stream);
+            audioRecorderRef.current = new MediaRecorder(stream);
             audioChunksRef.current = [];
 
-            mediaRecorderRef.current.ondataavailable = event => {
+            audioRecorderRef.current.ondataavailable = event => {
                 audioChunksRef.current.push(event.data);
             };
 
-            mediaRecorderRef.current.onstop = () => {
+            audioRecorderRef.current.onstop = () => {
                 const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/ogg; codecs=opus' });
-                onSendAudio(audioBlob, recordingTime);
+                onSendAudio(audioBlob, audioRecordingTime);
                 stream.getTracks().forEach(track => track.stop()); // Stop microphone access
                 resetRecordingState();
             };
 
-            mediaRecorderRef.current.start();
-            setIsRecording(true);
-            setRecordingTime(0);
-            recordingTimerRef.current = window.setInterval(() => {
-                setRecordingTime(prevTime => prevTime + 1);
+            audioRecorderRef.current.start();
+            setIsAudioRecording(true);
+            setAudioRecordingTime(0);
+            audioRecordingTimerRef.current = window.setInterval(() => {
+                setAudioRecordingTime(prevTime => prevTime + 1);
             }, 1000);
 
         } catch (error) {
@@ -440,34 +489,202 @@ const MessageInput: React.FC<MessageInputProps> = ({
     };
 
     const stopRecording = () => {
-        if (mediaRecorderRef.current && isRecording) {
-            mediaRecorderRef.current.stop();
+        if (audioRecorderRef.current && isAudioRecording) {
+            audioRecorderRef.current.stop();
         }
     };
-    
+
     const cancelRecording = () => {
-        if (mediaRecorderRef.current && isRecording) {
-            mediaRecorderRef.current.stream.getTracks().forEach(track => track.stop());
-            mediaRecorderRef.current.ondataavailable = null;
-            mediaRecorderRef.current.onstop = null;
+        if (audioRecorderRef.current && isAudioRecording) {
+            audioRecorderRef.current.stream.getTracks().forEach(track => track.stop());
+            audioRecorderRef.current.ondataavailable = null;
+            audioRecorderRef.current.onstop = null;
             resetRecordingState();
         }
     };
 
-    const resetRecordingState = () => {
-        setIsRecording(false);
-        if (recordingTimerRef.current) {
-            clearInterval(recordingTimerRef.current);
-            recordingTimerRef.current = null;
+    const resetRecordingState = useCallback(() => {
+        setIsAudioRecording(false);
+        if (audioRecordingTimerRef.current) {
+            clearInterval(audioRecordingTimerRef.current);
+            audioRecordingTimerRef.current = null;
         }
-        setRecordingTime(0);
+        setAudioRecordingTime(0);
+        audioChunksRef.current = [];
+        audioRecorderRef.current = null;
+    }, []);
+
+    const stopVideoTimer = useCallback(() => {
+        if (videoRecordingTimerRef.current) {
+            clearInterval(videoRecordingTimerRef.current);
+            videoRecordingTimerRef.current = null;
+        }
+    }, []);
+
+    const cleanupVideoStream = useCallback(() => {
+        if (videoStreamRef.current) {
+            videoStreamRef.current.getTracks().forEach(track => track.stop());
+            videoStreamRef.current = null;
+        }
+        const el = liveVideoRef.current;
+        if (el) {
+            el.srcObject = null;
+        }
+    }, []);
+
+    const resetVideoRecordingState = useCallback(() => {
+        setIsVideoRecording(false);
+        stopVideoTimer();
+        setVideoRecordingTime(0);
+        videoRecorderRef.current = null;
+        videoChunksRef.current = [];
+        cleanupVideoStream();
+    }, [cleanupVideoStream, stopVideoTimer]);
+
+    const discardVideoDraft = useCallback(() => {
+        if (videoDraft) {
+            URL.revokeObjectURL(videoDraft.url);
+            URL.revokeObjectURL(videoDraft.thumbnailUrl);
+            setVideoDraft(null);
+        }
+    }, [videoDraft]);
+
+    const handleVideoRecorderStop = useCallback(async (mimeType?: string) => {
+        stopVideoTimer();
+        setIsVideoRecording(false);
+        setVideoRecordingTime(0);
+        cleanupVideoStream();
+
+        try {
+            if (videoChunksRef.current.length === 0) {
+                videoRecorderRef.current = null;
+                return;
+            }
+
+            const blobType = mimeType || (videoRecorderRef.current?.mimeType ?? 'video/webm');
+            const videoBlob = new Blob(videoChunksRef.current, { type: blobType });
+            const metadata = await readVideoMetadata(videoBlob, { captureTime: 0.2 });
+            const previewUrl = URL.createObjectURL(videoBlob);
+            const thumbnailUrl = URL.createObjectURL(metadata.thumbnailBlob);
+            setVideoDraft({
+                blob: videoBlob,
+                url: previewUrl,
+                durationMs: metadata.durationMs,
+                width: metadata.width,
+                height: metadata.height,
+                mimeType: blobType,
+                thumbnailBlob: metadata.thumbnailBlob,
+                thumbnailUrl,
+                thumbnailWidth: metadata.thumbnailWidth,
+                thumbnailHeight: metadata.thumbnailHeight,
+                thumbnailMimeType: metadata.thumbnailMimeType,
+            });
+        } catch (error) {
+            console.error('Error while finalising video recording:', error);
+        } finally {
+            videoChunksRef.current = [];
+            videoRecorderRef.current = null;
+        }
+    }, [cleanupVideoStream, stopVideoTimer]);
+
+    const startVideoRecording = async () => {
+        if (isVideoRecording) return;
+        discardVideoDraft();
+        try {
+            const constraints: MediaStreamConstraints = {
+                audio: true,
+                video: {
+                    facingMode: 'user',
+                    width: { ideal: 720 },
+                    height: { ideal: 720 },
+                },
+            };
+            const stream = await navigator.mediaDevices.getUserMedia(constraints);
+            videoStreamRef.current = stream;
+            const mimeType = pickSupportedVideoMimeType();
+            const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+            videoRecorderRef.current = recorder;
+            videoChunksRef.current = [];
+
+            recorder.ondataavailable = event => {
+                if (event.data && event.data.size > 0) {
+                    videoChunksRef.current.push(event.data);
+                }
+            };
+
+            recorder.onstop = () => {
+                void handleVideoRecorderStop(recorder.mimeType);
+            };
+
+            recorder.start();
+            setIsVideoRecording(true);
+            setVideoRecordingTime(0);
+            stopVideoTimer();
+            videoRecordingTimerRef.current = window.setInterval(() => {
+                setVideoRecordingTime(prev => {
+                    const next = prev + 1;
+                    if (next >= VIDEO_MAX_DURATION_SECONDS) {
+                        window.setTimeout(() => {
+                            if (videoRecorderRef.current && videoRecorderRef.current.state === 'recording') {
+                                videoRecorderRef.current.stop();
+                            }
+                        }, 0);
+                        return VIDEO_MAX_DURATION_SECONDS;
+                    }
+                    return next;
+                });
+            }, 1000);
+        } catch (error) {
+            console.error('Error starting video recording:', error);
+            resetVideoRecordingState();
+        }
     };
+
+    const stopVideoRecording = () => {
+        if (videoRecorderRef.current && videoRecorderRef.current.state === 'recording') {
+            videoRecorderRef.current.stop();
+        }
+    };
+
+    const cancelVideoRecording = () => {
+        if (videoRecorderRef.current) {
+            videoRecorderRef.current.ondataavailable = null;
+            videoRecorderRef.current.onstop = null;
+            if (videoRecorderRef.current.state === 'recording') {
+                videoRecorderRef.current.stop();
+            }
+        }
+        resetVideoRecordingState();
+    };
+
+    const handleSendVideoDraft = useCallback(() => {
+        if (!videoDraft || !roomId) return;
+        onSendVideo(videoDraft.blob, {
+            durationMs: videoDraft.durationMs,
+            width: videoDraft.width,
+            height: videoDraft.height,
+            mimeType: videoDraft.mimeType,
+            thumbnail: videoDraft.thumbnailBlob,
+            thumbnailMimeType: videoDraft.thumbnailMimeType,
+            thumbnailWidth: videoDraft.thumbnailWidth,
+            thumbnailHeight: videoDraft.thumbnailHeight,
+        });
+        discardVideoDraft();
+    }, [discardVideoDraft, onSendVideo, roomId, videoDraft]);
 
     const formatTime = (seconds: number) => {
         const minutes = Math.floor(seconds / 60);
         const secs = seconds % 60;
         return `${minutes}:${secs < 10 ? '0' : ''}${secs}`;
     };
+
+    useEffect(() => {
+        return () => {
+            resetRecordingState();
+            resetVideoRecordingState();
+            discardVideoDraft();
+        };
+    }, [discardVideoDraft, resetRecordingState, resetVideoRecordingState]);
 
     
     const ttlLabel = (ms: number | null | undefined) => {
@@ -502,7 +719,17 @@ const MessageInput: React.FC<MessageInputProps> = ({
         const hasContent = content.trim().length > 0 || attachments.length > 0;
         const buttonDisabled = isSending || !roomId;
 
-        if (isRecording) {
+        if (isVideoRecording) {
+            return (
+                 <button onClick={stopVideoRecording} disabled={buttonDisabled} className="p-3 text-text-accent hover:opacity-80 disabled:text-text-secondary disabled:cursor-not-allowed">
+                     <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" viewBox="0 0 20 20" fill="currentColor">
+                        <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8 7a1 1 0 00-1 1v4a1 1 0 102 0V8a1 1 0 00-1-1zm4 0a1 1 0 00-1 1v4a1 1 0 102 0V8a1 1 0 00-1-1z" clipRule="evenodd" />
+                    </svg>
+                </button>
+            );
+        }
+
+        if (isAudioRecording) {
             return (
                  <button onClick={stopRecording} disabled={buttonDisabled} className="p-3 text-text-accent hover:opacity-80 disabled:text-text-secondary disabled:cursor-not-allowed">
                      <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" viewBox="0 0 20 20" fill="currentColor">
@@ -528,7 +755,7 @@ const MessageInput: React.FC<MessageInputProps> = ({
         return (
              <button
                 onClick={startRecording}
-                disabled={buttonDisabled}
+                disabled={buttonDisabled || isVideoRecording || Boolean(videoDraft)}
                 className="p-3 text-text-secondary hover:text-text-primary disabled:opacity-50 disabled:cursor-not-allowed"
                 aria-label="Record voice message"
             >
@@ -622,6 +849,51 @@ const MessageInput: React.FC<MessageInputProps> = ({
                     ))}
                 </div>
             )}
+            {isVideoRecording && (
+                <div className="ml-1 mr-1 mb-2 flex items-center gap-4 bg-bg-secondary/70 border border-border-secondary rounded-lg p-3">
+                    <div className="w-24 h-24 rounded-xl overflow-hidden bg-black/60 flex items-center justify-center">
+                        <video ref={liveVideoRef} className="w-full h-full object-cover" muted playsInline />
+                    </div>
+                    <div className="flex-1">
+                        <p className="text-sm text-text-primary font-semibold">Запись видео…</p>
+                        <p className="text-xs text-text-secondary">Осталось {Math.max(0, VIDEO_MAX_DURATION_SECONDS - videoRecordingTime)} сек.</p>
+                        <p className="text-xs text-text-secondary mt-1 font-mono">{formatTime(videoRecordingTime)}</p>
+                    </div>
+                    <div className="flex flex-col gap-2">
+                        <button onClick={stopVideoRecording} className="px-3 py-1 rounded-md bg-accent text-text-inverted text-sm hover:bg-accent-hover">Стоп</button>
+                        <button onClick={cancelVideoRecording} className="px-3 py-1 rounded-md bg-bg-tertiary text-text-secondary text-sm hover:text-text-primary">Отмена</button>
+                    </div>
+                </div>
+            )}
+            {videoDraft && (
+                <div className="ml-1 mr-1 mb-2 bg-bg-secondary/80 border border-border-secondary rounded-lg p-3 flex flex-col gap-3">
+                    <div className="flex gap-3 items-center">
+                        <div className="w-32 h-32 rounded-xl overflow-hidden bg-black/60 flex items-center justify-center">
+                            <video src={videoDraft.url} poster={videoDraft.thumbnailUrl} className="w-full h-full object-cover" controls playsInline />
+                        </div>
+                        <div className="flex-1 space-y-1">
+                            <p className="text-sm text-text-primary font-semibold">Видео готово к отправке</p>
+                            <p className="text-xs text-text-secondary font-mono">Длительность: {formatTime(Math.round(videoDraft.durationMs / 1000))}</p>
+                            <p className="text-xs text-text-secondary">Разрешение: {videoDraft.width}×{videoDraft.height}</p>
+                        </div>
+                    </div>
+                    <div className="flex justify-end gap-2">
+                        <button
+                            onClick={discardVideoDraft}
+                            className="px-3 py-1 rounded-md bg-bg-tertiary text-text-secondary text-sm hover:text-text-primary"
+                        >
+                            Удалить
+                        </button>
+                        <button
+                            onClick={handleSendVideoDraft}
+                            className="px-3 py-1 rounded-md bg-accent text-text-inverted text-sm hover:bg-accent-hover"
+                            disabled={isSending}
+                        >
+                            Отправить видео
+                        </button>
+                    </div>
+                </div>
+            )}
             <div className={`flex items-center bg-bg-secondary ${replyingTo ? 'rounded-b-lg' : 'rounded-lg'}`}>
                 <input
                     type="file"
@@ -631,7 +903,7 @@ const MessageInput: React.FC<MessageInputProps> = ({
                 />
                 <button
                     onClick={() => fileInputRef.current?.click()}
-                    disabled={isSending || !roomId || isRecording}
+                    disabled={isSending || !roomId || isAudioRecording || isVideoRecording}
                     className="p-3 text-text-secondary hover:text-text-primary disabled:opacity-50 disabled:cursor-not-allowed"
                     aria-label="Attach file"
                 >
@@ -641,7 +913,7 @@ const MessageInput: React.FC<MessageInputProps> = ({
                 </button>
                 <button
                     onClick={onOpenCreatePoll}
-                    disabled={isSending || !roomId || isRecording}
+                    disabled={isSending || !roomId || isAudioRecording || isVideoRecording}
                     className="p-3 text-text-secondary hover:text-text-primary disabled:opacity-50 disabled:cursor-not-allowed"
                     aria-label="Create poll"
                 >
@@ -649,14 +921,24 @@ const MessageInput: React.FC<MessageInputProps> = ({
                         <path d="M2 11a1 1 0 011-1h2a1 1 0 110 2H3a1 1 0 01-1-1zm5 0a1 1 0 011-1h10a1 1 0 110 2H8a1 1 0 01-1-1zM2 5a1 1 0 011-1h2a1 1 0 110 2H3a1 1 0 01-1-1zm5 0a1 1 0 011-1h10a1 1 0 110 2H8a1 1 0 01-1-1zM2 17a1 1 0 011-1h2a1 1 0 110 2H3a1 1 0 01-1-1zm5 0a1 1 0 011-1h10a1 1 0 110 2H8a1 1 0 01-1-1z" />
                     </svg>
                 </button>
-                {isRecording ? (
+                <button
+                    onClick={startVideoRecording}
+                    disabled={isSending || !roomId || isAudioRecording || isVideoRecording}
+                    className="p-3 text-text-secondary hover:text-text-primary disabled:opacity-50 disabled:cursor-not-allowed"
+                    aria-label="Record video message"
+                >
+                    <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" viewBox="0 0 24 24" fill="currentColor">
+                        <path d="M5 5a3 3 0 00-3 3v8a3 3 0 003 3h8a3 3 0 003-3v-1.382l2.553 1.532A1 1 0 0020 15.236V8.764a1 1 0 00-1.447-.914L16 9.382V8a3 3 0 00-3-3H5z" />
+                    </svg>
+                </button>
+                {isAudioRecording ? (
                      <div className="flex-1 flex items-center justify-between p-3">
                          <div className="flex items-center">
                             <span className="relative flex h-3 w-3">
                                 <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75"></span>
                                 <span className="relative inline-flex rounded-full h-3 w-3 bg-red-500"></span>
                             </span>
-                            <span className="ml-3 text-text-primary font-mono">{formatTime(recordingTime)}</span>
+                            <span className="ml-3 text-text-primary font-mono">{formatTime(audioRecordingTime)}</span>
                          </div>
                          <button onClick={cancelRecording} className="text-text-secondary hover:text-text-primary">Cancel</button>
                      </div>
@@ -738,7 +1020,7 @@ const MessageInput: React.FC<MessageInputProps> = ({
                 <div className="relative">
                     <button
                         onClick={() => setTtlMenuOpen(v => !v)}
-                        disabled={isSending || !roomId || isRecording}
+                        disabled={isSending || !roomId || isAudioRecording || isVideoRecording}
                         className="p-3 text-text-secondary hover:text-text-primary disabled:opacity-50 disabled:cursor-not-allowed"
                         aria-label="TTL"
                     >
@@ -762,9 +1044,9 @@ const MessageInput: React.FC<MessageInputProps> = ({
                     )}
                 </div>
 
-                 <button
+                <button
                     onClick={() => setPickerOpen(p => !p)}
-                    disabled={isSending || !roomId || isRecording}
+                    disabled={isSending || !roomId || isAudioRecording || isVideoRecording}
                     className="p-3 text-text-secondary hover:text-text-primary disabled:opacity-50 disabled:cursor-not-allowed"
                     aria-label="Open sticker picker"
                 >

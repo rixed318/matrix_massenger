@@ -1,4 +1,4 @@
-import { MatrixClient, MatrixEvent, MatrixRoom, MatrixUser, Sticker, StickerPack, StickerLibraryState, Gif, RoomCreationOptions } from '../types';
+import { MatrixClient, MatrixEvent, MatrixRoom, MatrixUser, Sticker, Gif, RoomCreationOptions, VideoMessageMetadata } from '../types';
 import type { SecureCloudProfile } from './secureCloudService';
 import { normaliseSecureCloudProfile } from './secureCloudService';
 import GroupCallCoordinator, { GroupCallParticipant as CoordinatorParticipant } from './webrtc/groupCallCoordinator';
@@ -2747,6 +2747,20 @@ export const sendImageMessage = async (client: MatrixClient, roomId: string, fil
     }
 };
 
+const applySelfDestructContent = async (client: MatrixClient, roomId: string, content: any) => {
+    let ttlForMessage = getNextMessageTTL(roomId);
+    if (ttlForMessage == null) {
+        ttlForMessage = await getRoomTTL(client, roomId);
+    }
+    if (typeof ttlForMessage === 'number' && ttlForMessage > 0) {
+        const expiresAt = Date.now() + ttlForMessage;
+        content[SELF_DESTRUCT_CONTENT_KEY] = {
+            ttlMs: ttlForMessage,
+            expiresAt,
+        };
+    }
+};
+
 export const sendAudioMessage = async (client: MatrixClient, roomId: string, file: Blob, duration: number): Promise<{ event_id: string }> => {
     const content = {
         body: "Voice Message",
@@ -2758,6 +2772,7 @@ export const sendAudioMessage = async (client: MatrixClient, roomId: string, fil
         msgtype: MsgType.Audio,
         url: undefined as unknown as string,
     };
+    await applySelfDestructContent(client, roomId, content);
     const sendDirect = async () => {
         const { content_uri: mxcUrl } = await client.uploadContent(file, {
             name: "voice-message.ogg",
@@ -2773,6 +2788,7 @@ export const sendAudioMessage = async (client: MatrixClient, roomId: string, fil
             kind: 'audio',
         });
         const localId = await enqueueOutbox(roomId, EventType.RoomMessage, content, { attachments: [attachment] });
+        clearNextMessageTTL(roomId);
         return { event_id: localId };
     };
 
@@ -2781,7 +2797,99 @@ export const sendAudioMessage = async (client: MatrixClient, roomId: string, fil
     }
 
     try {
-        return await sendDirect();
+        const result = await sendDirect();
+        clearNextMessageTTL(roomId);
+        return result;
+    } catch (error) {
+        if (shouldQueueFromError(error)) {
+            return queueOutbox();
+        }
+        throw error;
+    }
+};
+
+export const sendVideoMessage = async (
+    client: MatrixClient,
+    roomId: string,
+    file: Blob,
+    metadata: VideoMessageMetadata,
+): Promise<{ event_id: string }> => {
+    const content: any = {
+        body: 'Video message',
+        info: {
+            mimetype: metadata.mimeType,
+            size: file.size,
+            duration: Math.round(metadata.durationMs),
+            w: metadata.width,
+            h: metadata.height,
+            thumbnail_url: undefined as unknown as string,
+            thumbnail_info: {
+                mimetype: metadata.thumbnailMimeType,
+                size: metadata.thumbnail.size,
+                w: metadata.thumbnailWidth,
+                h: metadata.thumbnailHeight,
+            },
+        },
+        msgtype: MsgType.Video,
+        url: undefined as unknown as string,
+    };
+    await applySelfDestructContent(client, roomId, content);
+
+    const sendDirect = async () => {
+        const [videoUpload, thumbUpload] = await Promise.all([
+            client.uploadContent(file, {
+                name: 'video-message.webm',
+                type: metadata.mimeType,
+            }),
+            client.uploadContent(metadata.thumbnail, {
+                name: 'video-thumbnail.jpg',
+                type: metadata.thumbnailMimeType,
+            }),
+        ]);
+        const toMxc = (result: any) => {
+            if (typeof result === 'string') return result;
+            if (result?.content_uri) return result.content_uri;
+            if (result?.contentUri) return result.contentUri;
+            return undefined;
+        };
+        const videoMxc = toMxc(videoUpload);
+        const thumbMxc = toMxc(thumbUpload);
+        const payload = { ...content };
+        if (videoMxc) {
+            payload.url = videoMxc;
+        }
+        if (thumbMxc) {
+            payload.info = { ...payload.info, thumbnail_url: thumbMxc };
+        }
+        return client.sendEvent(roomId, EventType.RoomMessage, payload as any);
+    };
+
+    const queueOutbox = async () => {
+        const videoAttachment = await serializeOutboxAttachment(file, {
+            name: 'video-message.webm',
+            contentPath: 'url',
+            kind: 'video',
+            mimeTypeOverride: metadata.mimeType,
+        });
+        const thumbAttachment = await serializeOutboxAttachment(metadata.thumbnail, {
+            name: 'video-thumbnail.jpg',
+            contentPath: 'info.thumbnail_url',
+            kind: 'image',
+            mimeTypeOverride: metadata.thumbnailMimeType,
+        });
+        const localId = await enqueueOutbox(roomId, EventType.RoomMessage, content, { attachments: [videoAttachment, thumbAttachment] });
+        clearNextMessageTTL(roomId);
+        return { event_id: localId };
+    };
+
+    if (isOffline()) {
+        return queueOutbox();
+    }
+
+    try {
+        const result = await sendDirect();
+        clearNextMessageTTL(roomId);
+        return result;
     } catch (error) {
         if (shouldQueueFromError(error)) {
             return queueOutbox();
