@@ -3,11 +3,17 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import SearchModal from '../../../src/components/SearchModal';
 import type { MatrixClient, Room } from '../../../src/types';
 import { vi, describe, it, beforeEach, expect } from 'vitest';
+import { getAccountStore } from '../../../src/services/accountManager';
 
 const searchMessagesMock = vi.fn();
+const searchUniversalMessagesMock = vi.fn();
 
 vi.mock('@matrix-messenger/core', () => ({
     searchMessages: searchMessagesMock,
+}));
+
+vi.mock('../../../src/services/universalSearchService', () => ({
+    searchUniversalMessages: searchUniversalMessagesMock,
 }));
 
 const createRoom = (overrides: Partial<Room> = {}): Room => ({
@@ -28,6 +34,7 @@ describe('SearchModal', () => {
         createRoom({ roomId: '!room:example', name: 'Общий чат' }),
         createRoom({ roomId: '!room:second', name: 'Рабочая комната' }),
     ];
+    const accountStore = getAccountStore();
 
     beforeEach(() => {
         vi.clearAllMocks();
@@ -36,6 +43,13 @@ describe('SearchModal', () => {
             highlights: [],
             nextBatch: undefined,
             results: [],
+        });
+        searchUniversalMessagesMock.mockReset();
+        accountStore.setState({
+            accounts: {},
+            universalMode: 'active',
+            aggregatedRooms: [],
+            aggregatedQuickFilters: [],
         });
     });
 
@@ -146,6 +160,83 @@ describe('SearchModal', () => {
         await waitFor(() => {
             expect(screen.queryByText(/Отправители:/)).toBeNull();
             expect(screen.queryByText(/Медиа:/)).toBeNull();
+        });
+    });
+
+    it('uses universal search mode and shows account badge', async () => {
+        const compositeId = 'acc-1|!room:example.org';
+        const aggregatedRoom = {
+            roomId: '!room:example.org',
+            name: 'Совместный чат',
+            homeserverName: 'example.org',
+            compositeId,
+            accountKey: 'acc-1',
+            accountDisplayName: '@user:example.org',
+        } as any;
+
+        accountStore.setState({
+            universalMode: 'all',
+            aggregatedRooms: [aggregatedRoom],
+        });
+
+        const event = {
+            getId: () => '$event',
+            getTs: () => 1,
+            getContent: () => ({ body: 'Сообщение' }),
+            getType: () => 'm.room.message',
+        } as any;
+
+        searchUniversalMessagesMock.mockResolvedValue({
+            results: [
+                {
+                    event,
+                    roomId: aggregatedRoom.roomId,
+                    rank: 1,
+                    context: { before: [], after: [] },
+                    highlights: ['Сообщение'],
+                    accountKey: aggregatedRoom.accountKey,
+                    accountUserId: '@user:example.org',
+                    accountDisplayName: '@user:example.org',
+                    accountAvatarUrl: null,
+                    homeserverName: aggregatedRoom.homeserverName,
+                },
+            ],
+            highlights: ['Сообщение'],
+            cursor: null,
+        });
+
+        render(
+            <SearchModal
+                isOpen
+                onClose={vi.fn()}
+                client={client}
+                rooms={rooms}
+                onSelectResult={vi.fn()}
+            />,
+        );
+
+        fireEvent.change(screen.getByPlaceholderText('Найдите сообщения по всему аккаунту...'), {
+            target: { value: 'Сообщение' },
+        });
+
+        fireEvent.change(screen.getByRole('combobox', { name: 'Комната' }), { target: { value: compositeId } });
+
+        fireEvent.click(screen.getByRole('button', { name: 'Искать' }));
+
+        await waitFor(() => expect(searchUniversalMessagesMock).toHaveBeenCalledTimes(1));
+
+        const [options] = searchUniversalMessagesMock.mock.calls[0];
+        expect(options).toMatchObject({
+            searchTerm: 'Сообщение',
+            roomId: aggregatedRoom.roomId,
+            includedAccountKeys: [aggregatedRoom.accountKey],
+        });
+        expect(searchMessagesMock).not.toHaveBeenCalled();
+
+        await waitFor(() => {
+            expect(screen.getByText(aggregatedRoom.name)).toBeInTheDocument();
+            expect(screen.getByText(aggregatedRoom.homeserverName)).toBeInTheDocument();
+            expect(screen.getByText('@user:example.org')).toBeInTheDocument();
         });
     });
 });
