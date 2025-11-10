@@ -110,6 +110,21 @@ const RoomListItem: React.FC<RoomListItemProps> = ({ room, isSelected, onSelect 
                         {hasRecentAttachment && (
                             <span className="px-1.5 py-0.5 rounded-full bg-accent/10 text-[10px] uppercase tracking-wide text-accent font-semibold">Shared</span>
                         )}
+                        {room.mentionCount && room.mentionCount > 0 && (
+                            <span className="px-1.5 py-0.5 rounded-full bg-indigo-500/10 text-[10px] uppercase tracking-wide text-indigo-200" title="Новые упоминания">
+                                @{room.mentionCount}
+                            </span>
+                        )}
+                        {room.scheduledMessageCount && room.scheduledMessageCount > 0 && (
+                            <span className="px-1.5 py-0.5 rounded-full bg-amber-500/10 text-[10px] uppercase tracking-wide text-amber-200" title="Отложенные сообщения">
+                                ⏰ {room.scheduledMessageCount}
+                            </span>
+                        )}
+                        {room.secureAlertCount && room.secureAlertCount > 0 && (
+                            <span className="px-1.5 py-0.5 rounded-full bg-red-500/10 text-[10px] uppercase tracking-wide text-red-200" title="Оповещения Secure Cloud">
+                                ⚠️ {room.secureAlertCount}
+                            </span>
+                        )}
                     </p>
                     {room.unreadCount > 0 && (
                         <span className="bg-accent text-text-inverted text-xs font-bold rounded-full h-5 w-5 flex items-center justify-center flex-shrink-0 ml-2">

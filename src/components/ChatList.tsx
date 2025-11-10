@@ -10,7 +10,11 @@ import {
     InboxViewMode,
     useAccountStore,
 } from '../services/accountManager';
-import { UniversalQuickFilterId } from '../utils/chatSelectors';
+import {
+    UNIVERSAL_QUICK_FILTER_METADATA,
+    evaluateQuickFilterMembership,
+    type UniversalQuickFilterId,
+} from '../utils/chatSelectors';
 
 interface ChatListProps {
     rooms: Room[];
@@ -159,13 +163,8 @@ const ChatList: React.FC<ChatListProps> = ({
     const aggregatedFilteredRooms = useMemo(() => {
         const query = searchTerm.trim().toLowerCase();
         return aggregatedRooms.filter(room => {
-            const quickFilterMatch: Record<UniversalQuickFilterId, boolean> = {
-                all: true,
-                unread: (room.unreadCount ?? 0) > 0,
-                service: room.isServiceRoom,
-            };
-
-            if (!quickFilterMatch[activeQuickFilterId]) {
+            const membership = evaluateQuickFilterMembership(room);
+            if (!membership[activeQuickFilterId]) {
                 return false;
             }
 
@@ -415,18 +414,21 @@ const ChatList: React.FC<ChatListProps> = ({
                 </div>
                 {isUniversal && (
                     <div className="flex flex-wrap gap-2">
-                        {aggregatedQuickFilters.map(filter => (
-                            <button
-                                key={filter.id}
-                                onClick={() => setActiveQuickFilterId(filter.id)}
-                                className={quickFilterLabelClass(activeQuickFilterId === filter.id)}
-                            >
-                                <span>{filter.label}</span>
-                                <span className="ml-2 inline-flex items-center justify-center rounded-full bg-bg-secondary px-1.5 text-[10px]">
-                                    {filter.unreadCount}
-                                </span>
-                            </button>
-                        ))}
+                        {aggregatedQuickFilters
+                            .filter(filter => filter.id === 'all' || filter.roomCount > 0)
+                            .map(filter => (
+                                <button
+                                    key={filter.id}
+                                    onClick={() => setActiveQuickFilterId(filter.id)}
+                                    className={quickFilterLabelClass(activeQuickFilterId === filter.id)}
+                                    title={filter.description ?? UNIVERSAL_QUICK_FILTER_METADATA[filter.id]?.description}
+                                >
+                                    <span>{filter.label}</span>
+                                    <span className="ml-2 inline-flex items-center justify-center rounded-full bg-bg-secondary px-1.5 text-[10px]">
+                                        {filter.unreadCount}
+                                    </span>
+                                </button>
+                            ))}
                     </div>
                 )}
             </div>

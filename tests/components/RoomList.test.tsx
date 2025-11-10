@@ -2,6 +2,8 @@ import React from 'react';
 import { render, screen, fireEvent } from '@testing-library/react';
 import RoomList from '../../src/components/RoomList';
 import type { MatrixClient, Room, Folder } from '@matrix-messenger/core';
+import { AccountProvider, getAccountStore } from '../../src/services/accountManager';
+import { buildQuickFilterSummaries } from '../../src/utils/chatSelectors';
 
 vi.mock('@matrix-messenger/core', async () => {
   const actual = await vi.importActual<any>('@matrix-messenger/core');
@@ -59,14 +61,27 @@ const baseProps: React.ComponentProps<typeof RoomList> = {
 };
 
 describe('RoomList', () => {
+  beforeEach(() => {
+    const store = getAccountStore();
+    store.setState({
+      aggregatedRooms: [],
+      aggregatedQuickFilters: buildQuickFilterSummaries([]),
+      aggregatedUnread: 0,
+      universalMode: 'active',
+      activeQuickFilterId: 'all',
+    });
+  });
+
   it('switches active account immediately without timers', () => {
     const onSwitchAccount = vi.fn();
     const { rerender } = render(
-      <RoomList
-        {...baseProps}
-        onSwitchAccount={onSwitchAccount}
-        activeAccountKey="one"
-      />,
+      <AccountProvider>
+        <RoomList
+          {...baseProps}
+          onSwitchAccount={onSwitchAccount}
+          activeAccountKey="one"
+        />
+      </AccountProvider>,
     );
 
     expect(screen.getByTitle('Alice')).toHaveClass('ring-2');
@@ -76,11 +91,13 @@ describe('RoomList', () => {
     expect(onSwitchAccount).toHaveBeenCalledWith('two');
 
     rerender(
-      <RoomList
-        {...baseProps}
-        onSwitchAccount={onSwitchAccount}
-        activeAccountKey="two"
-      />,
+      <AccountProvider>
+        <RoomList
+          {...baseProps}
+          onSwitchAccount={onSwitchAccount}
+          activeAccountKey="two"
+        />
+      </AccountProvider>,
     );
 
     expect(screen.getByTitle('Bob')).toHaveClass('ring-2');

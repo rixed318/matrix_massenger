@@ -6,7 +6,7 @@ import {
   RoomNotificationMode,
 } from '../types';
 import { parseMatrixEvent } from './parseMatrixEvent';
-import { mxcToHttp } from '../services/matrixService';
+import { isRoomHidden, mxcToHttp } from '../services/matrixService';
 
 export type ChatRoomType = 'all' | 'direct' | 'group' | 'saved';
 export type ChatRoomStatus = 'all' | 'joined' | 'invited' | 'left';
@@ -18,6 +18,10 @@ export interface RoomSummary extends UIRoom {
   status: ChatRoomStatus;
   lastMessagePreview: string | null;
   lastMessageAt: number | null;
+  mentionCount: number;
+  scheduledMessageCount: number;
+  secureAlertCount: number;
+  isHidden: boolean;
 }
 
 export interface RoomSelection {
@@ -31,6 +35,8 @@ export interface RoomBuildOptions {
   matrixRoom: MatrixRoom;
   savedMessagesRoomId: string;
   roomNotificationModes: Record<string, RoomNotificationMode>;
+  scheduledCountByRoom?: Record<string, number>;
+  secureAlertCountByRoom?: Record<string, number>;
 }
 
 export interface UnifiedAccountDescriptor {
@@ -42,6 +48,8 @@ export interface UnifiedAccountDescriptor {
   displayName?: string | null;
   avatarUrl?: string | null;
   homeserverUrl: string;
+  scheduledCountByRoom?: Record<string, number>;
+  secureAlertCountByRoom?: Record<string, number>;
 }
 
 export interface UnifiedRoomSummary extends RoomSummary {
@@ -88,6 +96,8 @@ export const buildRoomSelection = ({
   matrixRoom,
   savedMessagesRoomId,
   roomNotificationModes,
+  scheduledCountByRoom = {},
+  secureAlertCountByRoom = {},
 }: RoomBuildOptions): RoomSelection | null => {
   const membership = matrixRoom.getMyMembership();
   const status = membershipToStatus(membership);
@@ -113,9 +123,13 @@ export const buildRoomSelection = ({
     : null;
 
   const unreadCount = matrixRoom.getUnreadNotificationCount(NotificationCountType.Total);
+  const mentionCount = matrixRoom.getUnreadNotificationCount(NotificationCountType.Highlight);
   const lastMessageAt = lastMessage?.timestamp ?? lastEvent?.getTs() ?? null;
 
   const isServiceRoom = matrixRoom.getType?.() === 'm.server_notice';
+  const isHidden = isRoomHidden(client, matrixRoom.roomId);
+  const scheduledMessageCount = scheduledCountByRoom[matrixRoom.roomId] ?? 0;
+  const secureAlertCount = secureAlertCountByRoom[matrixRoom.roomId] ?? 0;
 
   const summary: RoomSummary = {
     roomId: matrixRoom.roomId,
@@ -141,6 +155,10 @@ export const buildRoomSelection = ({
     spaceChildIds: matrixRoom.getChildRooms?.()?.map(child => child.roomId),
     spaceParentIds: matrixRoom.getParentRooms?.()?.map(parent => parent.roomId),
     canonicalAlias: matrixRoom.getCanonicalAlias?.() ?? null,
+    mentionCount,
+    scheduledMessageCount,
+    secureAlertCount,
+    isHidden,
   } as RoomSummary;
 
   return {
@@ -154,6 +172,8 @@ export const collectRoomsForClient = ({
   client,
   savedMessagesRoomId,
   roomNotificationModes,
+  scheduledCountByRoom = {},
+  secureAlertCountByRoom = {},
 }: Omit<UnifiedAccountDescriptor, 'key' | 'userId' | 'displayName' | 'avatarUrl' | 'homeserverUrl'>): RoomSelection[] => {
   const rooms = client.getRooms().slice().sort((a, b) => {
     const aEvents = a.getLiveTimeline().getEvents();
@@ -171,6 +191,8 @@ export const collectRoomsForClient = ({
       matrixRoom: room,
       savedMessagesRoomId: savedMessagesRoomId ?? '',
       roomNotificationModes,
+      scheduledCountByRoom,
+      secureAlertCountByRoom,
     });
 
     if (!built) {
@@ -193,6 +215,8 @@ export const collectUnifiedRooms = (
       client: descriptor.client,
       savedMessagesRoomId: descriptor.savedMessagesRoomId ?? '',
       roomNotificationModes: descriptor.roomNotificationModes,
+      scheduledCountByRoom: descriptor.scheduledCountByRoom ?? {},
+      secureAlertCountByRoom: descriptor.secureAlertCountByRoom ?? {},
     });
 
     const displayName = descriptor.displayName ?? descriptor.userId;
@@ -217,7 +241,73 @@ export const collectUnifiedRooms = (
   return aggregated;
 };
 
-export type UniversalQuickFilterId = 'all' | 'unread' | 'service';
+export type UniversalQuickFilterId =
+  | 'all'
+  | 'unread'
+  | 'mentions'
+  | 'scheduled'
+  | 'secure'
+  | 'hidden'
+  | 'pinned'
+  | 'service';
+
+export const UNIVERSAL_QUICK_FILTER_ORDER: UniversalQuickFilterId[] = [
+  'all',
+  'unread',
+  'mentions',
+  'scheduled',
+  'secure',
+  'hidden',
+  'pinned',
+  'service',
+];
+
+export const UNIVERSAL_QUICK_FILTER_METADATA: Record<UniversalQuickFilterId, { label: string; description?: string }> = {
+  all: { label: 'Все чаты' },
+  unread: { label: 'Все непрочитанные', description: 'Комнаты с непрочитанными сообщениями' },
+  mentions: { label: 'Упоминания', description: 'Есть новые @упоминания или подсветки' },
+  scheduled: { label: 'Запланированные', description: 'Есть отложенные сообщения' },
+  secure: { label: 'Secure Cloud', description: 'Есть предупреждения Secure Cloud' },
+  hidden: { label: 'Скрытые', description: 'Чаты, защищённые PIN-кодом' },
+  pinned: { label: 'С закрепами', description: 'Есть закреплённые сообщения' },
+  service: { label: 'Служебные', description: 'Системные и сервисные уведомления' },
+};
+
+export const isUniversalQuickFilterId = (value: unknown): value is UniversalQuickFilterId =>
+  typeof value === 'string' && UNIVERSAL_QUICK_FILTER_ORDER.includes(value as UniversalQuickFilterId);
+
+export interface QuickFilterContext {
+  unreadCount?: number | null;
+  isServiceRoom?: boolean;
+  mentionCount?: number | null;
+  scheduledMessageCount?: number | null;
+  secureAlertCount?: number | null;
+  isHidden?: boolean;
+  pinnedEvents?: string[];
+}
+
+export const evaluateQuickFilterMembership = (
+  context: QuickFilterContext,
+): Record<UniversalQuickFilterId, boolean> => {
+  const unread = (context.unreadCount ?? 0) > 0;
+  const mentions = (context.mentionCount ?? 0) > 0;
+  const scheduled = (context.scheduledMessageCount ?? 0) > 0;
+  const secure = (context.secureAlertCount ?? 0) > 0;
+  const hidden = Boolean(context.isHidden);
+  const pinned = (context.pinnedEvents?.length ?? 0) > 0;
+  const service = Boolean(context.isServiceRoom);
+
+  return {
+    all: true,
+    unread,
+    mentions,
+    scheduled,
+    secure,
+    hidden,
+    pinned,
+    service,
+  } satisfies Record<UniversalQuickFilterId, boolean>;
+};
 
 export interface UniversalQuickFilterSummary {
   id: UniversalQuickFilterId;
@@ -230,30 +320,31 @@ export interface UniversalQuickFilterSummary {
 export const buildQuickFilterSummaries = (
   rooms: UnifiedRoomSummary[],
 ): UniversalQuickFilterSummary[] => {
-  const unreadRooms = rooms.filter(room => (room.unreadCount ?? 0) > 0);
-  const serviceRooms = rooms.filter(room => room.isServiceRoom);
+  const accumulator = UNIVERSAL_QUICK_FILTER_ORDER.reduce(
+    (acc, id) => {
+      acc[id] = { roomCount: 0, unreadCount: 0 };
+      return acc;
+    },
+    {} as Record<UniversalQuickFilterId, { roomCount: number; unreadCount: number }>,
+  );
 
-  const sumUnread = (items: UnifiedRoomSummary[]) =>
-    items.reduce((acc, item) => acc + (item.unreadCount ?? 0), 0);
+  rooms.forEach(room => {
+    const membership = evaluateQuickFilterMembership(room);
+    (Object.entries(membership) as Array<[UniversalQuickFilterId, boolean]>).forEach(([id, matches]) => {
+      if (!matches) {
+        return;
+      }
+      const summary = accumulator[id];
+      summary.roomCount += 1;
+      summary.unreadCount += room.unreadCount ?? 0;
+    });
+  });
 
-  return [
-    {
-      id: 'all',
-      label: 'Все чаты',
-      roomCount: rooms.length,
-      unreadCount: sumUnread(rooms),
-    },
-    {
-      id: 'unread',
-      label: 'Все непрочитанные',
-      roomCount: unreadRooms.length,
-      unreadCount: sumUnread(unreadRooms),
-    },
-    {
-      id: 'service',
-      label: 'Служебные',
-      roomCount: serviceRooms.length,
-      unreadCount: sumUnread(serviceRooms),
-    },
-  ];
+  return UNIVERSAL_QUICK_FILTER_ORDER.map(id => ({
+    id,
+    label: UNIVERSAL_QUICK_FILTER_METADATA[id].label,
+    description: UNIVERSAL_QUICK_FILTER_METADATA[id].description,
+    roomCount: accumulator[id].roomCount,
+    unreadCount: accumulator[id].unreadCount,
+  }));
 };
