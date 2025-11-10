@@ -5,7 +5,7 @@ import RoomList from './RoomList';
 import MessageView from './MessageView';
 import ChatHeader from './ChatHeader';
 import MessageInput from './MessageInput';
-import { mxcToHttp, sendReaction, sendTypingIndicator, editMessage, sendMessage, deleteMessage, sendImageMessage, sendReadReceipt, sendFileMessage, setDisplayName, setAvatar, createRoom, inviteUser, forwardMessage, paginateRoomHistory, sendAudioMessage, sendVideoMessage, setPinnedMessages, sendPollStart, sendPollResponse, translateText, sendStickerMessage, sendGifMessage, getSecureCloudProfileForClient, getRoomNotificationMode, setRoomNotificationMode as updateRoomPushRule, RoomCreationOptions, getRoomTTL, setRoomTTL, isRoomHidden, setRoomHidden } from '@matrix-messenger/core';
+import { mxcToHttp, sendReaction, sendTypingIndicator, editMessage, sendMessage, deleteMessage, sendImageMessage, sendReadReceipt, sendFileMessage, setDisplayName, setAvatar, createRoom, inviteUser, forwardMessage, paginateRoomHistory, sendAudioMessage, sendVideoMessage, setPinnedMessages, sendPollStart, sendPollResponse, translateText, sendStickerMessage, sendGifMessage, sendLocationMessage, getSecureCloudProfileForClient, getRoomNotificationMode, setRoomNotificationMode as updateRoomPushRule, RoomCreationOptions, getRoomTTL, setRoomTTL, isRoomHidden, setRoomHidden } from '@matrix-messenger/core';
 import { startGroupCall, joinGroupCall, getDisplayMedia, enumerateDevices } from '@matrix-messenger/core';
 import {
     getScheduledMessages,
@@ -36,7 +36,7 @@ import SearchModal from './SearchModal';
 import PluginCatalogModal from './PluginCatalogModal';
 import PluginSurfaceHost from './PluginSurfaceHost';
 import { SearchResultItem } from '@matrix-messenger/core';
-import type { DraftContent, SendKeyBehavior, DraftAttachment, DraftAttachmentKind, VideoMessageMetadata } from '../types';
+import type { DraftContent, SendKeyBehavior, DraftAttachment, DraftAttachmentKind, VideoMessageMetadata, LocationContentPayload } from '../types';
 import SharedMediaPanel from './SharedMediaPanel';
 import type { RoomMediaSummary, SharedMediaCategory, RoomMediaItem } from '@matrix-messenger/core';
 // FIX: The `matrix-js-sdk` exports event names as enums. Import them to use with the event emitter.
@@ -153,6 +153,7 @@ interface ChatComposerSectionProps {
         onSendVideo: (file: Blob, metadata: VideoMessageMetadata) => Promise<void> | void;
         onSendSticker: (sticker: Sticker) => Promise<void> | void;
         onSendGif: (gif: Gif) => Promise<void> | void;
+        onSendLocation: (payload: LocationContentPayload) => Promise<void> | void;
         onOpenCreatePoll: () => void;
         onSchedule: (content: DraftContent) => void;
         isSending: boolean;
@@ -592,6 +593,7 @@ const ChatComposerSection: React.FC<ChatComposerSectionProps> = ({ composer }) =
         onSendVideo,
         onSendSticker,
         onSendGif,
+        onSendLocation,
         onOpenCreatePoll,
         onSchedule,
         isSending,
@@ -617,6 +619,7 @@ const ChatComposerSection: React.FC<ChatComposerSectionProps> = ({ composer }) =
             onSendVideo={onSendVideo}
             onSendSticker={onSendSticker}
             onSendGif={onSendGif}
+            onSendLocation={onSendLocation}
             onOpenCreatePoll={onOpenCreatePoll}
             onSchedule={onSchedule}
             isSending={isSending}
@@ -3146,6 +3149,15 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
         }
     };
 
+    const handleSendLocation = async (payload: LocationContentPayload) => {
+        if (!selectedRoomId) return;
+        try {
+            await sendLocationMessage(client, selectedRoomId, payload);
+        } catch (error) {
+            console.error('Failed to send location message:', error);
+        }
+    };
+
     const handleReaction = async (messageId: string, emoji: string, reaction?: Reaction) => {
         if (!selectedRoomId) return;
         if (reaction?.isOwn && reaction.ownEventId) {
@@ -3583,6 +3595,7 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
             onSendVideo: handleSendVideo,
             onSendSticker: handleSendSticker,
             onSendGif: handleSendGif,
+            onSendLocation: handleSendLocation,
             onOpenCreatePoll: () => setIsCreatePollOpen(true),
             onSchedule: handleOpenScheduleModal,
             isSending,
