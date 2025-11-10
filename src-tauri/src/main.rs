@@ -19,6 +19,7 @@ const STORE_FILE: &str = "secure_credentials.store";
 const ACCOUNTS_KEY: &str = "accounts";
 const BACKUP_STORE_FILE: &str = "secure_key_backups.store";
 const BACKUP_KEY: &str = "backups";
+const PASSKEYS_KEY: &str = "passkey_devices";
 const PBKDF2_ITERATIONS: u32 = 120_000;
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 12;
@@ -54,6 +55,22 @@ pub struct StoredAccount {
   #[serde(default)]
   #[serde(skip_serializing_if = "Option::is_none")]
   pub push_subscription: Option<StoredPushSubscription>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredPasskeyDevice {
+  credential_id: String,
+  user_id: String,
+  label: String,
+  added_at: u64,
+  #[serde(default)]
+  #[serde(skip_serializing_if = "Option::is_none")]
+  last_used_at: Option<u64>,
+  #[serde(default)]
+  #[serde(skip_serializing_if = "Option::is_none")]
+  transports: Option<Vec<String>>,
+  #[serde(default)]
+  device_type: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,6 +114,28 @@ async fn write_accounts_map(app: &AppHandle, map: &HashMap<String, Credentials>)
       .map_err(|e| e.to_string())?;
   let v = serde_json::to_value(map).map_err(|e| e.to_string())?;
   store.set(ACCOUNTS_KEY.to_string(), v);
+  store.save().map_err(|e| e.to_string())
+}
+
+async fn read_passkey_map(app: &AppHandle) -> Result<HashMap<String, Vec<StoredPasskeyDevice>>, String> {
+  let store = StoreBuilder::new(app, STORE_FILE)
+      .build()
+      .map_err(|e| e.to_string())?;
+  let value = store.get(PASSKEYS_KEY);
+  if let Some(v) = value {
+    serde_json::from_value::<HashMap<String, Vec<StoredPasskeyDevice>>>(v.clone())
+      .map_err(|e| format!("Corrupt store: {}", e))
+  } else {
+    Ok(HashMap::new())
+  }
+}
+
+async fn write_passkey_map(app: &AppHandle, map: &HashMap<String, Vec<StoredPasskeyDevice>>) -> Result<(), String> {
+  let store = StoreBuilder::new(app, STORE_FILE)
+      .build()
+      .map_err(|e| e.to_string())?;
+  let v = serde_json::to_value(map).map_err(|e| e.to_string())?;
+  store.set(PASSKEYS_KEY.to_string(), v);
   store.save().map_err(|e| e.to_string())
 }
 
@@ -704,6 +743,81 @@ async fn clear_credentials(app: AppHandle, key: Option<String>) -> Result<(), St
 }
 
 #[tauri::command]
+async fn save_passkey_device(app: AppHandle, account_key: String, device: StoredPasskeyDevice) -> Result<(), String> {
+  if account_key.trim().is_empty() { return Ok(()); }
+  let mut map = read_passkey_map(&app).await?;
+  let mut devices = map.remove(&account_key).unwrap_or_default();
+  let now = SystemTime::now()
+    .duration_since(UNIX_EPOCH)
+    .map_err(|e| e.to_string())?
+    .as_secs();
+  let mut updated = device;
+  if updated.label.trim().is_empty() {
+    let next_index = devices.len() + 1;
+    updated.label = format!("Passkey #{next_index}");
+  }
+  if updated.device_type.trim().is_empty() {
+    updated.device_type = "passkey".to_string();
+  }
+  if updated.added_at == 0 {
+    updated.added_at = now;
+  }
+  if updated.last_used_at.is_none() {
+    updated.last_used_at = Some(now);
+  }
+  devices.retain(|item| item.credential_id != updated.credential_id);
+  devices.push(updated);
+  map.insert(account_key, devices);
+  write_passkey_map(&app, &map).await
+}
+
+#[tauri::command]
+async fn list_passkey_devices(app: AppHandle, account_key: String) -> Result<Vec<StoredPasskeyDevice>, String> {
+  if account_key.trim().is_empty() {
+    return Ok(vec![]);
+  }
+  let map = read_passkey_map(&app).await?;
+  Ok(map.get(&account_key).cloned().unwrap_or_default())
+}
+
+#[tauri::command]
+async fn touch_passkey_device(app: AppHandle, account_key: String, credential_id: String) -> Result<(), String> {
+  if account_key.trim().is_empty() || credential_id.trim().is_empty() {
+    return Ok(());
+  }
+  let mut map = read_passkey_map(&app).await?;
+  if let Some(devices) = map.get_mut(&account_key) {
+    let now = SystemTime::now()
+      .duration_since(UNIX_EPOCH)
+      .map_err(|e| e.to_string())?
+      .as_secs();
+    for device in devices.iter_mut() {
+      if device.credential_id == credential_id {
+        device.last_used_at = Some(now);
+      }
+    }
+    write_passkey_map(&app, &map).await?;
+  }
+  Ok(())
+}
+
+#[tauri::command]
+async fn remove_passkey_device(app: AppHandle, account_key: String, credential_id: String) -> Result<(), String> {
+  if account_key.trim().is_empty() || credential_id.trim().is_empty() {
+    return Ok(());
+  }
+  let mut map = read_passkey_map(&app).await?;
+  if let Some(devices) = map.get_mut(&account_key) {
+    devices.retain(|device| device.credential_id != credential_id);
+    if devices.is_empty() {
+      map.remove(&account_key);
+    }
+    write_passkey_map(&app, &map).await?;
+  }
+  Ok(())
+}
+
+#[tauri::command]
 async fn secure_store_save_seed(app: AppHandle, label: String, payload_json: String, passphrase: String) -> Result<(), String> {
   let mut map = read_backups_map(&app).await?;
   let entry = encrypt_payload(&passphrase, &payload_json)?;
@@ -777,6 +891,10 @@ fn main() {
       save_credentials,
       load_credentials,
       clear_credentials,
+      save_passkey_device,
+      list_passkey_devices,
+      touch_passkey_device,
+      remove_passkey_device,
       secure_store_save_seed,
       secure_store_load_seed,
       upsert_index_records,
