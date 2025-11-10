@@ -17,3 +17,7 @@ export * from '../../../src/hooks/useChats';
 export * from '../../../src/hooks/useRoomTimeline';
 export * from '../../../src/services/matrixRuntime';
 export * from '../../../src/services/matrixService';
+export * from '../../../src/services/botBridge';
+export * from '../../../src/services/botBridgeSecretsStore';
+export * from '../../../src/services/botBridgeWebhook';
+export * from '../../../src/services/botBridgeSync';
