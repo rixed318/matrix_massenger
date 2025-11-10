@@ -10,6 +10,7 @@ export {
   type CommandHandler,
   type CommandHandlerResult,
   type ReplyContent,
+  type PluginUiContext,
 } from './plugin';
 export {
   type AccountMetadata,
@@ -25,6 +26,8 @@ export {
   type MatrixSendResult,
   type CommandInvocation,
   type CommandExecutionResult,
+  type UiRenderEventPayload,
+  type UiActionEventPayload,
 } from './types';
 export {
   createMemoryStorageAdapter,

@@ -99,6 +99,7 @@ const ThreadView: React.FC<ThreadViewProps> = ({ room, activeThread, onClose, cl
                 // Adding placeholder functions as this feature is not yet implemented for threads.
                 onSendSticker={() => { /* Not implemented for threads yet */ }}
                 onSendGif={() => { /* Not implemented for threads yet */ }}
+                onSendLocation={() => { /* Not implemented for threads yet */ }}
                 onOpenCreatePoll={() => { /* Not implemented for threads yet */}}
                 // FIX: Add missing 'onSchedule' prop to satisfy the MessageInputProps interface.
                 onSchedule={() => { /* Not implemented for threads yet */}}

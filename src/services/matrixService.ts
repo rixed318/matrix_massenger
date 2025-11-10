@@ -1,7 +1,8 @@
-import { MatrixClient, MatrixEvent, MatrixRoom, MatrixUser, Sticker, Gif, RoomCreationOptions, VideoMessageMetadata } from '../types';
+import { MatrixClient, MatrixEvent, MatrixRoom, MatrixUser, Sticker, Gif, RoomCreationOptions, VideoMessageMetadata, LocationContentPayload } from '../types';
 import type { SecureCloudProfile } from './secureCloudService';
 import { normaliseSecureCloudProfile } from './secureCloudService';
 import GroupCallCoordinator, { GroupCallParticipant as CoordinatorParticipant } from './webrtc/groupCallCoordinator';
+import { buildGeoUri, buildStaticMapUrl, buildExternalNavigationUrl, MAP_ZOOM_DEFAULT, STATIC_MAP_HEIGHT, STATIC_MAP_WIDTH, sanitizeZoom } from '../utils/location';
 import {
     GROUP_CALL_CONTROL_EVENT_TYPE,
     GROUP_CALL_PARTICIPANTS_EVENT_TYPE,
@@ -34,7 +35,13 @@ import {
     RoomEvent,
 } from 'matrix-js-sdk';
 import type { HierarchyRoom } from 'matrix-js-sdk';
-import { sendNotification } from './notificationService';
+import {
+    enqueueTranscriptionJob,
+    confirmTranscriptionJob,
+    cancelTranscriptionJob,
+    getTranscriptionRuntimeConfig,
+} from './transcriptionService';
+import type { TranscriptionSettings as ServiceTranscriptionSettings } from './transcriptionService';
 
 
 // ===== Offline Outbox Queue (IndexedDB/SQLite) =====
@@ -1590,6 +1597,11 @@ export const flushOutbox = async () => {
                 }
             }
             const sendRes = await _boundClient.sendEvent(item.roomId, item.type as any, baseContent);
+            try {
+                confirmTranscriptionJob(item.id, { eventId: sendRes.event_id, client: _boundClient, roomId: item.roomId, content: baseContent });
+            } catch (error) {
+                console.warn('Failed to schedule transcription for outbox item', error);
+            }
             await idbDelete(item.id);
             if (Array.isArray(workingItem.attachments)) {
                 for (const attachment of workingItem.attachments) {
@@ -1636,6 +1648,11 @@ export const enqueueOutbox = async (
 
 export const cancelOutboxItem = async (id: string) => {
     await idbDelete(id);
+    try {
+        cancelTranscriptionJob(id);
+    } catch (error) {
+        console.warn('Failed to cancel transcription job', error);
+    }
     _outboxEmitter.emit({ kind: 'cancelled', id });
     await updateServiceWorkerOutboxState();
 };
@@ -1952,6 +1969,10 @@ const GIF_FAVORITES_ACCOUNT_EVENT = 'com.econix.gif_favorites';
 
 let _translationSettingsCache: TranslationSettings | null = null;
 
+const TRANSCRIPTION_ACCOUNT_EVENT = 'com.econix.transcription.settings';
+const TRANSCRIPTION_LOCAL_KEY = 'econix.transcription.settings';
+let _transcriptionSettingsCache: ServiceTranscriptionSettings | null = null;
+
 /**
  * Read translation settings from Matrix account data or localStorage.
  * Account data has priority if present.
@@ -1997,6 +2018,87 @@ export async function setTranslationSettings(client: MatrixClient | null | undef
         }
     } catch (e) {
         console.warn('Failed to persist translation settings to account data', e);
+    }
+}
+
+const sanitizeTranscriptionSettings = (value: ServiceTranscriptionSettings | null | undefined): ServiceTranscriptionSettings | null => {
+    if (!value || typeof value !== 'object') return null;
+    const result: ServiceTranscriptionSettings = {};
+    if (typeof value.enabled === 'boolean') {
+        result.enabled = value.enabled;
+    }
+    if (typeof value.language === 'string' && value.language.trim().length) {
+        result.language = value.language.trim();
+    }
+    if (typeof value.maxDurationSec === 'number' && Number.isFinite(value.maxDurationSec)) {
+        result.maxDurationSec = Math.max(0, value.maxDurationSec);
+    }
+    return result;
+};
+
+const mergeTranscriptionSettings = (
+    defaults: ServiceTranscriptionSettings,
+    local: ServiceTranscriptionSettings | null,
+    remote: ServiceTranscriptionSettings | null,
+): ServiceTranscriptionSettings => {
+    const merged: ServiceTranscriptionSettings = { ...defaults };
+    const sources = [local, remote];
+    for (const source of sources) {
+        if (!source) continue;
+        if (typeof source.enabled === 'boolean') merged.enabled = source.enabled;
+        if (typeof source.language === 'string') merged.language = source.language;
+        if (typeof source.maxDurationSec === 'number') merged.maxDurationSec = source.maxDurationSec;
+    }
+    return merged;
+};
+
+export function getTranscriptionSettings(client?: MatrixClient | null): ServiceTranscriptionSettings {
+    try {
+        const defaults = (() => {
+            const runtime = getTranscriptionRuntimeConfig();
+            const base: ServiceTranscriptionSettings = { enabled: runtime.enabled };
+            if (runtime.defaultLanguage) base.language = runtime.defaultLanguage;
+            if (typeof runtime.maxDurationSec === 'number') base.maxDurationSec = runtime.maxDurationSec;
+            return base;
+        })();
+
+        const localRaw = (globalThis as any).localStorage?.getItem(TRANSCRIPTION_LOCAL_KEY);
+        const local = localRaw ? sanitizeTranscriptionSettings(JSON.parse(localRaw)) : null;
+        let remote: ServiceTranscriptionSettings | null = null;
+        if (client) {
+            const ev: any = (client as any).getAccountData?.(TRANSCRIPTION_ACCOUNT_EVENT as any);
+            const content = ev?.getContent?.();
+            if (content && typeof content === 'object') {
+                remote = sanitizeTranscriptionSettings({
+                    enabled: typeof content.enabled === 'boolean' ? content.enabled : undefined,
+                    language: typeof content.language === 'string' ? content.language : undefined,
+                    maxDurationSec: typeof content.maxDurationSec === 'number' ? content.maxDurationSec : undefined,
+                });
+            }
+        }
+        const merged = mergeTranscriptionSettings(defaults, local, remote);
+        _transcriptionSettingsCache = merged;
+        return merged;
+    } catch (error) {
+        console.warn('Failed to read transcription settings', error);
+        return _transcriptionSettingsCache || { enabled: false };
+    }
+}
+
+export async function setTranscriptionSettings(client: MatrixClient | null | undefined, settings: ServiceTranscriptionSettings): Promise<void> {
+    const sanitized = sanitizeTranscriptionSettings(settings) ?? {};
+    try {
+        (globalThis as any).localStorage?.setItem(TRANSCRIPTION_LOCAL_KEY, JSON.stringify(sanitized));
+    } catch (error) {
+        console.warn('Failed to persist transcription settings to localStorage', error);
+    }
+    _transcriptionSettingsCache = mergeTranscriptionSettings(getTranscriptionSettings(client), sanitized, null);
+    try {
+        if (client) {
+            await (client as any).setAccountData?.(TRANSCRIPTION_ACCOUNT_EVENT as any, sanitized as any);
+        }
+    } catch (error) {
+        console.warn('Failed to persist transcription settings to account data', error);
     }
 }
 
@@ -2625,6 +2727,109 @@ export interface LoginOptions {
     secureProfile?: SecureCloudProfile;
     totpCode?: string;
     totpSessionId?: string;
+    onPasskeyAssertion?: (details: PasskeyAssertionDetails) => void;
+}
+
+export interface RegisterOptions {
+    onPasskeyAttestation?: (details: PasskeyAttestationDetails) => void;
+    onPasskeyAssertion?: (details: PasskeyAssertionDetails) => void;
+}
+
+interface WebAuthnPublicKeyOptions {
+    publicKey?: PublicKeyCredentialRequestOptions | PublicKeyCredentialCreationOptions;
+    public_key?: PublicKeyCredentialRequestOptions | PublicKeyCredentialCreationOptions;
+}
+
+const isPasskeyStage = (stage: string | undefined): stage is 'm.login.webauthn' | 'm.login.passkey' =>
+    stage === 'm.login.webauthn' || stage === 'm.login.passkey';
+
+const toBase64Url = (buffer: ArrayBuffer | Uint8Array): string => {
+    const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+    let binary = '';
+    for (let i = 0; i < bytes.byteLength; i += 1) {
+        binary += String.fromCharCode(bytes[i]);
+    }
+    return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/u, '');
+};
+
+const fromBase64Url = (input: string): Uint8Array => {
+    const normalized = input.replace(/-/g, '+').replace(/_/g, '/');
+    const padded = normalized + '==='.slice((normalized.length + 3) % 4);
+    const binary = atob(padded);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) {
+        bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes;
+};
+
+const normaliseRequestOptions = (raw: WebAuthnPublicKeyOptions | undefined): PublicKeyCredentialRequestOptions => {
+    const source = raw?.publicKey ?? raw?.public_key ?? raw;
+    if (!source || typeof source !== 'object') {
+        throw new Error('Сервер не предоставил параметры passkey для входа.');
+    }
+    const cloner: typeof structuredClone = typeof structuredClone === 'function'
+        ? structuredClone
+        : ((value: any) => JSON.parse(JSON.stringify(value)));
+    const options = cloner(source) as PublicKeyCredentialRequestOptions;
+    if (typeof options.challenge === 'string') {
+        options.challenge = fromBase64Url(options.challenge);
+    }
+    if (Array.isArray(options.allowCredentials)) {
+        options.allowCredentials = options.allowCredentials.map((cred) => {
+            const next = { ...cred } as PublicKeyCredentialDescriptor;
+            if (typeof next.id === 'string') {
+                next.id = fromBase64Url(next.id).buffer;
+            }
+            return next;
+        });
+    }
+    return options;
+};
+
+const normaliseCreationOptions = (raw: WebAuthnPublicKeyOptions | undefined): PublicKeyCredentialCreationOptions => {
+    const source = raw?.publicKey ?? raw?.public_key ?? raw;
+    if (!source || typeof source !== 'object') {
+        throw new Error('Сервер не предоставил параметры passkey для регистрации.');
+    }
+    const cloner: typeof structuredClone = typeof structuredClone === 'function'
+        ? structuredClone
+        : ((value: any) => JSON.parse(JSON.stringify(value)));
+    const options = cloner(source) as PublicKeyCredentialCreationOptions;
+    if (typeof options.challenge === 'string') {
+        options.challenge = fromBase64Url(options.challenge);
+    }
+    if (options.user && typeof options.user.id === 'string') {
+        options.user = { ...options.user, id: fromBase64Url(options.user.id) };
+    }
+    if (Array.isArray(options.excludeCredentials)) {
+        options.excludeCredentials = options.excludeCredentials.map((cred) => {
+            const next = { ...cred } as PublicKeyCredentialDescriptor;
+            if (typeof next.id === 'string') {
+                next.id = fromBase64Url(next.id).buffer;
+            }
+            return next;
+        });
+    }
+    return options;
+};
+
+const requireWebAuthnAvailability = () => {
+    if (typeof navigator === 'undefined' || typeof navigator.credentials?.get !== 'function') {
+        throw new Error('В этой среде недоступна аппаратная проверка passkey.');
+    }
+};
+
+export interface PasskeyAssertionDetails {
+    credentialId: string;
+    stage: 'm.login.webauthn' | 'm.login.passkey';
+    transports?: AuthenticatorTransport[];
+}
+
+export interface PasskeyAttestationDetails {
+    credentialId: string;
+    stage: 'm.login.webauthn' | 'm.login.passkey';
+    transports?: AuthenticatorTransport[];
 }
 
 export class TotpRequiredError extends Error {
@@ -2672,31 +2877,25 @@ export const login = async (
     } as const;
 
     const trimmedTotp = typeof options.totpCode === 'string' ? options.totpCode.trim() : undefined;
-    let authPayload: { type: string; code: string; session?: string } | undefined = undefined;
     let totpAttempted = false;
     let sessionHint = options.totpSessionId ?? undefined;
+    let nextAuthPayload: Record<string, any> | undefined;
+    let passkeyAttempts = 0;
+    let pendingPasskeyDetails: PasskeyAssertionDetails | null = null;
 
     const performLogin = async () => {
         const payload: Record<string, any> = {
             identifier,
             password,
         };
-        if (authPayload) {
-            payload.auth = authPayload;
+        if (nextAuthPayload) {
+            payload.auth = nextAuthPayload;
+            nextAuthPayload = undefined;
         }
         return await client.login('m.login.password', payload);
     };
 
     while (true) {
-        if (trimmedTotp && !totpAttempted && !authPayload) {
-            authPayload = {
-                type: 'm.login.totp',
-                code: trimmedTotp,
-                ...(sessionHint ? { session: sessionHint } : {}),
-            };
-            totpAttempted = true;
-        }
-
         try {
             await performLogin();
             break;
@@ -2706,41 +2905,98 @@ export const login = async (
                 ? matrixError.data.flows
                 : [];
             const sessionId = matrixError?.data?.session ?? sessionHint;
-            const requiresTotp = flows.some((flow) => Array.isArray(flow?.stages) && flow.stages.includes('m.login.totp'));
+            const completed = new Set<string>(
+                Array.isArray(matrixError?.data?.completed) ? matrixError.data.completed.filter(Boolean) : [],
+            );
+            const requiresTotp =
+                flows.some((flow) => Array.isArray(flow?.stages) && flow.stages.includes('m.login.totp')) &&
+                !completed.has('m.login.totp');
+            const passkeyStage = flows
+                .flatMap((flow) => flow.stages ?? [])
+                .find((stage) => isPasskeyStage(stage) && !completed.has(stage));
+            sessionHint = sessionId ?? sessionHint;
 
             if (matrixError?.errcode === 'M_FORBIDDEN' && requiresTotp) {
-                sessionHint = sessionId ?? sessionHint;
-                if (trimmedTotp) {
-                    if (totpAttempted && authPayload) {
-                        throw new TotpRequiredError(
-                            matrixError?.data?.error || matrixError?.message || 'Неверный одноразовый код или код истёк.',
-                            {
-                                sessionId: sessionHint,
-                                flows,
-                                validationError: true,
-                                cause: error,
-                            },
-                        );
-                    }
-
-                    authPayload = {
-                        type: 'm.login.totp',
-                        code: trimmedTotp,
-                        ...(sessionHint ? { session: sessionHint } : {}),
-                    };
-                    totpAttempted = true;
-                    continue;
+                if (!trimmedTotp) {
+                    throw new TotpRequiredError(
+                        'Эта учётная запись защищена двухфакторной аутентификацией. Введите код из приложения TOTP.',
+                        {
+                            sessionId: sessionHint,
+                            flows,
+                            validationError: false,
+                            cause: error,
+                        },
+                    );
                 }
 
-                throw new TotpRequiredError(
-                    'Эта учётная запись защищена двухфакторной аутентификацией. Введите код из приложения TOTP.',
-                    {
-                        sessionId: sessionHint,
-                        flows,
-                        validationError: false,
-                        cause: error,
+                if (totpAttempted) {
+                    throw new TotpRequiredError(
+                        matrixError?.data?.error || matrixError?.message || 'Неверный одноразовый код или код истёк.',
+                        {
+                            sessionId: sessionHint,
+                            flows,
+                            validationError: true,
+                            cause: error,
+                        },
+                    );
+                }
+
+                nextAuthPayload = {
+                    type: 'm.login.totp',
+                    code: trimmedTotp,
+                    ...(sessionHint ? { session: sessionHint } : {}),
+                };
+                totpAttempted = true;
+                continue;
+            }
+
+            if (matrixError?.errcode === 'M_FORBIDDEN' && passkeyStage && isPasskeyStage(passkeyStage)) {
+                if (passkeyAttempts > 0 && matrixError?.data?.error) {
+                    throw new Error(matrixError.data.error);
+                }
+
+                requireWebAuthnAvailability();
+                const rawParams =
+                    typeof matrixError?.data?.params === 'object' && matrixError?.data?.params !== null
+                        ? (matrixError.data.params?.[passkeyStage] ?? matrixError.data.params)
+                        : undefined;
+                const publicKey = normaliseRequestOptions(rawParams);
+
+                let credential: PublicKeyCredential | null = null;
+                try {
+                    credential = (await navigator.credentials.get({ publicKey })) as PublicKeyCredential | null;
+                } catch (getError: any) {
+                    throw new Error(getError?.message || 'Проверка passkey отменена.');
+                }
+
+                if (!credential) {
+                    throw new Error('Проверка passkey отменена пользователем.');
+                }
+
+                const response = credential.response as AuthenticatorAssertionResponse;
+                nextAuthPayload = {
+                    type: passkeyStage,
+                    session: sessionHint,
+                    response: {
+                        id: credential.id,
+                        rawId: toBase64Url(credential.rawId),
+                        type: credential.type,
+                        response: {
+                            clientDataJSON: toBase64Url(response.clientDataJSON),
+                            authenticatorData: toBase64Url(response.authenticatorData),
+                            signature: toBase64Url(response.signature),
+                            userHandle: response.userHandle ? toBase64Url(response.userHandle) : undefined,
+                        },
+                        extensions: credential.getClientExtensionResults?.() ?? undefined,
                     },
-                );
+                };
+                pendingPasskeyDetails = {
+                    credentialId: toBase64Url(credential.rawId),
+                    stage: passkeyStage,
+                    transports: undefined,
+                };
+                passkeyAttempts += 1;
+                continue;
             }
 
             throw new Error(matrixError?.data?.error || matrixError?.message || 'Вход не выполнен.');
@@ -2749,14 +3005,30 @@ export const login = async (
 
     await bootstrapAuthenticatedClient(client, options.secureProfile);
 
+    if (pendingPasskeyDetails) {
+        try {
+            options.onPasskeyAssertion?.(pendingPasskeyDetails);
+        } catch (err) {
+            console.warn('Passkey assertion handler failed', err);
+        }
+    }
+
     return client;
 };
 
-export const register = async (homeserverUrl: string, username: string, password: string): Promise<MatrixClient> => {
+export const register = async (
+    homeserverUrl: string,
+    username: string,
+    password: string,
+    options: RegisterOptions = {},
+): Promise<MatrixClient> => {
     const client = await initClient(homeserverUrl);
     let sessionId: string | null = null;
     let hasAttemptedDummy = false;
     let registerResponse: Awaited<ReturnType<typeof client.register>> | null = null;
+    let nextAuthPayload: Record<string, any> | undefined;
+    let passkeyAttempts = 0;
+    let pendingPasskeyDetails: PasskeyAttestationDetails | null = null;
 
     while (true) {
         try {
@@ -2764,11 +3036,12 @@ export const register = async (homeserverUrl: string, username: string, password
                 username,
                 password,
                 sessionId,
-                sessionId ? { type: "m.login.dummy", session: sessionId } : { type: "m.login.dummy" },
+                nextAuthPayload ?? (sessionId ? { type: "m.login.dummy", session: sessionId } : { type: "m.login.dummy" }),
                 undefined,
                 undefined,
                 true,
             );
+            nextAuthPayload = undefined;
             break;
         } catch (error: any) {
             const matrixError = error ?? {};
@@ -2776,11 +3049,64 @@ export const register = async (homeserverUrl: string, username: string, password
                 ? matrixError.data.flows
                 : [];
             const stages = flows.flatMap((flow) => flow.stages ?? []);
+            const completed = new Set<string>(
+                Array.isArray(matrixError?.data?.completed) ? matrixError.data.completed.filter(Boolean) : [],
+            );
 
             if (!hasAttemptedDummy && matrixError?.data?.session && flows.length > 0) {
                 if (stages.every((stage) => stage === "m.login.dummy") && stages.includes("m.login.dummy")) {
                     sessionId = matrixError.data.session;
                     hasAttemptedDummy = true;
+                    continue;
+                }
+
+                const passkeyStage = stages.find((stage) => isPasskeyStage(stage) && !completed.has(stage));
+                if (matrixError?.errcode === 'M_FORBIDDEN' && passkeyStage && isPasskeyStage(passkeyStage)) {
+                    if (passkeyAttempts > 0 && matrixError?.data?.error) {
+                        throw new Error(matrixError.data.error);
+                    }
+
+                    requireWebAuthnAvailability();
+                    sessionId = matrixError?.data?.session ?? sessionId;
+                    const rawParams =
+                        typeof matrixError?.data?.params === 'object' && matrixError?.data?.params !== null
+                            ? (matrixError.data.params?.[passkeyStage] ?? matrixError.data.params)
+                            : undefined;
+                    const publicKey = normaliseCreationOptions(rawParams);
+
+                    let credential: PublicKeyCredential | null = null;
+                    try {
+                        credential = (await navigator.credentials.create({ publicKey })) as PublicKeyCredential | null;
+                    } catch (createError: any) {
+                        throw new Error(createError?.message || 'Регистрация passkey отменена.');
+                    }
+
+                    if (!credential) {
+                        throw new Error('Регистрация passkey отменена пользователем.');
+                    }
+
+                    const response = credential.response as AuthenticatorAttestationResponse;
+                    const transports = typeof response.getTransports === 'function' ? response.getTransports() : undefined;
+                    nextAuthPayload = {
+                        type: passkeyStage,
+                        session: matrixError?.data?.session,
+                        response: {
+                            id: credential.id,
+                            rawId: toBase64Url(credential.rawId),
+                            type: credential.type,
+                            response: {
+                                clientDataJSON: toBase64Url(response.clientDataJSON),
+                                attestationObject: toBase64Url(response.attestationObject),
+                            },
+                            transports,
+                        },
+                    };
+                    pendingPasskeyDetails = {
+                        credentialId: toBase64Url(credential.rawId),
+                        stage: passkeyStage,
+                        transports: transports ?? undefined,
+                    };
+                    passkeyAttempts += 1;
                     continue;
                 }
 
@@ -2827,7 +3153,19 @@ export const register = async (homeserverUrl: string, username: string, password
     }
 
     const userId = registerResponse?.user_id || username;
-    return await login(homeserverUrl, userId, password);
+    if (pendingPasskeyDetails) {
+        try {
+            options.onPasskeyAttestation?.(pendingPasskeyDetails);
+        } catch (err) {
+            console.warn('Passkey attestation handler failed', err);
+        }
+    }
+    const followupLoginOptions = options.onPasskeyAssertion
+        ? { onPasskeyAssertion: options.onPasskeyAssertion }
+        : undefined;
+    return followupLoginOptions
+        ? await login(homeserverUrl, userId, password, followupLoginOptions)
+        : await login(homeserverUrl, userId, password);
 };
 
 export const loginWithToken = async (homeserverUrl: string, loginToken: string): Promise<MatrixClient> => {
@@ -4019,12 +4357,16 @@ const applySelfDestructContent = async (client: MatrixClient, roomId: string, co
 };
 
 export const sendAudioMessage = async (client: MatrixClient, roomId: string, file: Blob, duration: number): Promise<{ event_id: string }> => {
+    const durationMs = Math.round(duration * 1000);
+    const transcriptionSettings = getTranscriptionSettings(client);
+    const runtimeConfig = getTranscriptionRuntimeConfig();
+    const shouldAttemptTranscription = (transcriptionSettings.enabled ?? runtimeConfig.enabled) && Boolean(runtimeConfig.endpoint);
     const content = {
         body: "Voice Message",
         info: {
             mimetype: file.type,
             size: file.size,
-            duration: Math.round(duration * 1000), // duration in milliseconds
+            duration: durationMs,
         },
         msgtype: MsgType.Audio,
         url: undefined as unknown as string,
@@ -4035,7 +4377,21 @@ export const sendAudioMessage = async (client: MatrixClient, roomId: string, fil
             name: "voice-message.ogg",
             type: file.type,
         });
-        return client.sendEvent(roomId, EventType.RoomMessage, { ...content, url: mxcUrl } as any);
+        const result = await client.sendEvent(roomId, EventType.RoomMessage, { ...content, url: mxcUrl } as any);
+        if (shouldAttemptTranscription && result?.event_id) {
+            enqueueTranscriptionJob({
+                client,
+                roomId,
+                eventId: result.event_id,
+                msgType: MsgType.Audio,
+                mimeType: file.type,
+                durationMs,
+                file,
+                mxcUrl,
+                settings: transcriptionSettings,
+            });
+        }
+        return result;
     };
 
     const queueOutbox = async () => {
@@ -4046,6 +4402,17 @@ export const sendAudioMessage = async (client: MatrixClient, roomId: string, fil
         });
         const localId = await enqueueOutbox(roomId, EventType.RoomMessage, content, { attachments: [attachment] });
         clearNextMessageTTL(roomId);
+        if (shouldAttemptTranscription) {
+            enqueueTranscriptionJob({
+                client,
+                roomId,
+                localId,
+                msgType: MsgType.Audio,
+                mimeType: file.type,
+                durationMs,
+                settings: transcriptionSettings,
+            });
+        }
         return { event_id: localId };
     };
 
@@ -4071,12 +4438,16 @@ export const sendVideoMessage = async (
     file: Blob,
     metadata: VideoMessageMetadata,
 ): Promise<{ event_id: string }> => {
+    const durationMs = Math.round(metadata.durationMs);
+    const transcriptionSettings = getTranscriptionSettings(client);
+    const runtimeConfig = getTranscriptionRuntimeConfig();
+    const shouldAttemptTranscription = (transcriptionSettings.enabled ?? runtimeConfig.enabled) && Boolean(runtimeConfig.endpoint);
     const content: any = {
         body: 'Video message',
         info: {
             mimetype: metadata.mimeType,
             size: file.size,
-            duration: Math.round(metadata.durationMs),
+            duration: durationMs,
             w: metadata.width,
             h: metadata.height,
             thumbnail_url: undefined as unknown as string,
@@ -4118,7 +4489,21 @@ export const sendVideoMessage = async (
         if (thumbMxc) {
             payload.info = { ...payload.info, thumbnail_url: thumbMxc };
         }
-        return client.sendEvent(roomId, EventType.RoomMessage, payload as any);
+        const result = await client.sendEvent(roomId, EventType.RoomMessage, payload as any);
+        if (shouldAttemptTranscription && result?.event_id) {
+            enqueueTranscriptionJob({
+                client,
+                roomId,
+                eventId: result.event_id,
+                msgType: MsgType.Video,
+                mimeType: metadata.mimeType,
+                durationMs,
+                file,
+                mxcUrl: videoMxc,
+                settings: transcriptionSettings,
+            });
+        }
+        return result;
     };
 
     const queueOutbox = async () => {
@@ -4136,6 +4521,17 @@ export const sendVideoMessage = async (
         });
         const localId = await enqueueOutbox(roomId, EventType.RoomMessage, content, { attachments: [videoAttachment, thumbAttachment] });
         clearNextMessageTTL(roomId);
+        if (shouldAttemptTranscription) {
+            enqueueTranscriptionJob({
+                client,
+                roomId,
+                localId,
+                msgType: MsgType.Video,
+                mimeType: metadata.mimeType,
+                durationMs,
+                settings: transcriptionSettings,
+            });
+        }
         return { event_id: localId };
     };
 
@@ -4190,6 +4586,72 @@ export const sendFileMessage = async (client: MatrixClient, roomId: string, file
 
     try {
         return await sendDirect();
+    } catch (error) {
+        if (shouldQueueFromError(error)) {
+            return queueOutbox();
+        }
+        throw error;
+    }
+};
+
+export const sendLocationMessage = async (
+    client: MatrixClient,
+    roomId: string,
+    payload: LocationContentPayload,
+): Promise<{ event_id: string }> => {
+    if (!Number.isFinite(payload.latitude) || !Number.isFinite(payload.longitude)) {
+        throw new Error('Invalid coordinates for location message');
+    }
+
+    const latitude = payload.latitude;
+    const longitude = payload.longitude;
+    const zoom = sanitizeZoom(payload.zoom ?? MAP_ZOOM_DEFAULT);
+    const geoUri = buildGeoUri(latitude, longitude, payload.accuracy);
+    const description = (payload.description ?? '').trim() || `📍 ${latitude.toFixed(5)}, ${longitude.toFixed(5)}`;
+    const thumbnailUrl = buildStaticMapUrl(latitude, longitude, zoom, STATIC_MAP_WIDTH, STATIC_MAP_HEIGHT);
+    const externalUrl = buildExternalNavigationUrl(latitude, longitude, zoom);
+
+    const content: Record<string, any> = {
+        body: description,
+        msgtype: MsgType.Location,
+        geo_uri: geoUri,
+        'm.location': {
+            uri: geoUri,
+            description,
+        },
+        info: {
+            thumbnail_url: thumbnailUrl,
+            thumbnail_info: {
+                mimetype: 'image/png',
+                w: STATIC_MAP_WIDTH,
+                h: STATIC_MAP_HEIGHT,
+            },
+        },
+        external_url: externalUrl,
+        'com.matrix_messenger.map_zoom': zoom,
+    };
+
+    if (typeof payload.accuracy === 'number' && Number.isFinite(payload.accuracy) && payload.accuracy > 0) {
+        content['m.location'].accuracy = Math.round(payload.accuracy);
+    }
+
+    await applySelfDestructContent(client, roomId, content);
+
+    const sendDirect = async () => client.sendEvent(roomId, EventType.RoomMessage, content as any);
+    const queueOutbox = async () => {
+        const localId = await enqueueOutbox(roomId, EventType.RoomMessage, content);
+        clearNextMessageTTL(roomId);
+        return { event_id: localId };
+    };
+
+    if (isOffline()) {
+        return queueOutbox();
+    }
+
+    try {
+        const result = await sendDirect();
+        clearNextMessageTTL(roomId);
+        return result;
     } catch (error) {
         if (shouldQueueFromError(error)) {
             return queueOutbox();

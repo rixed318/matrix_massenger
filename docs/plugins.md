@@ -1,72 +1,76 @@
-# Plugin catalog and manifests
+# Плагины Matrix Messenger
 
-Matrix Messenger ships with a built-in plugin host powered by `@matrix-messenger/sdk`. The runtime bridges the SDK inside `src/services/pluginHost.ts`, registers Matrix clients for every logged-in account, and exposes a `window.matrixMessenger.registerPlugin` helper for advanced integrations.【F:src/services/pluginHost.ts†L1-L255】
+Этот документ описывает расширенную модель плагинов Matrix Messenger, включая UI-поверхности и новые события.
 
-## Authoring a plugin module
+## Manifest
 
-Create your plugin as an ES module that exports a `PluginDefinition`. The simplest approach is to reuse the SDK helper `definePlugin` and respond to Matrix events. Example modules live under `examples/` and can be bundled with any toolchain that emits modern JavaScript.【F:packages/sdk/src/plugin.ts†L1-L123】【F:plugins/echo-bot.js†L1-L22】
+Пример манифеста:
 
-```js
-import { definePlugin } from '@matrix-messenger/sdk';
-
-export default definePlugin({
-  id: 'demo.echo',
-  name: 'Echo bot',
-  async setup(ctx) {
-    ctx.events.on('matrix.message', async payload => {
-      if (payload.content?.body?.startsWith('!echo ')) {
-        await ctx.actions.sendTextMessage({
-          accountId: payload.account.id,
-          roomId: payload.roomId,
-          body: payload.content.body.slice('!echo '.length),
-        });
-      }
-    });
-  },
-});
-```
-
-## Manifest format
-
-The catalog reads manifests from `plugins/registry.json`. Each entry describes how the UI should present a plugin and which permissions it requires.【F:plugins/registry.json†L1-L11】
-
-```jsonc
+```json
 {
   "id": "demo.echo",
   "name": "Echo bot",
-  "version": "1.0.0",
-  "description": "Отвечает на команды !echo в комнатах Matrix.",
   "entry": "./echo-bot.js",
-  "permissions": ["sendTextMessage"],
-  "requiredEvents": ["matrix.message"]
+  "version": "1.1.0",
+  "permissions": ["sendTextMessage", "ui.panel"],
+  "requiredEvents": ["matrix.message", "ui.action"],
+  "surfaces": [
+    {
+      "id": "echo-control",
+      "location": "chat.panel",
+      "entry": "./echo-panel.html",
+      "label": "Echo Panel",
+      "description": "Мини-приложение для отправки тестовых сообщений",
+      "csp": "default-src 'self'; script-src 'self'; frame-ancestors 'self'"
+    }
+  ]
 }
 ```
 
-When the catalog loads, the host resolves the `entry` against the registry URL, validates `permissions` and `requiredEvents`, and caches the manifest together with user preferences. Unknown permission strings or unsupported events trigger an error and prevent installation.【F:src/services/pluginHost.ts†L18-L235】
+### Новые поля
 
-### Supported permissions
+- `capabilities`: произвольные маркеры возможностей плагина.
+- `surfaces`: описание UI-поверхностей (iframe/mini-app).
+  - `location` может быть `chat.panel` или `chat.composer`.
+  - `csp` позволяет явно задать ожидаемую Content-Security-Policy, если сервер не возвращает заголовок.
 
-| Permission | Description |
-| --- | --- |
-| `sendTextMessage` | Allows the plugin to call `ctx.actions.sendTextMessage`. |
-| `sendEvent` | Grants access to `ctx.actions.sendEvent` for arbitrary Matrix events. |
-| `redactEvent` | Enables `ctx.actions.redactEvent` for moderation scenarios. |
-| `storage` | Requests access to the plugin-scoped persistent storage adapter. |
-| `scheduler` | Permits background timers (`ctx.scheduler.setTimeout/setInterval`). |
+### Разрешения
 
-Valid event names include `matrix.client-ready`, `matrix.client-updated`, `matrix.client-stopped`, `matrix.room-event`, `matrix.message`, and `command.invoked`—matching the dispatcher built into the SDK.【F:packages/sdk/src/types.ts†L33-L86】【F:src/services/pluginHost.ts†L18-L112】
+Добавлены новые разрешения:
 
-## Publishing to the catalog
+- `ui.panel` — плагин может встраивать интерфейс в приложение.
+- `background` — разрешение на фоновую работу (в планах, пока не используется).
 
-1. Add your bundled module (for example `plugins/my-plugin.js`) to the repository or an accessible URL.
-2. Append a new manifest object to `plugins/registry.json` with the metadata described above.
-3. Submit the change together with documentation updates so reviewers understand the requested permissions.
-4. Ensure the module exports a `PluginDefinition` whose `id` matches the manifest. Mismatches are logged and can confuse users during updates.【F:src/services/pluginHost.ts†L90-L164】
+Каталог плагинов отображает расшифровку разрешений и список поверхностей.
 
-## Runtime behaviour
+## UI API
 
-- The catalog modal (opened from the **«Плагины»** button in the sidebar) lists registry entries, warns about requested permissions, and prompts the user before installation.【F:src/components/RoomList.tsx†L1-L190】【F:src/components/PluginCatalogModal.tsx†L1-L164】
-- Successful installations are persisted under the `matrix-messenger.plugins.preferences` key. At boot the app calls `bootstrapStoredPlugins()` to re-register enabled plugins automatically.【F:src/services/pluginHost.ts†L37-L235】【F:src/App.tsx†L1-L63】
-- The settings panel (**Настройки → Плагины**) enumerates installed plugins, shows required events/permissions, and exposes controls to enable, disable, or remove them.【F:src/components/Settings/PluginsPanel.tsx†L1-L169】【F:src/components/SettingsModal.tsx†L1-L360】
+В песочнице доступен `ctx.ui.render(surfaceId, payload)`. Плагин может подписаться на события:
 
-By combining manifests with the existing SDK you can ship reusable features while giving users explicit control over the access granted to each plugin.
+- `ui.render` — вызывается хостом, когда поверхность готова к отображению.
+- `ui.action` — пользовательское действие в мини-приложении.
+
+Мини-приложение общается с хостом через `window.postMessage`:
+
+```js
+window.parent.postMessage({ type: 'ui.ready', surfaceId: 'echo-control' }, '*');
+window.parent.postMessage({ type: 'ui.action', surfaceId: 'echo-control', action: 'send.echo', payload: { text: 'hello' } }, '*');
+```
+
+Ответ от плагина приходит через `ui.render`:
+
+```js
+window.addEventListener('message', event => {
+  if (event.data?.type === 'ui.render') {
+    updateUI(event.data.payload);
+  }
+});
+```
+
+## Content-Security-Policy
+
+Перед загрузкой iframe хост выполняет HEAD-запрос к `entry` и проверяет директиву `frame-ancestors`. Если заголовок недоступен, используется значение из поля `csp`. При нарушении политика блокирует поверхность.
+
+## Пример mini-app
+
+В каталоге `plugins/echo-panel.html` содержится пример мини-приложения, которое отправляет действия `send.echo` и отображает контекст комнаты. Плагин `plugins/echo-bot.js` обрабатывает событие `ui.action` и отвечает через `ctx.ui.render`.

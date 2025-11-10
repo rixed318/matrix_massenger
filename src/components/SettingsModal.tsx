@@ -1,6 +1,13 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { MatrixClient } from '@matrix-messenger/core';
-import { mxcToHttp, getTranslationSettings, setTranslationSettings } from '@matrix-messenger/core';
+import {
+    mxcToHttp,
+    getTranslationSettings,
+    setTranslationSettings,
+    getTranscriptionSettings,
+    setTranscriptionSettings,
+    getTranscriptionRuntimeConfig,
+} from '@matrix-messenger/core';
 import Avatar from './Avatar';
 import SecuritySettings from './SecuritySettings';
 import PluginsPanel from './Settings/PluginsPanel';
@@ -51,6 +58,18 @@ const BACKGROUNDS = [
     'https://www.transparenttextures.com/patterns/brushed-alum.png'
 ];
 
+const TRANSCRIPTION_LANG_OPTIONS = [
+    { value: '', label: 'Использовать по умолчанию' },
+    { value: 'auto', label: 'Определять автоматически' },
+    { value: 'ru', label: 'Русский' },
+    { value: 'en', label: 'English' },
+    { value: 'es', label: 'Español' },
+    { value: 'de', label: 'Deutsch' },
+    { value: 'fr', label: 'Français' },
+    { value: 'uk', label: 'Українська' },
+    { value: 'it', label: 'Italiano' },
+];
+
 
 const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, onSave, client, notificationsEnabled, onSetNotificationsEnabled, chatBackground, onSetChatBackground, onResetChatBackground, sendKeyBehavior, onSetSendKeyBehavior, isPresenceHidden, onSetPresenceHidden, presenceRestricted, animatedReactionsEnabled, onSetAnimatedReactionsEnabled }) => {
     const user = client.getUser(client.getUserId());
@@ -60,6 +79,13 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, onSave, 
     const [currentTheme, setCurrentTheme] = useState(document.documentElement.className || '');
     const [translationUrl, setTranslationUrl] = useState<string>('');
     const [translationApiKey, setTranslationApiKey] = useState<string>('');
+    const runtimeTranscription = getTranscriptionRuntimeConfig();
+    const transcriptionConfigured = Boolean(runtimeTranscription.endpoint);
+    const [transcriptionEnabled, setTranscriptionEnabled] = useState<boolean>(runtimeTranscription.enabled);
+    const [transcriptionLanguage, setTranscriptionLanguage] = useState<string>(runtimeTranscription.defaultLanguage ?? '');
+    const [transcriptionMaxDuration, setTranscriptionMaxDuration] = useState<string>(
+        typeof runtimeTranscription.maxDurationSec === 'number' ? String(runtimeTranscription.maxDurationSec) : ''
+    );
     const [isSecurityOpen, setIsSecurityOpen] = useState(false);
     const fileInputRef = useRef<HTMLInputElement>(null);
     const bgFileInputRef = useRef<HTMLInputElement>(null);
@@ -93,6 +119,37 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, onSave, 
         }, 400);
         return () => clearTimeout(t);
     }, [translationUrl, translationApiKey, client]);
+
+    useEffect(() => {
+        if (!isOpen) return;
+        try {
+            const settings = getTranscriptionSettings(client);
+            setTranscriptionEnabled(Boolean(settings?.enabled));
+            setTranscriptionLanguage(settings?.language ?? '');
+            setTranscriptionMaxDuration(
+                typeof settings?.maxDurationSec === 'number' && Number.isFinite(settings.maxDurationSec)
+                    ? String(settings.maxDurationSec)
+                    : ''
+            );
+        } catch (_) {
+            /* noop */
+        }
+    }, [isOpen, client]);
+
+    useEffect(() => {
+        if (!isOpen) return;
+        const handle = setTimeout(() => {
+            const maxDurationValue = transcriptionMaxDuration.trim();
+            const parsed = maxDurationValue.length ? Number(maxDurationValue) : undefined;
+            const safeDuration = typeof parsed === 'number' && Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+            void setTranscriptionSettings(client, {
+                enabled: transcriptionEnabled,
+                language: transcriptionLanguage || undefined,
+                maxDurationSec: safeDuration,
+            });
+        }, 400);
+        return () => clearTimeout(handle);
+    }, [transcriptionEnabled, transcriptionLanguage, transcriptionMaxDuration, client, isOpen]);
 
     useEffect(() => {
         if (!isOpen) {
@@ -302,39 +359,102 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, onSave, 
                         </button>
                     </div>
 
-<div className="pt-6 border-t border-border-primary">
-    <h3 className="text-lg font-semibold text-text-primary mb-3">Перевод сообщений</h3>
-    <div className="space-y-4">
-        <div>
-            <label htmlFor="translationUrl" className="block text-sm font-medium text-text-secondary mb-1">
-                Базовый URL
-            </label>
-            <input
-                type="text"
-                id="translationUrl"
-                value={translationUrl}
-                onChange={(e) => setTranslationUrl(e.target.value)}
-                className="appearance-none block w-full px-3 py-2 border border-border-primary bg-bg-secondary text-text-primary placeholder-text-secondary rounded-md focus:outline-none focus:ring-ring-focus focus:border-ring-focus sm:text-sm"
-                placeholder="https://example.com/api/translate"
-            />
-            <p className="text-xs text-text-secondary mt-1">Если пусто, перевод отключен.</p>
-        </div>
-        <div>
-            <label htmlFor="translationApiKey" className="block text-sm font-medium text-text-secondary mb-1">
-                API‑ключ
-            </label>
-            <input
-                type="text"
-                id="translationApiKey"
-                value={translationApiKey}
-                onChange={(e) => setTranslationApiKey(e.target.value)}
-                className="appearance-none block w-full px-3 py-2 border border-border-primary bg-bg-secondary text-text-primary placeholder-text-secondary rounded-md focus:outline-none focus:ring-ring-focus focus:border-ring-focus sm:text-sm"
-                placeholder="опционально"
-            />
-            <p className="text-xs text-text-secondary mt-1">Синхронизируется с локальным хранилищем и Matrix Account Data.</p>
-        </div>
-    </div>
-</div>
+                    <div className="pt-6 border-t border-border-primary">
+                        <h3 className="text-lg font-semibold text-text-primary mb-3">Транскрипция голосовых</h3>
+                        <div className="space-y-4">
+                            <div className="flex items-center justify-between gap-4">
+                                <div>
+                                    <p className="text-sm font-medium text-text-primary">Автоматическая расшифровка аудио и видео</p>
+                                    <p className="text-xs text-text-secondary">
+                                        {transcriptionConfigured
+                                            ? `Провайдер: ${runtimeTranscription.provider === 'cloud' ? 'облачный сервис' : 'локальный Whisper.cpp'}`
+                                            : 'Укажите endpoint в .env для активации сервиса.'}
+                                    </p>
+                                </div>
+                                <label className="relative inline-flex items-center cursor-pointer">
+                                    <input
+                                        type="checkbox"
+                                        className="sr-only peer"
+                                        checked={transcriptionEnabled}
+                                        onChange={(event) => setTranscriptionEnabled(event.target.checked)}
+                                        disabled={!transcriptionConfigured}
+                                    />
+                                    <div className={`w-11 h-6 rounded-full transition-colors ${
+                                        transcriptionEnabled && transcriptionConfigured ? 'bg-accent' : 'bg-bg-tertiary'
+                                    }`}></div>
+                                    <div className={`absolute top-1 left-1 w-4 h-4 rounded-full bg-white transition-transform ${
+                                        transcriptionEnabled && transcriptionConfigured ? 'translate-x-5' : ''
+                                    }`}></div>
+                                </label>
+                            </div>
+                            <div>
+                                <label htmlFor="transcriptionLanguage" className="block text-sm font-medium text-text-secondary mb-1">
+                                    Язык распознавания
+                                </label>
+                                <select
+                                    id="transcriptionLanguage"
+                                    value={transcriptionLanguage}
+                                    onChange={(event) => setTranscriptionLanguage(event.target.value)}
+                                    disabled={!transcriptionEnabled}
+                                    className="block w-full px-3 py-2 border border-border-primary bg-bg-secondary text-text-primary rounded-md focus:outline-none focus:ring-ring-focus focus:border-ring-focus sm:text-sm disabled:opacity-60"
+                                >
+                                    {TRANSCRIPTION_LANG_OPTIONS.map(option => (
+                                        <option key={option.value || 'default'} value={option.value}>{option.label}</option>
+                                    ))}
+                                </select>
+                            </div>
+                            <div>
+                                <label htmlFor="transcriptionMaxDuration" className="block text-sm font-medium text-text-secondary mb-1">
+                                    Максимальная длительность, секунд
+                                </label>
+                                <input
+                                    type="number"
+                                    id="transcriptionMaxDuration"
+                                    min={0}
+                                    value={transcriptionMaxDuration}
+                                    onChange={(event) => setTranscriptionMaxDuration(event.target.value)}
+                                    disabled={!transcriptionEnabled}
+                                    className="appearance-none block w-full px-3 py-2 border border-border-primary bg-bg-secondary text-text-primary placeholder-text-secondary rounded-md focus:outline-none focus:ring-ring-focus focus:border-ring-focus sm:text-sm disabled:opacity-60"
+                                    placeholder="без ограничений"
+                                />
+                                <p className="text-xs text-text-secondary mt-1">Оставьте пустым, чтобы не ограничивать продолжительность записи.</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div className="pt-6 border-t border-border-primary">
+                        <h3 className="text-lg font-semibold text-text-primary mb-3">Перевод сообщений</h3>
+                        <div className="space-y-4">
+                            <div>
+                                <label htmlFor="translationUrl" className="block text-sm font-medium text-text-secondary mb-1">
+                                    Базовый URL
+                                </label>
+                                <input
+                                    type="text"
+                                    id="translationUrl"
+                                    value={translationUrl}
+                                    onChange={(e) => setTranslationUrl(e.target.value)}
+                                    className="appearance-none block w-full px-3 py-2 border border-border-primary bg-bg-secondary text-text-primary placeholder-text-secondary rounded-md focus:outline-none focus:ring-ring-focus focus:border-ring-focus sm:text-sm"
+                                    placeholder="https://example.com/api/translate"
+                                />
+                                <p className="text-xs text-text-secondary mt-1">Если пусто, перевод отключен.</p>
+                            </div>
+                            <div>
+                                <label htmlFor="translationApiKey" className="block text-sm font-medium text-text-secondary mb-1">
+                                    API‑ключ
+                                </label>
+                                <input
+                                    type="text"
+                                    id="translationApiKey"
+                                    value={translationApiKey}
+                                    onChange={(e) => setTranslationApiKey(e.target.value)}
+                                    className="appearance-none block w-full px-3 py-2 border border-border-primary bg-bg-secondary text-text-primary placeholder-text-secondary rounded-md focus:outline-none focus:ring-ring-focus focus:border-ring-focus sm:text-sm"
+                                    placeholder="опционально"
+                                />
+                                <p className="text-xs text-text-secondary mt-1">Синхронизируется с локальным хранилищем и Matrix Account Data.</p>
+                            </div>
+                        </div>
+                    </div>
 
                     <div className="pt-6 border-t border-border-primary">
                         <PluginsPanel />

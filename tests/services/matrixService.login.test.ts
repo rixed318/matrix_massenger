@@ -37,6 +37,7 @@ describe('matrixService.login (interactive auth)', () => {
   let initCryptoSpy: ReturnType<typeof vi.spyOn>;
   let bindOutboxSpy: ReturnType<typeof vi.spyOn>;
   let secureProfileSpy: ReturnType<typeof vi.spyOn>;
+  const originalNavigator = (global as any).navigator;
 
   beforeEach(() => {
     fakeClient = createFakeClient();
@@ -44,10 +45,17 @@ describe('matrixService.login (interactive auth)', () => {
     initCryptoSpy = vi.spyOn(matrixService, 'initCryptoBackend').mockResolvedValue('none' as any);
     bindOutboxSpy = vi.spyOn(matrixService, 'bindOutboxToClient').mockImplementation(() => undefined);
     secureProfileSpy = vi.spyOn(matrixService, 'setSecureCloudProfileForClient').mockImplementation(() => undefined);
+    (global as any).navigator = {
+      credentials: {
+        get: vi.fn(),
+        create: vi.fn(),
+      },
+    } as any;
   });
 
   afterEach(() => {
     vi.restoreAllMocks();
+    (global as any).navigator = originalNavigator;
   });
 
   it('throws TotpRequiredError when homeserver demands m.login.totp', async () => {
@@ -123,6 +131,85 @@ describe('matrixService.login (interactive auth)', () => {
     expect(fakeClient.login).toHaveBeenCalledTimes(2);
     const secondAttemptPayload = fakeClient.login.mock.calls[1]?.[1];
     expect(secondAttemptPayload?.auth).toMatchObject({ type: 'm.login.totp', code: '654321', session: 'sess-1' });
+    expect(initCryptoSpy).not.toHaveBeenCalled();
+    expect(bindOutboxSpy).not.toHaveBeenCalled();
+  });
+
+  it('performs WebAuthn challenge when homeserver requires m.login.webauthn', async () => {
+    const rawId = Uint8Array.from([1, 2, 3]).buffer;
+    const clientData = Uint8Array.from([4, 5]).buffer;
+    const authenticatorData = Uint8Array.from([6, 7]).buffer;
+    const signature = Uint8Array.from([8, 9]).buffer;
+    const credentialsGet = vi.mocked((navigator as any).credentials.get);
+    credentialsGet.mockResolvedValue({
+      id: 'cred-1',
+      rawId,
+      type: 'public-key',
+      response: {
+        clientDataJSON: clientData,
+        authenticatorData,
+        signature,
+        userHandle: null,
+      },
+      getClientExtensionResults: vi.fn(() => ({})),
+    } as any);
+
+    fakeClient.login
+      .mockRejectedValueOnce({
+        errcode: 'M_FORBIDDEN',
+        data: {
+          flows: [{ stages: ['m.login.password', 'm.login.webauthn'] }],
+          session: 'sess-pass',
+          params: {
+            'm.login.webauthn': {
+              public_key: {
+                challenge: 'AQID',
+                rpId: 'example.org',
+                allowCredentials: [],
+              },
+            },
+          },
+        },
+      })
+      .mockResolvedValueOnce({ user_id: '@alice:hs', access_token: 'token' });
+
+    const client = await login('https://hs', 'alice', 'secret');
+
+    expect(client).toBe(fakeClient);
+    expect(credentialsGet).toHaveBeenCalledTimes(1);
+    expect(fakeClient.login).toHaveBeenCalledTimes(2);
+    const payload = fakeClient.login.mock.calls[1]?.[1];
+    expect(payload?.auth?.type).toBe('m.login.webauthn');
+    expect(payload?.auth?.session).toBe('sess-pass');
+    expect(payload?.auth?.response?.rawId).toBe('AQID');
+    expect(payload?.auth?.response?.response?.clientDataJSON).toBe('BAU');
+    expect(payload?.auth?.response?.response?.authenticatorData).toBe('Bgc');
+    expect(payload?.auth?.response?.response?.signature).toBe('CAk');
+    expect(initCryptoSpy).toHaveBeenCalledWith(fakeClient);
+    expect(bindOutboxSpy).toHaveBeenCalledWith(fakeClient);
+  });
+
+  it('propagates WebAuthn errors when user cancels passkey prompt', async () => {
+    vi.mocked((navigator as any).credentials.get).mockRejectedValueOnce(new Error('User dismissed'));
+
+    fakeClient.login.mockRejectedValueOnce({
+      errcode: 'M_FORBIDDEN',
+      data: {
+        flows: [{ stages: ['m.login.password', 'm.login.passkey'] }],
+        session: 'sess-pass',
+        params: {
+          'm.login.passkey': {
+            public_key: {
+              challenge: 'AQID',
+              rpId: 'example.org',
+              allowCredentials: [],
+            },
+          },
+        },
+      },
+    });
+
+    await expect(login('https://hs', 'alice', 'secret')).rejects.toThrow('User dismissed');
     expect(initCryptoSpy).not.toHaveBeenCalled();
     expect(bindOutboxSpy).not.toHaveBeenCalled();
   });

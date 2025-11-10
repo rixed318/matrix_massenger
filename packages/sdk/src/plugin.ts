@@ -21,6 +21,10 @@ export interface PluginScheduler {
   setInterval(handler: () => void | Promise<void>, ms: number): () => void;
 }
 
+export interface PluginUiContext {
+  render(surfaceId: string, payload: unknown): void;
+}
+
 export interface CommandContext {
   account: AccountMetadata;
   client: MatrixClient;
@@ -77,6 +81,7 @@ export interface PluginContext {
     getClient(accountId: string): MatrixClient | undefined;
   };
   scheduler: PluginScheduler;
+  ui: PluginUiContext;
 }
 
 export type PluginCleanup = () => void | Promise<void>;

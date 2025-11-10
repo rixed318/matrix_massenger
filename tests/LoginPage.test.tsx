@@ -19,6 +19,17 @@ vi.mock('@matrix-messenger/core', () => {
       public readonly isValidationError: boolean;
       public readonly sessionId: string | null;
     },
+    getSecureCloudDetectorCatalog: vi.fn(() => [
+      {
+        id: 'secure-cloud-lite-ml',
+        displayName: 'Локальная ML модель (lite)',
+        type: 'ml',
+        models: [
+          { id: 'lite-json', label: 'Lite JSON', provider: 'onnx' },
+          { id: 'securecloud-api', label: 'Secure Cloud API', provider: 'external' },
+        ],
+      },
+    ]),
   };
 });
 
@@ -43,6 +54,8 @@ describe('LoginPage', () => {
     expect(homeserverInput.value).toBe('https://matrix.secure-messenger.com');
     expect(screen.queryByLabelText(/Secure Cloud API/i)).not.toBeNull();
     expect(screen.queryByLabelText(/Порог риска/i)).not.toBeNull();
+    expect(screen.queryByLabelText(/Политика хранения предупреждений/i)).not.toBeNull();
+    expect(screen.getByText(/Secure Cloud Premium/i)).not.toBeNull();
   });
 
   it('enables editing homeserver details for self-hosted connections', () => {

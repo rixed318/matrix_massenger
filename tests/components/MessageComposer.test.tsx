@@ -34,6 +34,7 @@ describe('MessageComposer', () => {
                 onSendAudio={vi.fn()}
                 onSendSticker={vi.fn()}
                 onSendGif={vi.fn()}
+                onSendLocation={vi.fn()}
                 onOpenCreatePoll={vi.fn()}
                 onSchedule={vi.fn()}
                 isSending={false}

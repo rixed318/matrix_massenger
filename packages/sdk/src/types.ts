@@ -55,6 +55,22 @@ export interface CommandInvocationPayload {
   pluginId?: string;
 }
 
+export interface UiRenderEventPayload {
+  pluginId: string;
+  surfaceId: string;
+  location?: string;
+  context?: Record<string, unknown>;
+}
+
+export interface UiActionEventPayload {
+  pluginId: string;
+  surfaceId: string;
+  action: string;
+  payload?: unknown;
+  location?: string;
+  context?: Record<string, unknown>;
+}
+
 export interface MessengerEvents {
   'matrix.client-ready': ClientRuntime;
   'matrix.client-updated': ClientRuntime;
@@ -62,6 +78,8 @@ export interface MessengerEvents {
   'matrix.room-event': RoomEventPayload;
   'matrix.message': MessageEventPayload;
   'command.invoked': CommandInvocationPayload;
+  'ui.render': UiRenderEventPayload;
+  'ui.action': UiActionEventPayload;
 }
 
 export type PluginEventName = keyof MessengerEvents;
