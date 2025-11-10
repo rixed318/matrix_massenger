@@ -21,6 +21,7 @@ import {
   AppLockSnapshot,
 } from '../services/appLockService';
 import {
+  exportSecureCloudAggregatedStats,
   exportSuspiciousEventsLog,
   getSecureCloudAggregatedStats,
   subscribeSecureCloudAggregatedStats,
@@ -32,6 +33,8 @@ import {
   type SecureCloudProfile,
   type SecureCloudDetector,
 } from '../services/secureCloudService';
+import SecureCloudAnalyticsPanel from './SecureCloudAnalyticsPanel';
+import { SECURE_CLOUD_EXPORT_RANGE_PRESETS, type SecureCloudExportRangeId } from '../constants/secureCloud';
 
 interface SecuritySettingsProps {
   client: MatrixClient;
@@ -137,26 +140,9 @@ const SecuritySettings: React.FC<SecuritySettingsProps> = ({ client, isOpen, onC
   const [secureCloudMetadataConsent, setSecureCloudMetadataConsent] = useState(true);
   const [secureCloudRetentionDays, setSecureCloudRetentionDays] = useState<number>(30);
   const [secureCloudExportFormat, setSecureCloudExportFormat] = useState<SecureCloudLogFormat>('json');
-  const [secureCloudPremiumEnabled, setSecureCloudPremiumEnabled] = useState(false);
-  const [secureCloudUserSensitivity, setSecureCloudUserSensitivity] = useState<'low' | 'medium' | 'high'>('medium');
-  const [secureCloudOrgSensitivity, setSecureCloudOrgSensitivity] = useState<'low' | 'medium' | 'high'>('medium');
-  const [secureCloudModelOverrides, setSecureCloudModelOverrides] = useState<Record<string, string>>({});
-  const secureCloudDetectorCatalog = useMemo<SecureCloudDetector[]>(() => {
-    try {
-      return getSecureCloudDetectorCatalog().filter((detector) => detector.type === 'ml' || detector.type === 'llm');
-    } catch {
-      return [];
-    }
-  }, []);
-  const secureCloudDefaultModels = useMemo<Record<string, string>>(() => {
-    const mapping: Record<string, string> = {};
-    secureCloudDetectorCatalog.forEach((detector) => {
-      if (Array.isArray(detector.models) && detector.models.length > 0) {
-        mapping[detector.id] = detector.models[0].id;
-      }
-    });
-    return mapping;
-  }, [secureCloudDetectorCatalog]);
+  const [secureCloudExportRoom, setSecureCloudExportRoom] = useState<string>('all');
+  const [secureCloudExportRange, setSecureCloudExportRange] = useState<SecureCloudExportRangeId>('all');
+  const [secureCloudAnalyticsFormat, setSecureCloudAnalyticsFormat] = useState<SecureCloudLogFormat>('json');
   const isTauriRuntime = typeof window !== 'undefined' && Boolean((window as any).__TAURI__);
 
   const refreshAppLock = useCallback(async () => {
@@ -185,6 +171,29 @@ const SecuritySettings: React.FC<SecuritySettingsProps> = ({ client, isOpen, onC
     }
     return Array.from(values).sort((a, b) => a - b);
   }, [secureCloudRetentionOptions, secureCloudRetentionDays]);
+
+  const secureCloudRoomOptions = useMemo(() => {
+    if (!secureCloudStats) {
+      return [] as Array<{ roomId: string; roomName: string }>;
+    }
+    const seen = new Set<string>();
+    return secureCloudStats.rooms.filter(room => {
+      if (!room.roomId || seen.has(room.roomId)) {
+        return false;
+      }
+      seen.add(room.roomId);
+      return true;
+    }).map(room => ({ roomId: room.roomId, roomName: room.roomName || room.roomId }));
+  }, [secureCloudStats]);
+
+  useEffect(() => {
+    if (secureCloudExportRoom === 'all') {
+      return;
+    }
+    if (!secureCloudRoomOptions.some(option => option.roomId === secureCloudExportRoom)) {
+      setSecureCloudExportRoom('all');
+    }
+  }, [secureCloudExportRoom, secureCloudRoomOptions]);
 
   const updateSecureCloudProfile = useCallback(
     (updater: (current: SecureCloudProfile) => SecureCloudProfile) => {
@@ -683,7 +692,17 @@ const SecuritySettings: React.FC<SecuritySettingsProps> = ({ client, isOpen, onC
     setError(null);
     setFeedback(null);
     try {
-      const payload = exportSuspiciousEventsLog(client, { format: secureCloudExportFormat });
+      const now = Date.now();
+      const range = SECURE_CLOUD_EXPORT_RANGE_PRESETS.find(item => item.id === secureCloudExportRange);
+      const fromTimestamp = range?.durationMs ? Math.max(0, now - range.durationMs) : undefined;
+      const toTimestamp = range?.durationMs ? now : undefined;
+      const roomId = secureCloudExportRoom === 'all' ? undefined : secureCloudExportRoom;
+      const payload = exportSuspiciousEventsLog(client, {
+        format: secureCloudExportFormat,
+        roomId,
+        fromTimestamp,
+        toTimestamp,
+      });
       if (typeof window === 'undefined') {
         console.info('Secure Cloud export:\n', payload);
         setFeedback('Логи Secure Cloud сформированы в консоли.');
@@ -707,17 +726,72 @@ const SecuritySettings: React.FC<SecuritySettingsProps> = ({ client, isOpen, onC
       console.error('Failed to export Secure Cloud logs', err);
       setError(`Не удалось экспортировать логи Secure Cloud: ${err?.message ?? err}`);
     }
-  }, [client, secureCloudExportFormat]);
+  }, [client, secureCloudExportFormat, secureCloudExportRange, secureCloudExportRoom]);
 
-  const secureCloudFlagEntries = useMemo(() => {
-    if (!secureCloudStats) return [] as Array<[string, number]>;
-    return Object.entries(secureCloudStats.flags).sort((a, b) => b[1] - a[1]);
-  }, [secureCloudStats]);
+  const handleSecureCloudAnalyticsExport = useCallback(() => {
+    setError(null);
+    setFeedback(null);
+    try {
+      const payload = exportSecureCloudAggregatedStats(client, { format: secureCloudAnalyticsFormat });
+      if (typeof window === 'undefined') {
+        console.info('Secure Cloud analytics export:\n', payload);
+        setFeedback('Аналитика Secure Cloud сформирована в консоли.');
+        return;
+      }
+      const extension = secureCloudAnalyticsFormat === 'csv' ? 'csv' : 'json';
+      const blob = new Blob([payload], {
+        type: secureCloudAnalyticsFormat === 'csv' ? 'text/csv;charset=utf-8' : 'application/json;charset=utf-8',
+      });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      link.download = `secure-cloud-analytics-${timestamp}.${extension}`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+      setFeedback('Аналитика Secure Cloud экспортирована.');
+    } catch (err: any) {
+      console.error('Failed to export Secure Cloud analytics', err);
+      setError(`Не удалось экспортировать аналитику Secure Cloud: ${err?.message ?? err}`);
+    }
+  }, [client, secureCloudAnalyticsFormat]);
 
-  const secureCloudActionEntries = useMemo(() => {
-    if (!secureCloudStats) return [] as Array<[string, number]>;
-    return Object.entries(secureCloudStats.actions).sort((a, b) => b[1] - a[1]);
-  }, [secureCloudStats]);
+  const handleOpenSecureCloudAdminPanel = useCallback(async () => {
+    if (!isTauriRuntime) {
+      setError('Панель администратора доступна только в настольном приложении.');
+      return;
+    }
+    setError(null);
+    setFeedback(null);
+    try {
+      const { WebviewWindow } = await import('@tauri-apps/api/window');
+      const existing = await WebviewWindow.getByLabel('secure-cloud-admin');
+      if (existing) {
+        await existing.setFocus();
+        setFeedback('Панель администратора уже открыта.');
+        return;
+      }
+      const adminWindow = new WebviewWindow('secure-cloud-admin', {
+        url: '/?view=secure-cloud-admin',
+        title: 'Secure Cloud Admin',
+        width: 900,
+        height: 720,
+        resizable: true,
+      });
+      adminWindow.on('tauri://created', () => {
+        setFeedback('Панель администратора открыта в отдельном окне.');
+      });
+      adminWindow.on('tauri://error', (event) => {
+        console.error('Secure Cloud admin window error', event);
+        setError('Не удалось открыть панель администратора Secure Cloud.');
+      });
+    } catch (err: any) {
+      console.error('Failed to open Secure Cloud admin panel', err);
+      setError(`Не удалось открыть панель администратора: ${err?.message ?? err}`);
+    }
+  }, [isTauriRuntime]);
 
   const handleEnableAppLock = async () => {
     if (!isTauriRuntime) {
@@ -998,7 +1072,18 @@ const SecuritySettings: React.FC<SecuritySettingsProps> = ({ client, isOpen, onC
           </section>
 
           <section>
-            <h3 className="text-lg font-semibold text-text-primary mb-4">Secure Cloud отчётность</h3>
+            <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+              <h3 className="text-lg font-semibold text-text-primary">Secure Cloud отчётность</h3>
+              <button
+                type="button"
+                onClick={handleOpenSecureCloudAdminPanel}
+                className="inline-flex items-center gap-2 rounded-md border border-border-primary px-3 py-1.5 text-xs font-semibold text-text-secondary hover:text-text-primary hover:bg-bg-tertiary disabled:opacity-50"
+                disabled={!isTauriRuntime}
+                title={isTauriRuntime ? 'Открыть окно администратора Secure Cloud' : 'Доступно только в настольном приложении'}
+              >
+                Панель администратора
+              </button>
+            </div>
             {secureCloudStats ? (
               <div className="space-y-4">
                 <div className="grid gap-3 md:grid-cols-3">
@@ -1016,20 +1101,18 @@ const SecuritySettings: React.FC<SecuritySettingsProps> = ({ client, isOpen, onC
                   </div>
                   <div className="border border-border-primary rounded-md p-4">
                     <div className="text-xs uppercase text-text-secondary tracking-wide">Средний срок хранения</div>
-                    <div className="text-2xl font-semibold text-text-primary">
-                      {formatDuration(secureCloudStats.retention.averageMs ?? null)}
-                    </div>
+                    <div className="text-2xl font-semibold text-text-primary">{formatDuration(secureCloudStats.retention.averageMs ?? null)}</div>
                     <div className="text-xs text-text-secondary mt-1">
                       Политика: {secureCloudStats.retention.policyDays != null ? `${secureCloudStats.retention.policyDays} д` : 'по умолчанию'}
                     </div>
                   </div>
                 </div>
 
+                <SecureCloudAnalyticsPanel stats={secureCloudStats} />
+
                 <div className="grid gap-4 md:grid-cols-2">
                   <div className="border border-border-primary rounded-md overflow-hidden">
-                    <div className="px-4 py-2 border-b border-border-primary text-sm font-semibold text-text-primary">
-                      Согласия и телеметрия
-                    </div>
+                    <div className="px-4 py-2 border-b border-border-primary text-sm font-semibold text-text-primary">Согласия и телеметрия</div>
                     <div className="p-4 space-y-4">
                       <label className="flex items-start gap-3">
                         <input
@@ -1056,9 +1139,7 @@ const SecuritySettings: React.FC<SecuritySettingsProps> = ({ client, isOpen, onC
                         />
                         <div>
                           <div className="font-medium text-text-primary">Отправлять метаданные событий</div>
-                          <p className="text-xs text-text-secondary">
-                            Используется для уведомлений и серверных отчётов. Данные не содержат содержимого сообщений.
-                          </p>
+                          <p className="text-xs text-text-secondary">Используется для уведомлений и серверных отчётов. Данные не содержат содержимого сообщений.</p>
                         </div>
                       </label>
                       <label className="flex items-start gap-3">
@@ -1071,28 +1152,20 @@ const SecuritySettings: React.FC<SecuritySettingsProps> = ({ client, isOpen, onC
                         />
                         <div>
                           <div className="font-medium text-text-primary">Анонимная аналитика Secure Cloud</div>
-                          <p className="text-xs text-text-secondary">
-                            Помогает улучшать локальные детекторы и агрегированную статистику безопасности.
-                          </p>
+                          <p className="text-xs text-text-secondary">Помогает улучшать локальные детекторы и агрегированную статистику безопасности.</p>
                         </div>
                       </label>
                       {!secureCloudEnabled && (
-                        <p className="text-xs text-text-secondary">
-                          Активируйте Secure Cloud в настройках подключения, чтобы управлять согласиями.
-                        </p>
+                        <p className="text-xs text-text-secondary">Активируйте Secure Cloud в настройках подключения, чтобы управлять согласиями.</p>
                       )}
                     </div>
                   </div>
 
                   <div className="border border-border-primary rounded-md overflow-hidden">
-                    <div className="px-4 py-2 border-b border-border-primary text-sm font-semibold text-text-primary">
-                      Политика хранения и экспорт логов
-                    </div>
+                    <div className="px-4 py-2 border-b border-border-primary text-sm font-semibold text-text-primary">Политика хранения и экспорт</div>
                     <div className="p-4 space-y-4">
                       <div>
-                        <label htmlFor="secure-retention" className="block text-xs font-medium uppercase text-text-secondary">
-                          Срок хранения предупреждений
-                        </label>
+                        <label htmlFor="secure-retention" className="block text-xs font-medium uppercase text-text-secondary">Срок хранения предупреждений</label>
                         <select
                           id="secure-retention"
                           value={secureCloudRetentionDays}
@@ -1170,9 +1243,38 @@ const SecuritySettings: React.FC<SecuritySettingsProps> = ({ client, isOpen, onC
                         </div>
                       )}
                       <div>
-                        <label htmlFor="secure-export-format" className="block text-xs font-medium uppercase text-text-secondary">
-                          Формат экспорта
-                        </label>
+                        <label htmlFor="secure-export-room" className="block text-xs font-medium uppercase text-text-secondary">Комната</label>
+                        <select
+                          id="secure-export-room"
+                          value={secureCloudExportRoom}
+                          onChange={(e) => setSecureCloudExportRoom(e.target.value)}
+                          className="mt-1 w-full rounded-md border border-border-primary bg-bg-secondary px-3 py-2 text-sm text-text-primary focus:outline-none focus:ring-2 focus:ring-accent/50"
+                        >
+                          <option value="all">Все комнаты</option>
+                          {secureCloudRoomOptions.map((room) => (
+                            <option key={room.roomId} value={room.roomId}>
+                              {room.roomName}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                      <div>
+                        <label htmlFor="secure-export-range" className="block text-xs font-medium uppercase text-text-secondary">Диапазон времени</label>
+                        <select
+                          id="secure-export-range"
+                          value={secureCloudExportRange}
+                          onChange={(e) => setSecureCloudExportRange(e.target.value as SecureCloudExportRangeId)}
+                          className="mt-1 w-full rounded-md border border-border-primary bg-bg-secondary px-3 py-2 text-sm text-text-primary focus:outline-none focus:ring-2 focus:ring-accent/50"
+                        >
+                          {SECURE_CLOUD_EXPORT_RANGE_PRESETS.map((range) => (
+                            <option key={range.id} value={range.id}>
+                              {range.label}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                      <div>
+                        <label htmlFor="secure-export-format" className="block text-xs font-medium uppercase text-text-secondary">Формат логов</label>
                         <select
                           id="secure-export-format"
                           value={secureCloudExportFormat}
@@ -1189,51 +1291,32 @@ const SecuritySettings: React.FC<SecuritySettingsProps> = ({ client, isOpen, onC
                       >
                         Экспорт логов Secure Cloud
                       </button>
+                      <div className="border-t border-border-primary pt-4 space-y-3">
+                        <div>
+                          <label htmlFor="secure-analytics-format" className="block text-xs font-medium uppercase text-text-secondary">Формат аналитики</label>
+                          <select
+                            id="secure-analytics-format"
+                            value={secureCloudAnalyticsFormat}
+                            onChange={(e) => setSecureCloudAnalyticsFormat(e.target.value as SecureCloudLogFormat)}
+                            className="mt-1 w-full rounded-md border border-border-primary bg-bg-secondary px-3 py-2 text-sm text-text-primary focus:outline-none focus:ring-2 focus:ring-accent/50"
+                          >
+                            <option value="json">JSON</option>
+                            <option value="csv">CSV</option>
+                          </select>
+                        </div>
+                        <button
+                          onClick={handleSecureCloudAnalyticsExport}
+                          className="inline-flex items-center justify-center rounded-md border border-border-primary px-4 py-2 text-sm font-medium text-text-primary hover:bg-bg-tertiary"
+                        >
+                          Экспорт аналитики Secure Cloud
+                        </button>
+                      </div>
                     </div>
-                  </div>
-                </div>
-
-                <div className="grid gap-4 md:grid-cols-2">
-                  <div className="border border-border-primary rounded-md overflow-hidden">
-                    <div className="px-4 py-2 border-b border-border-primary text-sm font-semibold text-text-primary">
-                      Наиболее частые флаги
-                    </div>
-                    <ul className="divide-y divide-border-primary">
-                      {secureCloudFlagEntries.length > 0 ? (
-                        secureCloudFlagEntries.map(([reason, count]) => (
-                          <li key={reason} className="flex items-center justify-between px-4 py-2 text-sm">
-                            <span className="text-text-secondary">{reason}</span>
-                            <span className="font-semibold text-text-primary">{count}</span>
-                          </li>
-                        ))
-                      ) : (
-                        <li className="px-4 py-3 text-sm text-text-secondary">Флаги ещё не фиксировались.</li>
-                      )}
-                    </ul>
-                  </div>
-                  <div className="border border-border-primary rounded-md overflow-hidden">
-                    <div className="px-4 py-2 border-b border-border-primary text-sm font-semibold text-text-primary">
-                      Действия операторов
-                    </div>
-                    <ul className="divide-y divide-border-primary">
-                      {secureCloudActionEntries.length > 0 ? (
-                        secureCloudActionEntries.map(([action, count]) => (
-                          <li key={action} className="flex items-center justify-between px-4 py-2 text-sm">
-                            <span className="text-text-secondary">{action}</span>
-                            <span className="font-semibold text-text-primary">{count}</span>
-                          </li>
-                        ))
-                      ) : (
-                        <li className="px-4 py-3 text-sm text-text-secondary">Действий по событиям ещё не выполнялось.</li>
-                      )}
-                    </ul>
                   </div>
                 </div>
 
                 <div className="border border-border-primary rounded-md overflow-hidden">
-                  <div className="px-4 py-2 border-b border-border-primary text-sm font-semibold text-text-primary">
-                    Распределение сроков хранения
-                  </div>
+                  <div className="px-4 py-2 border-b border-border-primary text-sm font-semibold text-text-primary">Сводка хранения</div>
                   <div className="grid gap-3 px-4 py-3 text-xs text-text-secondary md:grid-cols-3">
                     <div>
                       Средний срок: <span className="font-semibold text-text-primary">{formatDuration(secureCloudStats.retention.averageMs ?? null)}</span>
@@ -1259,12 +1342,11 @@ const SecuritySettings: React.FC<SecuritySettingsProps> = ({ client, isOpen, onC
                 </div>
               </div>
             ) : (
-              <p className="text-sm text-text-secondary">
+              <div className="border border-dashed border-border-primary rounded-md p-6 text-sm text-text-secondary">
                 Данные Secure Cloud отсутствуют. Подключите Secure Cloud, чтобы начать сбор статистики и управлять политиками.
-              </p>
+              </div>
             )}
           </section>
-
           <section>
             <h3 className="text-lg font-semibold text-text-primary mb-4">Шифрование комнат</h3>
             <div className="space-y-3">
@@ -1289,7 +1371,7 @@ const SecuritySettings: React.FC<SecuritySettingsProps> = ({ client, isOpen, onC
                     </button>
                     <button
                       onClick={() => handleRotateSession(room.roomId)}
-                      className="px-3 py-1 rounded-md border border-border-primary hover:bg-bg-terтиary"
+                      className="px-3 py-1 rounded-md border border-border-primary hover:bg-bg-tertiary"
                     >
                       Сбросить сеанс
                     </button>
@@ -1319,7 +1401,7 @@ const SecuritySettings: React.FC<SecuritySettingsProps> = ({ client, isOpen, onC
                 <button onClick={handleRestore} className="px-4 py-2 rounded-md border border-border-primary hover:bg-bg-tertiary">
                   Восстановить
                 </button>
-                <button onClick={handleToggleAutoBackup} className="px-4 py-2 rounded-md border border-border-primary hover:bg-bg-terтиary">
+                <button onClick={handleToggleAutoBackup} className="px-4 py-2 rounded-md border border-border-primary hover:bg-bg-tertiary">
                   {autoBackupStopper ? 'Остановить авто-резервное копирование' : 'Включить авто-резервное копирование'}
                 </button>
               </div>
