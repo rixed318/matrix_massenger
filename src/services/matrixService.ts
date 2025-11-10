@@ -213,6 +213,90 @@ const idbDelete = async (id: string) => {
     db.close();
 };
 
+const OUTBOX_SYNC_TAG = 'matrix-outbox-flush';
+let _serviceWorkerOutboxListenerBound = false;
+
+const getServiceWorkerRegistration = async (): Promise<ServiceWorkerRegistration | null> => {
+    if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) {
+        return null;
+    }
+    try {
+        return await navigator.serviceWorker.ready;
+    } catch (error) {
+        console.debug('Failed to resolve service worker registration', error);
+        return null;
+    }
+};
+
+const postMessageToServiceWorker = async (message: any): Promise<void> => {
+    if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) {
+        return;
+    }
+    try {
+        navigator.serviceWorker.controller?.postMessage(message);
+    } catch (error) {
+        console.debug('Failed to post message to active controller', error);
+    }
+    try {
+        const registration = await navigator.serviceWorker.ready;
+        registration.active?.postMessage(message);
+    } catch (error) {
+        console.debug('Failed to post message to ready service worker', error);
+    }
+};
+
+const registerOutboxBackgroundSync = async () => {
+    const registration = await getServiceWorkerRegistration();
+    if (!registration) {
+        return;
+    }
+    try {
+        await registration.sync?.register?.(OUTBOX_SYNC_TAG);
+    } catch (error) {
+        console.debug('Failed to register outbox background sync', error);
+    }
+};
+
+const updateServiceWorkerOutboxState = async (pending?: boolean) => {
+    if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) {
+        return;
+    }
+    let isPending = pending;
+    if (typeof isPending !== 'boolean') {
+        try {
+            const existing = await idbGetAll();
+            isPending = existing.length > 0;
+        } catch (error) {
+            console.debug('Failed to read outbox state for service worker', error);
+            return;
+        }
+    }
+    await postMessageToServiceWorker({ type: isPending ? 'OUTBOX_PENDING' : 'OUTBOX_IDLE' });
+    if (isPending) {
+        await registerOutboxBackgroundSync();
+    }
+};
+
+const ensureServiceWorkerOutboxHooks = () => {
+    if (_serviceWorkerOutboxListenerBound) {
+        return;
+    }
+    if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) {
+        return;
+    }
+    try {
+        navigator.serviceWorker.addEventListener('message', event => {
+            const data = (event as MessageEvent)?.data;
+            if (data && typeof data === 'object' && data.type === 'OUTBOX_FLUSH') {
+                void flushOutbox();
+            }
+        });
+        _serviceWorkerOutboxListenerBound = true;
+    } catch (error) {
+        console.debug('Failed to bind service worker outbox hooks', error);
+    }
+};
+
 const idbGet = async (id: string): Promise<OutboxPayload | null> => {
     const db = await idbOpen();
     const item: OutboxPayload | undefined = await new Promise((resolve, reject) => {
@@ -698,15 +782,27 @@ const updateStatus = () => {
 
 export const bindOutboxToClient = (client: MatrixClient) => {
     _boundClient = client;
+    ensureServiceWorkerOutboxHooks();
+    void updateServiceWorkerOutboxState();
     client.on(ClientEvent.Sync as any, (state: any) => {
         _isSyncing = state === 'SYNCING' || state === 'PREPARED';
         updateStatus();
         if (_isSyncing && navigator.onLine) {
             void flushOutbox();
         }
+        if (_isSyncing) {
+            void updateServiceWorkerOutboxState();
+        }
     });
-    window.addEventListener('online', () => { updateStatus(); void flushOutbox(); });
-    window.addEventListener('offline', () => updateStatus());
+    window.addEventListener('online', () => {
+        updateStatus();
+        void flushOutbox();
+        void updateServiceWorkerOutboxState();
+    });
+    window.addEventListener('offline', () => {
+        updateStatus();
+        void updateServiceWorkerOutboxState();
+    });
 };
 
 const randomId = () => 'loc_' + Math.random().toString(36).slice(2) + Date.now().toString(36);
@@ -760,8 +856,14 @@ export const getOutboxPending = async (roomId?: string): Promise<OutboxPayload[]
 };
 
 export const flushOutbox = async () => {
-    if (!_boundClient) return;
-    if (!navigator.onLine) return;
+    if (!_boundClient) {
+        await updateServiceWorkerOutboxState();
+        return;
+    }
+    if (!navigator.onLine) {
+        await updateServiceWorkerOutboxState(true);
+        return;
+    }
     const items = (await idbGetAll()).sort((a,b) => a.ts - b.ts);
     for (const item of items) {
         let workingItem: OutboxPayload = item;
@@ -802,9 +904,11 @@ export const flushOutbox = async () => {
                 await idbPut({ ...item, attempts: (item.attempts||0)+1 });
             } catch {}
             _outboxEmitter.emit({ kind: 'error', id: item.id, error: e });
+            await updateServiceWorkerOutboxState(true);
             break;
         }
     }
+    await updateServiceWorkerOutboxState();
 };
 
 export const enqueueOutbox = async (
@@ -827,12 +931,14 @@ export const enqueueOutbox = async (
     };
     await idbPut(payload);
     _outboxEmitter.emit({ kind: 'enqueued', item: payload });
+    await updateServiceWorkerOutboxState(true);
     return id;
 };
 
 export const cancelOutboxItem = async (id: string) => {
     await idbDelete(id);
     _outboxEmitter.emit({ kind: 'cancelled', id });
+    await updateServiceWorkerOutboxState();
 };
 
 export const retryOutboxItem = async (id: string) => {
@@ -844,6 +950,7 @@ export const retryOutboxItem = async (id: string) => {
     if (navigator.onLine) {
         void flushOutbox();
     }
+    await updateServiceWorkerOutboxState(true);
 };
 
 export const serializeOutboxAttachment = async (

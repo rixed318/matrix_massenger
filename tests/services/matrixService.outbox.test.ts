@@ -187,12 +187,31 @@ describe('matrixService outbox queue', () => {
   let unsubscribe: (() => void) | undefined;
   let events: OutboxEvent[];
   let client: ReturnType<typeof createFakeClient>;
+  let registration: any;
+  let swMessages: Array<{ target: string; msg: any }>;
+  let syncRegister: ReturnType<typeof vi.fn>;
+
+  const countMessages = (type: string) => swMessages.filter(entry => entry.msg?.type === type).length;
 
   beforeEach(() => {
     const idb = new MemoryIndexedDB();
     (globalThis as any).indexedDB = idb as any;
     (indexedDB as any)._reset?.();
-    (globalThis as any).navigator = { onLine: true } as any;
+    swMessages = [];
+    syncRegister = vi.fn().mockResolvedValue(undefined);
+    registration = {
+      sync: { register: syncRegister },
+      active: { postMessage: vi.fn((msg: any) => swMessages.push({ target: 'active', msg })) },
+    };
+    (globalThis as any).navigator = {
+      onLine: true,
+      serviceWorker: {
+        ready: Promise.resolve(registration),
+        controller: { postMessage: vi.fn((msg: any) => swMessages.push({ target: 'controller', msg })) },
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+      },
+    } as any;
     (globalThis as any).window = {
       addEventListener: vi.fn(),
       removeEventListener: vi.fn(),
@@ -207,6 +226,7 @@ describe('matrixService outbox queue', () => {
     unsubscribe?.();
     vi.restoreAllMocks();
     (globalThis as any).fetch = undefined;
+    delete (globalThis as any).navigator;
   });
 
   test('uploads chunked attachments and emits progress', async () => {
@@ -214,7 +234,10 @@ describe('matrixService outbox queue', () => {
     const blob = new Blob([data.buffer], { type: 'application/octet-stream' });
     const attachment = await serializeOutboxAttachment(blob, { name: 'sample.bin', contentPath: 'url' });
     expect(attachment.mode).toBe('chunks');
+    const pendingBefore = countMessages('OUTBOX_PENDING');
     await enqueueOutbox('!room:test', 'm.room.message', { body: 'file', msgtype: 'm.file' }, { attachments: [attachment] });
+    expect(syncRegister).toHaveBeenCalledWith('matrix-outbox-flush');
+    expect(countMessages('OUTBOX_PENDING')).toBeGreaterThan(pendingBefore);
 
     const chunkCount = attachment.mode === 'chunks' ? attachment.chunkCount : 1;
     const fetchSpy = vi.fn(async () =>
@@ -229,6 +252,7 @@ describe('matrixService outbox queue', () => {
 
     expect(fetchSpy).toHaveBeenCalledTimes(chunkCount);
     expect(client.sendEvent).toHaveBeenCalledWith('!room:test', 'm.room.message', expect.objectContaining({ body: 'file' }));
+    expect(countMessages('OUTBOX_IDLE')).toBeGreaterThan(0);
     const sentEvent = events.find(ev => ev.kind === 'sent');
     expect(sentEvent).toBeTruthy();
     const progressEvent = events.find(ev => ev.kind === 'progress' && ev.progress);
@@ -258,6 +282,7 @@ describe('matrixService outbox queue', () => {
     expect(client.sendEvent).not.toHaveBeenCalled();
     let pending = await getOutboxPending();
     expect(pending).toHaveLength(1);
+    expect(countMessages('OUTBOX_IDLE')).toBeGreaterThan(0);
     const storedAttachment = pending[0].attachments?.[0] as any;
     expect(storedAttachment?.checkpoint?.uploadedChunks).toBe(1);
 
@@ -278,5 +303,6 @@ describe('matrixService outbox queue', () => {
     expect(client.sendEvent).toHaveBeenCalledTimes(1);
     pending = await getOutboxPending();
     expect(pending).toHaveLength(0);
+    expect(countMessages('OUTBOX_IDLE')).toBeGreaterThan(1);
   });
 });

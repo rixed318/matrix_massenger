@@ -27,6 +27,9 @@
       ],
       "zustand/vanilla": [
         "./src/lib/zustand.ts"
+      ],
+      "@playwright/test": [
+        "./tests/e2e/playwrightTestStub.ts"
       ]
     },
     "allowImportingTsExtensions": true,
