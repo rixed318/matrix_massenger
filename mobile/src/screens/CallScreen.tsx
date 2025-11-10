@@ -5,6 +5,7 @@ import { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { mediaDevices, MediaStream, RTCView } from 'react-native-webrtc';
 import { MatrixSessionWithAccount } from '../context/MatrixSessionContext';
 import { RootStackParamList } from '../types/navigation';
+import { useNativeCallBridge } from '../hooks/useNativeCallBridge';
 
 interface CallScreenProps {
   session: MatrixSessionWithAccount;
@@ -17,6 +18,8 @@ export const CallScreen: React.FC<CallScreenProps> = ({ session, route }) => {
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
   const [callState, setCallState] = useState<string>('connecting');
   const [error, setError] = useState<string | null>(null);
+
+  useNativeCallBridge(roomId, callState);
 
   useEffect(() => {
     let disposed = false;

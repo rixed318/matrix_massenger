@@ -2,98 +2,22 @@ import React, { useState, KeyboardEvent, useEffect, useRef, useMemo, ChangeEvent
 import { MatrixClient, Message, MatrixUser, Sticker, Gif } from '@matrix-messenger/core';
 import { sendTypingIndicator, getRoomTTL, setRoomTTL, setNextMessageTTL } from '@matrix-messenger/core';
 import type { GifFavorite } from '@matrix-messenger/core';
+import {
+    createAttachmentId,
+    formatFileSize,
+    mergeGifFavorites,
+    renderMarkdown,
+    VIDEO_MAX_DURATION_SECONDS,
+} from '@matrix-messenger/ui/message-input';
 import MentionSuggestions from './MentionSuggestions';
 import StickerGifPicker from './StickerGifPicker';
-import type { DraftAttachment, DraftContent, SendKeyBehavior, VideoMessageMetadata } from '../types';
+import type { DraftAttachment, DraftContent, SendKeyBehavior, VideoMessageMetadata } from '@matrix-messenger/core';
 import { pickSupportedVideoMimeType, readVideoMetadata } from '../utils/media';
-
-const VIDEO_MAX_DURATION_SECONDS = 30;
 
 const deserializeAttachment = async (attachment: DraftAttachment): Promise<File> => {
     const response = await fetch(attachment.dataUrl);
     const blob = await response.blob();
     return new File([blob], attachment.name, { type: attachment.mimeType, lastModified: Date.now() });
-};
-
-const mergeGifFavorites = (local: GifFavorite[], remote: GifFavorite[]): GifFavorite[] => {
-    const map = new Map<string, GifFavorite>();
-    for (const entry of local) {
-        map.set(entry.id, entry);
-    }
-    for (const entry of remote) {
-        const existing = map.get(entry.id);
-        if (!existing) {
-            map.set(entry.id, entry);
-            continue;
-        }
-        const updated: GifFavorite = {
-            ...existing,
-            ...entry,
-            addedAt: Math.max(existing.addedAt ?? 0, entry.addedAt ?? 0),
-        };
-        map.set(entry.id, updated);
-    }
-    return Array.from(map.values()).sort((a, b) => b.addedAt - a.addedAt);
-};
-
-const formatFileSize = (size: number) => {
-    if (size >= 1024 * 1024) {
-        return `${(size / (1024 * 1024)).toFixed(1)} MB`;
-    }
-    if (size >= 1024) {
-        return `${(size / 1024).toFixed(1)} KB`;
-    }
-    return `${size} B`;
-};
-
-const createAttachmentId = () => `att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-
-const escapeHtml = (value: string) =>
-    value
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;')
-        .replace(/'/g, '&#39;');
-
-const renderMarkdown = (value: string, roomMembers: MatrixUser[]): string => {
-    if (!value) {
-        return '';
-    }
-
-    const memberByName = new Map<string, MatrixUser>();
-    roomMembers.forEach(member => {
-        if (member.displayName) {
-            memberByName.set(member.displayName, member);
-        }
-        memberByName.set(member.userId, member);
-    });
-
-    let html = escapeHtml(value);
-
-    html = html.replace(/\[([^\]]+)\]\((https?:[^\s)]+)\)/g, (_match, text: string, url: string) => {
-        const safeText = text;
-        const safeUrl = escapeHtml(url);
-        return `<a href="${safeUrl}" target="_blank" rel="noopener noreferrer">${safeText}</a>`;
-    });
-
-    html = html.replace(/`([^`]+)`/g, (_match, content: string) => `<code>${content}</code>`);
-    html = html.replace(/\*\*([^*]+)\*\*/g, (_match, text: string) => `<strong>${text}</strong>`);
-    html = html.replace(/__([^_]+)__/g, (_match, text: string) => `<strong>${text}</strong>`);
-    html = html.replace(/~~([^~]+)~~/g, (_match, text: string) => `<s>${text}</s>`);
-    html = html.replace(/\*([^*]+)\*/g, (_match, text: string) => `<em>${text}</em>`);
-    html = html.replace(/_([^_]+)_/g, (_match, text: string) => `<em>${text}</em>`);
-
-    html = html.replace(/@([A-Za-z0-9._-]+)/g, (match: string, name: string) => {
-        const member = memberByName.get(name);
-        if (!member) {
-            return match;
-        }
-        const display = escapeHtml(member.displayName ?? member.userId);
-        return `<a href="https://matrix.to/#/${member.userId}" rel="noopener noreferrer">@${display}</a>`;
-    });
-
-    return html.replace(/\n/g, '<br/>');
 };
 
 interface RecordedVideoDraft {
@@ -110,7 +34,7 @@ interface RecordedVideoDraft {
     thumbnailMimeType: string;
 }
 
-interface MessageInputProps {
+export interface MessageInputProps {
     onSendMessage: (content: { body: string; formattedBody?: string }) => void | Promise<void>;
     onSendFile: (file: File) => void;
     onSendAudio: (file: Blob, duration: number) => void;

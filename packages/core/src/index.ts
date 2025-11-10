@@ -15,5 +15,6 @@ export * from '../../../src/services/searchService';
 export * from '../../../src/services/universalSearchService';
 export * from '../../../src/hooks/useChats';
 export * from '../../../src/hooks/useRoomTimeline';
+export * from './roomTimeline';
 export * from '../../../src/services/matrixRuntime';
 export * from '../../../src/services/matrixService';

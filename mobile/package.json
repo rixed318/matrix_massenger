@@ -8,16 +8,18 @@
     "android": "expo run:android",
     "ios": "expo run:ios",
     "web": "expo start --web",
-    "e2e:build:ios": "detox build --configuration ios.sim.debug",
-    "e2e:test:ios": "detox test --configuration ios.sim.debug",
-    "e2e:build:android": "detox build --configuration android.emu.debug",
-    "e2e:test:android": "detox test --configuration android.emu.debug"
+    "e2e:build:ios": "detox build --configuration ios.sim.debug --config detox.config.ts",
+    "e2e:test:ios": "detox test --configuration ios.sim.debug --config detox.config.ts",
+    "e2e:build:android": "detox build --configuration android.emu.debug --config detox.config.ts",
+    "e2e:test:android": "detox test --configuration android.emu.debug --config detox.config.ts"
   },
   "dependencies": {
     "@matrix-messenger/core": "file:../packages/core",
+    "@matrix-messenger/ui": "file:../packages/ui",
     "@matrix-messenger/ui-tokens": "file:../packages/ui-tokens",
     "@react-navigation/native": "^6.1.17",
     "@react-navigation/native-stack": "^6.10.0",
+    "@react-native-async-storage/async-storage": "^1.23.1",
     "expo": "~51.0.14",
     "expo-camera": "~15.0.7",
     "expo-av": "~14.0.5",
