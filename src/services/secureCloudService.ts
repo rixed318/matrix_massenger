@@ -16,11 +16,20 @@ export interface SecureCloudDetectorStatus {
     detail?: string;
 }
 
+export interface SecureCloudDetectorConfig {
+    threshold?: number;
+    language?: string;
+    [key: string]: unknown;
+}
+
 export interface SecureCloudDetector {
     id: string;
     displayName: string;
     description?: string;
     required?: boolean;
+    requireForPremium?: boolean;
+    defaultConfig?: SecureCloudDetectorConfig;
+    warmup?: () => Promise<void> | void;
     score: (
         event: MatrixEvent,
         room: MatrixRoom,
@@ -32,7 +41,7 @@ export interface SecureCloudDetector {
 export interface SecureCloudDetectorState {
     detector: SecureCloudDetector;
     enabled: boolean;
-    config?: Record<string, unknown>;
+    config?: SecureCloudDetectorConfig;
 }
 
 export interface SecureCloudProfile {
@@ -160,6 +169,25 @@ const normaliseBaseUrl = (baseUrl: string): string => {
     return baseUrl.replace(/\/+$/, '');
 };
 
+const mergeDetectorConfig = (
+    detector: SecureCloudDetector,
+    stateConfig?: SecureCloudDetectorConfig,
+): SecureCloudDetectorConfig | undefined => {
+    if (!detector.defaultConfig && !stateConfig) {
+        return undefined;
+    }
+    if (detector.defaultConfig && stateConfig) {
+        return { ...detector.defaultConfig, ...stateConfig };
+    }
+    if (detector.defaultConfig) {
+        return { ...detector.defaultConfig };
+    }
+    if (stateConfig) {
+        return { ...stateConfig };
+    }
+    return undefined;
+};
+
 const mergeDetectors = (profile: SecureCloudProfile): SecureCloudDetectorState[] => {
     const states = new Map<string, SecureCloudDetectorState>();
 
@@ -168,9 +196,28 @@ const mergeDetectors = (profile: SecureCloudProfile): SecureCloudDetectorState[]
         if (!detector) {
             return;
         }
-        const required = Boolean(detector.required);
+
+        const premiumRequired = Boolean(profile.enablePremium && detector.requireForPremium);
+        const required = premiumRequired || Boolean(detector.required);
+        const effectiveDetector = required && !detector.required ? { ...detector, required: true } : detector;
         const enabled = required ? true : state.enabled !== false;
-        states.set(detector.id, { ...state, detector, enabled });
+        const config = mergeDetectorConfig(effectiveDetector, state.config);
+
+        const finalState: SecureCloudDetectorState = {
+            ...state,
+            detector: effectiveDetector,
+            enabled,
+            config,
+        };
+        states.set(detector.id, finalState);
+
+        if ((required || enabled) && typeof effectiveDetector.warmup === 'function') {
+            try {
+                void effectiveDetector.warmup();
+            } catch {
+                // warmup errors are reported via detector status
+            }
+        }
     };
 
     for (const detector of builtinDetectors) {
@@ -187,9 +234,9 @@ const mergeDetectors = (profile: SecureCloudProfile): SecureCloudDetectorState[]
     for (const detector of getLocalMlDetectors()) {
         const existing = states.get(detector.id);
         if (existing) {
-            register({ ...existing, detector, enabled: existing.enabled });
+            register({ ...existing, detector, enabled: existing.enabled, config: existing.config });
         } else {
-            register({ detector, enabled: false });
+            register({ detector, enabled: false, config: detector.defaultConfig });
         }
     }
 

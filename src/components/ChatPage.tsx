@@ -49,6 +49,7 @@ import type {
     SecureCloudProfile,
     SecureCloudDetectorState,
     SecureCloudDetectorStatus,
+    SecureCloudDetectorConfig,
 } from '../services/secureCloudService';
 import {
     setSecureCloudProfileForClient,
@@ -599,6 +600,30 @@ const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, s
                 return rest;
             }
             return { ...prev, [detectorId]: { state: 'idle', detail: 'Отключен пользователем' } };
+        });
+    }, [client]);
+
+    const handleUpdateDetectorConfig = useCallback((detectorId: string, patch: SecureCloudDetectorConfig) => {
+        setSecureCloudProfile(prev => {
+            if (!prev) {
+                return prev;
+            }
+            const normalised = normaliseSecureCloudProfile(prev);
+            const detectors = (normalised.detectors ?? []).map(state => {
+                if (state.detector.id !== detectorId) {
+                    return state;
+                }
+                const mergedConfig: SecureCloudDetectorConfig = {
+                    ...(state.detector.defaultConfig ?? {}),
+                    ...(state.config ?? {}),
+                    ...patch,
+                };
+                return { ...state, config: mergedConfig };
+            });
+            const nextProfile = normaliseSecureCloudProfile({ ...normalised, detectors });
+            setSecureCloudProfileForClient(client, nextProfile);
+            secureSessionRef.current?.updateProfile(nextProfile);
+            return nextProfile;
         });
     }, [client]);
 
@@ -2767,32 +2792,99 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
                                             <span className="font-semibold text-sm">Детекторы Secure Cloud</span>
                                         </div>
                                         <ul className="space-y-2">
-                                            {detectorStates.map(state => (
-                                                <li key={state.detector.id} className="flex items-start justify-between gap-3">
-                                                    <div className="flex-1 min-w-0">
-                                                        <div className="flex items-center gap-2">
-                                                            <span className="font-medium text-sm text-neutral-100">{state.detector.displayName}</span>
-                                                            {state.detector.required && (
-                                                                <span className="text-[10px] uppercase tracking-wide text-emerald-400/80">обязательный</span>
-                                                            )}
+                                            {detectorStates.map(state => {
+                                                const mergedConfig: SecureCloudDetectorConfig = {
+                                                    ...(state.detector.defaultConfig ?? {}),
+                                                    ...(state.config ?? {}),
+                                                };
+                                                const derivedThreshold = typeof mergedConfig.threshold === 'number'
+                                                    ? mergedConfig.threshold
+                                                    : typeof state.detector.defaultConfig?.threshold === 'number'
+                                                        ? state.detector.defaultConfig.threshold
+                                                        : 0.6;
+                                                const thresholdValue = Number.isFinite(derivedThreshold)
+                                                    ? Math.min(0.95, Math.max(0.2, derivedThreshold))
+                                                    : 0.6;
+                                                const languageValue = typeof mergedConfig.language === 'string'
+                                                    ? mergedConfig.language
+                                                    : 'auto';
+                                                const configDisabled = !state.enabled && !state.detector.required;
+                                                const showThresholdControl = state.detector.defaultConfig?.threshold !== undefined
+                                                    || typeof state.config?.threshold === 'number';
+                                                const showLanguageControl = state.detector.defaultConfig?.language !== undefined
+                                                    || typeof state.config?.language === 'string';
+
+                                                return (
+                                                    <li key={state.detector.id} className="flex flex-col gap-2">
+                                                        <div className="flex items-start justify-between gap-3">
+                                                            <div className="flex-1 min-w-0">
+                                                                <div className="flex items-center gap-2">
+                                                                    <span className="font-medium text-sm text-neutral-100">{state.detector.displayName}</span>
+                                                                    {state.detector.required && (
+                                                                        <span className="text-[10px] uppercase tracking-wide text-emerald-400/80">обязательный</span>
+                                                                    )}
+                                                                </div>
+                                                                {state.detector.description && (
+                                                                    <p className="text-[11px] text-neutral-400 mt-0.5">{state.detector.description}</p>
+                                                                )}
+                                                                <p className="text-[10px] text-neutral-500 mt-1">{formatDetectorStatus(state)}</p>
+                                                            </div>
+                                                            <label className="flex items-center gap-2 text-[11px] text-neutral-300">
+                                                                <input
+                                                                    type="checkbox"
+                                                                    className="h-4 w-4 rounded border-neutral-500 bg-transparent text-emerald-500 focus:ring-emerald-500"
+                                                                    checked={state.detector.required || state.enabled}
+                                                                    onChange={(event) => handleToggleDetector(state.detector.id, event.target.checked)}
+                                                                    disabled={state.detector.required}
+                                                                />
+                                                                <span className="select-none">{state.detector.required ? 'Всегда' : state.enabled ? 'Вкл.' : 'Выкл.'}</span>
+                                                            </label>
                                                         </div>
-                                                        {state.detector.description && (
-                                                            <p className="text-[11px] text-neutral-400 mt-0.5">{state.detector.description}</p>
+                                                        {(showThresholdControl || showLanguageControl) && (
+                                                            <div className="pl-1 space-y-2">
+                                                                {showThresholdControl && (
+                                                                    <div>
+                                                                        <div className="flex items-center justify-between text-[11px] text-neutral-400">
+                                                                            <span>Порог срабатывания</span>
+                                                                            <span>{Math.round(thresholdValue * 100)}%</span>
+                                                                        </div>
+                                                                        <input
+                                                                            type="range"
+                                                                            min="0.2"
+                                                                            max="0.95"
+                                                                            step="0.01"
+                                                                            value={thresholdValue}
+                                                                            onChange={(event) => {
+                                                                                const value = Number(event.target.value);
+                                                                                if (!Number.isNaN(value)) {
+                                                                                    handleUpdateDetectorConfig(state.detector.id, { threshold: value });
+                                                                                }
+                                                                            }}
+                                                                            disabled={configDisabled}
+                                                                            className="w-full mt-1 accent-emerald-500"
+                                                                        />
+                                                                    </div>
+                                                                )}
+                                                                {showLanguageControl && (
+                                                                    <div>
+                                                                        <label className="block text-[11px] text-neutral-400 mb-1">Язык модели</label>
+                                                                        <select
+                                                                            value={languageValue}
+                                                                            onChange={(event) => handleUpdateDetectorConfig(state.detector.id, { language: event.target.value })}
+                                                                            disabled={configDisabled}
+                                                                            className="w-full rounded border border-neutral-600 bg-neutral-900/80 px-2 py-1 text-[11px] text-neutral-200 focus:border-emerald-500 focus:outline-none"
+                                                                        >
+                                                                            <option value="auto">Авто</option>
+                                                                            <option value="ru">Русский</option>
+                                                                            <option value="en">English</option>
+                                                                        </select>
+                                                                    </div>
+                                                                )}
+                                                            </div>
                                                         )}
-                                                        <p className="text-[10px] text-neutral-500 mt-1">{formatDetectorStatus(state)}</p>
-                                                    </div>
-                                                    <label className="flex items-center gap-2 text-[11px] text-neutral-300">
-                                                        <input
-                                                            type="checkbox"
-                                                            className="h-4 w-4 rounded border-neutral-500 bg-transparent text-emerald-500 focus:ring-emerald-500"
-                                                            checked={state.detector.required || state.enabled}
-                                                            onChange={(event) => handleToggleDetector(state.detector.id, event.target.checked)}
-                                                            disabled={state.detector.required}
-                                                        />
-                                                        <span className="select-none">{state.detector.required ? 'Всегда' : state.enabled ? 'Вкл.' : 'Выкл.'}</span>
-                                                    </label>
-                                                </li>
-                                            ))}
+                                                    </li>
+                                                );
+                                            })}
                                         </ul>
                                     </div>
                                 )}

@@ -1,4 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { readFileSync } from 'fs';
+import { resolve as resolvePath } from 'path';
 import { EventEmitter } from 'events';
 import { RoomEvent, EventType } from 'matrix-js-sdk';
 import type { MatrixClient, MatrixEvent, MatrixRoom } from '../../src/types';
@@ -152,6 +154,59 @@ describe('startSecureCloudSession detector aggregation', () => {
         expect(errors[0]).toContain('Secure Cloud detector failDet failed: Model missing');
 
         session.stop();
+    });
+
+    it('enriches notices with local ML classification when premium mode is enabled', async () => {
+        const modelDefinition = readFileSync(
+            resolvePath(__dirname, '../../src/assets/secure-cloud/lite-model.json'),
+            'utf-8',
+        );
+        const originalFetch = globalThis.fetch;
+        const mockFetch = vi.fn(async (input: RequestInfo | URL) => {
+            const urlString = typeof input === 'string' ? input : input instanceof URL ? input.href : '';
+            if (urlString.includes('lite-model.json')) {
+                return new Response(modelDefinition, {
+                    headers: { 'Content-Type': 'application/json' },
+                });
+            }
+            if (typeof originalFetch === 'function') {
+                return originalFetch(input as any);
+            }
+            throw new Error(`Unexpected fetch call for ${urlString}`);
+        });
+        (globalThis as any).fetch = mockFetch as any;
+
+        const notices: SuspiciousEventNotice[] = [];
+        const errors: string[] = [];
+
+        const profile: SecureCloudProfile = {
+            mode: 'managed',
+            apiBaseUrl: '',
+            enablePremium: true,
+            riskThreshold: 0.45,
+        };
+
+        let session: SecureCloudSession | null = null;
+        try {
+            session = startSecureCloudSession(client, normaliseSecureCloudProfile(profile), {
+                onSuspiciousEvent: notice => notices.push(notice),
+                onError: error => errors.push(error.message),
+            });
+
+            emitTimeline(createMatrixEvent('$ml-event', 'FREE bonus verify your account now https://secure.example/login\nInstant nudes 18+ only today!'));
+
+            await new Promise(resolve => setTimeout(resolve, 25));
+
+            expect(errors).toHaveLength(0);
+            expect(notices).toHaveLength(1);
+            const notice = notices[0];
+            expect(notice.reasons.some(reason => reason.startsWith('secure-cloud-lite-ml:'))).toBe(true);
+            expect(notice.keywords).toEqual(expect.arrayContaining(['bonus', 'verify']));
+            expect(notice.summary).toContain('FREE bonus verify');
+        } finally {
+            session?.stop();
+            (globalThis as any).fetch = originalFetch;
+        }
     });
 });
 
