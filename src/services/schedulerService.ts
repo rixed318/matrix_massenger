@@ -1,4 +1,4 @@
-import { MatrixClient, MatrixEvent, ScheduledMessage, ScheduledMessageRecurrence, DraftAttachment, DraftContent, DraftAttachmentKind } from '../types';
+import { MatrixClient, MatrixEvent, ScheduledMessage, ScheduledMessageRecurrence, DraftAttachment, DraftContent, DraftAttachmentKind, LocationContentPayload } from '../types';
 import { computeLocalTimestamp } from '../utils/timezone';
 
 export const SCHEDULED_MESSAGES_EVENT_TYPE = 'com.matrix_messenger.scheduled';
@@ -246,11 +246,28 @@ const normalizeDraftContent = (raw: unknown): DraftContent => {
             .map((item, index) => normalizeAttachment(item, index))
             .filter((item): item is DraftAttachment => Boolean(item));
 
+        let location: LocationContentPayload | null = null;
+        const locationRaw = record.location;
+        if (locationRaw && typeof locationRaw === 'object') {
+            const latitude = Number((locationRaw as any).latitude);
+            const longitude = Number((locationRaw as any).longitude);
+            if (Number.isFinite(latitude) && Number.isFinite(longitude)) {
+                location = {
+                    latitude,
+                    longitude,
+                    accuracy: Number.isFinite(Number((locationRaw as any).accuracy)) ? Number((locationRaw as any).accuracy) : undefined,
+                    description: typeof (locationRaw as any).description === 'string' ? (locationRaw as any).description : undefined,
+                    zoom: Number.isFinite(Number((locationRaw as any).zoom)) ? Number((locationRaw as any).zoom) : undefined,
+                };
+            }
+        }
+
         return {
             plain,
             formatted,
             attachments,
             msgtype,
+            location,
         };
     }
 
@@ -284,6 +301,7 @@ const serializeDraftContent = (content: DraftContent): Record<string, unknown> =
     plain: content.plain,
     ...(content.formatted ? { formatted: content.formatted } : {}),
     ...(content.msgtype ? { msgtype: content.msgtype } : {}),
+    ...(content.location ? { location: content.location } : {}),
     attachments: content.attachments.map(serializeAttachment),
 });
 

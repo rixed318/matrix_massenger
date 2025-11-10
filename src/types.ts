@@ -155,7 +155,7 @@ export interface Message {
     ttlMs?: number;
   } | null;
   localThumbnailUrl?: string;
-  transcript?: MessageTranscript | null;
+  location?: SharedLocation | null;
 }
 
 export interface ActiveThread {
@@ -205,6 +205,26 @@ export interface DraftContent {
     formatted?: string;
     attachments: DraftAttachment[];
     msgtype?: string;
+    location?: LocationContentPayload | null;
+}
+
+export interface SharedLocation {
+    latitude: number;
+    longitude: number;
+    accuracy?: number;
+    description?: string;
+    zoom?: number;
+    geoUri: string;
+    externalUrl?: string | null;
+    thumbnailUrl?: string | null;
+}
+
+export interface LocationContentPayload {
+    latitude: number;
+    longitude: number;
+    accuracy?: number;
+    description?: string;
+    zoom?: number;
 }
 
 export interface ScheduledMessageRecurrence {

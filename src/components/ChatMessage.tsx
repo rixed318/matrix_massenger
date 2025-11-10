@@ -11,6 +11,7 @@ import VideoMessagePlayer from './VideoMessagePlayer';
 import PollView from './PollView';
 import { EventType } from 'matrix-js-sdk';
 import LinkPreview from './LinkPreview';
+import { buildExternalNavigationUrl, buildStaticMapUrl, MAP_ZOOM_DEFAULT, formatCoordinate, sanitizeZoom } from '../utils/location';
 
 interface ChatMessageProps {
     message: Message;
@@ -166,6 +167,65 @@ const ChatMessage: React.FC<ChatMessageProps> = ({
         
         if (message.isRedacted) {
              return <p className="text-text-secondary italic">Message deleted</p>;
+        }
+
+        if (message.content.msgtype === 'm.location' || message.location) {
+            const location = message.location;
+            const latitude = location?.latitude ?? 0;
+            const longitude = location?.longitude ?? 0;
+            const zoom = sanitizeZoom(location?.zoom ?? MAP_ZOOM_DEFAULT);
+            const thumbnailUrl = location?.thumbnailUrl ?? buildStaticMapUrl(latitude, longitude, zoom);
+            const navigationUrl = location?.externalUrl ?? buildExternalNavigationUrl(latitude, longitude, zoom);
+            const accuracy = location?.accuracy;
+            const descriptionText = location?.description || message.content.body || 'Поделился локацией';
+
+            const handleOpenNavigation = () => {
+                if (!navigationUrl) return;
+                if (typeof window === 'undefined') {
+                    return;
+                }
+                try {
+                    window.open(navigationUrl, '_blank', 'noopener,noreferrer');
+                } catch (error) {
+                    console.warn('Failed to open navigation link', error);
+                    window.location.href = navigationUrl;
+                }
+            };
+
+            return (
+                <div className="space-y-3 max-w-md">
+                    <div className="text-text-primary font-medium break-words">{descriptionText}</div>
+                    <button
+                        type="button"
+                        onClick={handleOpenNavigation}
+                        className="block w-full overflow-hidden rounded-xl border border-border-secondary focus:outline-none focus:ring-2 focus:ring-text-accent"
+                    >
+                        <img
+                            src={thumbnailUrl}
+                            alt={`Карта (${formatCoordinate(latitude)}, ${formatCoordinate(longitude)})`}
+                            className="w-full h-auto"
+                        />
+                    </button>
+                    <div className="flex flex-wrap items-center gap-4 text-sm text-text-secondary">
+                        <span>Широта: {formatCoordinate(latitude)}</span>
+                        <span>Долгота: {formatCoordinate(longitude)}</span>
+                        {typeof accuracy === 'number' && Number.isFinite(accuracy) && (
+                            <span>Точность: ±{Math.round(accuracy)} м</span>
+                        )}
+                    </div>
+                    <button
+                        type="button"
+                        onClick={handleOpenNavigation}
+                        className="inline-flex items-center gap-2 px-3 py-2 text-sm font-semibold text-text-inverted bg-accent rounded-lg hover:bg-accent/90 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-text-accent"
+                    >
+                        <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 24 24" fill="currentColor">
+                            <path d="M3.172 11.172a4 4 0 0 1 5.656-5.656l1.415 1.414-1.414 1.415-1.415-1.415a2 2 0 0 0-2.828 2.829l4.242 4.242a2 2 0 0 0 2.828 0l1.415-1.414 1.414 1.414-1.414 1.415a4 4 0 0 1-5.657 0Z" />
+                            <path d="M12 5.828 14.828 3l6.364 6.364-2.828 2.828-1.414-1.414-7.071 7.071-4.95 1.414 1.414-4.95 7.071-7.07Z" />
+                        </svg>
+                        Открыть в навигаторе
+                    </button>
+                </div>
+            );
         }
 
         if (message.isSticker) {

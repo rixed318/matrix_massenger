@@ -116,6 +116,10 @@ function isFile(m: IContent) {
   return m?.msgtype === "m.file" || m?.file != null || (!!m?.url && !isImage(m) && !isVideo(m));
 }
 
+function isLocation(m: IContent) {
+  return m?.msgtype === "m.location";
+}
+
 const URL_REGEX = /\bhttps?:\/\/[^\s<>"'`]+/gi;
 
 type TranscriptStatus = "pending" | "completed" | "error";
@@ -152,7 +156,20 @@ function intoItems(roomId: string, ev: MatrixEvent): MediaItem[] {
     body: typeof m?.body === "string" ? m.body : undefined,
   };
 
-  if (isImage(m)) {
+  if (isLocation(m)) {
+    const geoUri = typeof (m as any)?.geo_uri === "string"
+      ? (m as any).geo_uri as string
+      : typeof (m as any)?.["m.location"]?.uri === "string"
+        ? (m as any)["m.location"].uri as string
+        : undefined;
+    const externalUrl = typeof (m as any)?.external_url === "string" ? (m as any).external_url as string : undefined;
+    items.push({
+      ...base,
+      id: `${base.eventId}:0`,
+      type: "link",
+      url: externalUrl || geoUri,
+    });
+  } else if (isImage(m)) {
     items.push({
       ...base,
       id: `${base.eventId}:0`,
