@@ -17,12 +17,43 @@ import {
   type UnifiedRoomSummary,
   type UniversalQuickFilterId,
   type UniversalQuickFilterSummary,
+  isUniversalQuickFilterId,
 } from '../utils/chatSelectors';
+import { SCHEDULED_MESSAGES_EVENT_TYPE, parseScheduledMessagesFromEvent } from './schedulerService';
+import { getSuspiciousEvents } from './secureCloudService';
 
 const RESTORE_ERROR_MESSAGE = 'Не удалось восстановить сессии. Авторизуйтесь заново.';
 
 const isTauriAvailable = () =>
   typeof window !== 'undefined' && typeof (window as any).__TAURI_INTERNALS__ !== 'undefined';
+
+const QUICK_FILTER_STORAGE_KEY = 'matrix-active-quick-filter';
+
+const readStoredQuickFilter = (): UniversalQuickFilterId | null => {
+  if (typeof window === 'undefined') {
+    return null;
+  }
+  try {
+    const stored = window.localStorage?.getItem(QUICK_FILTER_STORAGE_KEY) ?? null;
+    if (stored && isUniversalQuickFilterId(stored)) {
+      return stored;
+    }
+  } catch (error) {
+    console.warn('failed to read quick filter preference', error);
+  }
+  return null;
+};
+
+const persistQuickFilterPreference = (id: UniversalQuickFilterId) => {
+  if (typeof window === 'undefined') {
+    return;
+  }
+  try {
+    window.localStorage?.setItem(QUICK_FILTER_STORAGE_KEY, id);
+  } catch (error) {
+    console.warn('failed to persist quick filter preference', error);
+  }
+};
 
 export interface StoredAccount extends AccountCredentials {
   key: string;
@@ -73,6 +104,7 @@ export const createAccountKey = (creds: AccountCredentials) =>
 
 export const createAccountStore = () => {
   const sessionCleanup = new Map<string, () => void>();
+  const initialQuickFilter = readStoredQuickFilter() ?? 'all';
 
   const persistAccount = async (account: StoredAccount) => {
     if (!isTauriAvailable()) {
@@ -97,16 +129,44 @@ export const createAccountStore = () => {
   const store = createStore<AccountStoreState>((set, get) => {
     const refreshAggregatedState = () => {
       const { accounts, activeQuickFilterId: currentFilter } = get();
-      const descriptors: UnifiedAccountDescriptor[] = Object.values(accounts).map(runtime => ({
-        key: runtime.creds.key,
-        client: runtime.client,
-        savedMessagesRoomId: runtime.savedMessagesRoomId,
-        roomNotificationModes: runtime.roomNotificationModes,
-        userId: runtime.creds.user_id,
-        displayName: runtime.displayName,
-        avatarUrl: runtime.avatarUrl,
-        homeserverUrl: runtime.creds.homeserver_url,
-      }));
+      const descriptors: UnifiedAccountDescriptor[] = Object.values(accounts).map(runtime => {
+        const scheduledEvent = runtime.client.getAccountData(SCHEDULED_MESSAGES_EVENT_TYPE);
+        const scheduledMessages = parseScheduledMessagesFromEvent(scheduledEvent ?? null);
+        const scheduledCountByRoom = scheduledMessages.reduce<Record<string, number>>((acc, message) => {
+          if (!message || typeof message.roomId !== 'string' || message.roomId.length === 0) {
+            return acc;
+          }
+          if (message.status === 'sent') {
+            return acc;
+          }
+          acc[message.roomId] = (acc[message.roomId] ?? 0) + 1;
+          return acc;
+        }, {});
+
+        const secureAlertCountByRoom = getSuspiciousEvents(runtime.client).reduce<Record<string, number>>(
+          (acc, notice) => {
+            if (!notice?.roomId) {
+              return acc;
+            }
+            acc[notice.roomId] = (acc[notice.roomId] ?? 0) + 1;
+            return acc;
+          },
+          {},
+        );
+
+        return {
+          key: runtime.creds.key,
+          client: runtime.client,
+          savedMessagesRoomId: runtime.savedMessagesRoomId,
+          roomNotificationModes: runtime.roomNotificationModes,
+          userId: runtime.creds.user_id,
+          displayName: runtime.displayName,
+          avatarUrl: runtime.avatarUrl,
+          homeserverUrl: runtime.creds.homeserver_url,
+          scheduledCountByRoom,
+          secureAlertCountByRoom,
+        } satisfies UnifiedAccountDescriptor;
+      });
 
       const aggregatedRooms = collectUnifiedRooms(descriptors);
       const aggregatedQuickFilters = buildQuickFilterSummaries(aggregatedRooms);
@@ -120,6 +180,9 @@ export const createAccountStore = () => {
         aggregatedUnread,
         activeQuickFilterId: nextFilter,
       });
+      if (nextFilter !== currentFilter) {
+        persistQuickFilterPreference(nextFilter);
+      }
     };
 
     const attachAggregatedListeners = (key: string, client: MatrixClient) => {
@@ -361,7 +424,7 @@ export const createAccountStore = () => {
        aggregatedQuickFilters: buildQuickFilterSummaries([]),
        aggregatedUnread: 0,
        universalMode: 'active',
-       activeQuickFilterId: 'all',
+       activeQuickFilterId: initialQuickFilter,
       boot,
       addClientAccount,
       removeAccount,
@@ -374,7 +437,10 @@ export const createAccountStore = () => {
       setRoomNotificationModes,
       refreshAggregatedState,
       setUniversalMode: (mode) => set({ universalMode: mode }),
-      setActiveQuickFilterId: (id) => set({ activeQuickFilterId: id }),
+      setActiveQuickFilterId: (id) => {
+        set({ activeQuickFilterId: id });
+        persistQuickFilterPreference(id);
+      },
     };
   });
 

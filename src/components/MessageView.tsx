@@ -1,5 +1,6 @@
 import React from 'react';
 import { Message, Reaction, MatrixClient } from '@matrix-messenger/core';
+import type { OutboxProgressState } from '../services/matrixService';
 import { EventType } from 'matrix-js-sdk';
 import ChatMessage from './ChatMessage';
 
@@ -11,6 +12,7 @@ interface PendingQueueEntry {
     error?: string;
     attachments?: { name?: string; kind?: string }[];
     ts?: number;
+    progress?: OutboxProgressState;
 }
 
 interface MessageViewProps {
@@ -40,6 +42,15 @@ interface MessageViewProps {
     onRetryPending?: (id: string) => void;
     onCancelPending?: (id: string) => void;
 }
+
+
+const formatBytes = (value: number): string => {
+    if (!Number.isFinite(value) || value <= 0) return '0 Б';
+    const units = ['Б', 'КБ', 'МБ', 'ГБ', 'ТБ'];
+    const exponent = Math.min(units.length - 1, Math.floor(Math.log(value) / Math.log(1024)));
+    const scaled = value / Math.pow(1024, exponent);
+    return `${scaled.toFixed(exponent === 0 ? 0 : 1)} ${units[exponent]}`;
+};
 
 
 const TTLCountdown: React.FC<{ message: Message }> = ({ message }) => {
@@ -409,6 +420,10 @@ const MessageView: React.FC<MessageViewProps> = ({
                     <ul className="space-y-1">
                         {pendingQueue.map((entry) => {
                             const timeLabel = entry.ts ? new Date(entry.ts).toLocaleTimeString() : null;
+                            const progress = entry.progress;
+                            const percent = progress && progress.totalBytes > 0
+                                ? Math.min(100, Math.round((progress.uploadedBytes / progress.totalBytes) * 100))
+                                : null;
                             return (
                                 <li key={entry.id} className="flex items-start justify-between gap-3">
                                     <div className="flex-1 min-w-0">
@@ -417,6 +432,20 @@ const MessageView: React.FC<MessageViewProps> = ({
                                             Попыток: {entry.attempts}
                                             {timeLabel ? ` • ${timeLabel}` : ''}
                                         </p>
+                                        {progress && percent !== null && (
+                                            <div className="mt-1 space-y-1">
+                                                <div className="flex items-center justify-between text-[10px] text-amber-200/70">
+                                                    <span>{formatBytes(progress.uploadedBytes)} / {formatBytes(progress.totalBytes)}</span>
+                                                    <span>{percent}%</span>
+                                                </div>
+                                                <div className="h-1.5 w-full rounded bg-amber-200/20 overflow-hidden">
+                                                    <div
+                                                        className="h-full bg-amber-300"
+                                                        style={{ width: `${Math.max(0, percent)}%` }}
+                                                    />
+                                                </div>
+                                            </div>
+                                        )}
                                         {entry.error && (
                                             <p className="text-[11px] text-amber-300/90 mt-1 line-clamp-2">
                                                 Ошибка: {entry.error}

@@ -57,6 +57,7 @@ import {
     cancelOutboxItem,
     retryOutboxItem,
     OutboxPayload,
+    OutboxProgressState,
     startGroupCall,
     createGroupCallCoordinator,
     leaveGroupCallCoordinator,
@@ -86,7 +87,7 @@ interface ChatPageProps {
 const DRAFT_STORAGE_KEY = 'matrix-message-drafts';
 const DRAFT_ACCOUNT_DATA_EVENT = 'econix.message_drafts';
 
-type PendingQueueSummary = OutboxPayload & { attempts: number; error?: string };
+type PendingQueueSummary = OutboxPayload & { attempts: number; error?: string; progress?: OutboxProgressState };
 
 const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, savedMessagesRoomId: savedRoomIdProp }) => {
     const activeRuntime = useAccountStore(state => (state.activeKey ? state.accounts[state.activeKey] : null));
@@ -260,7 +261,7 @@ const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, s
     const [isSharedMediaLoading, setIsSharedMediaLoading] = useState(false);
     const [isSharedMediaPaginating, setIsSharedMediaPaginating] = useState(false);
     const [isPluginCatalogOpen, setIsPluginCatalogOpen] = useState(false);
-    const [outboxItems, setOutboxItems] = useState<Record<string, { payload: OutboxPayload; attempts: number; error?: string }>>({});
+    const [outboxItems, setOutboxItems] = useState<Record<string, { payload: OutboxPayload; attempts: number; error?: string; progress?: OutboxProgressState }>>({});
     const [currentSelfDestructSeconds, setCurrentSelfDestructSeconds] = useState<number | null>(null);
     const [appLockState, setAppLockState] = useState<{ enabled: boolean; biometricEnabled: boolean; unlocked: boolean }>(() => ({
         enabled: false,
@@ -474,6 +475,21 @@ const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, s
         } catch {
             return 'Неизвестная ошибка';
         }
+    }, []);
+
+    const deriveOutboxProgress = useCallback((payload: OutboxPayload): OutboxProgressState | undefined => {
+        if (!Array.isArray(payload.attachments) || payload.attachments.length === 0) {
+            return undefined;
+        }
+        const totalBytes = payload.attachments.reduce((sum, attachment) => sum + (attachment?.size ?? 0), 0);
+        if (!Number.isFinite(totalBytes) || totalBytes <= 0) {
+            return undefined;
+        }
+        const uploadedBytes = payload.attachments.reduce((sum, attachment) => sum + (attachment?.checkpoint?.uploadedBytes ?? 0), 0);
+        return {
+            totalBytes,
+            uploadedBytes: Math.min(uploadedBytes, totalBytes),
+        };
     }, []);
 
     const normalizeDraft = (value: unknown): DraftContent => {
@@ -1200,8 +1216,12 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
             try {
                 const existing = await getOutboxPending();
                 if (disposed) return;
-                const mapped = existing.reduce<Record<string, { payload: OutboxPayload; attempts: number; error?: string }>>((acc, item) => {
-                    acc[item.id] = { payload: item, attempts: item.attempts ?? 0 };
+                const mapped = existing.reduce<Record<string, { payload: OutboxPayload; attempts: number; error?: string; progress?: OutboxProgressState }>>((acc, item) => {
+                    acc[item.id] = {
+                        payload: item,
+                        attempts: item.attempts ?? 0,
+                        progress: deriveOutboxProgress(item),
+                    };
                     return acc;
                 }, {});
                 setOutboxItems(mapped);
@@ -1221,20 +1241,42 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
                 const next = { ...prev };
                 switch (event.kind) {
                     case 'enqueued':
-                        next[event.item.id] = { payload: event.item, attempts: event.item.attempts ?? 0 };
+                        next[event.item.id] = {
+                            payload: event.item,
+                            attempts: event.item.attempts ?? 0,
+                            progress: deriveOutboxProgress(event.item),
+                        };
                         break;
-                    case 'progress':
-                        if (next[event.id]) {
-                            next[event.id] = { ...next[event.id], attempts: event.attempts, error: undefined };
+                    case 'progress': {
+                        const payload = event.item ?? next[event.id]?.payload;
+                        if (payload) {
+                            next[event.id] = {
+                                payload,
+                                attempts: event.attempts,
+                                error: undefined,
+                                progress: event.progress ?? deriveOutboxProgress(payload),
+                            };
+                        } else if (next[event.id]) {
+                            next[event.id] = {
+                                ...next[event.id],
+                                attempts: event.attempts,
+                                error: undefined,
+                                progress: event.progress ?? deriveOutboxProgress(next[event.id].payload),
+                            };
                         }
                         break;
+                    }
                     case 'sent':
                     case 'cancelled':
                         delete next[event.id];
                         break;
                     case 'error':
                         if (next[event.id]) {
-                            next[event.id] = { ...next[event.id], error: formatOutboxError(event.error) };
+                            next[event.id] = {
+                                ...next[event.id],
+                                error: formatOutboxError(event.error),
+                                progress: deriveOutboxProgress(next[event.id].payload),
+                            };
                         }
                         break;
                     default:
@@ -1248,7 +1290,7 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
             disposed = true;
             unsubscribe?.();
         };
-    }, [formatOutboxError]);
+    }, [formatOutboxError, deriveOutboxProgress]);
 
     const pendingQueueForRoom = useMemo<PendingQueueSummary[]>(() => {
         if (!selectedRoomId) {
@@ -1260,8 +1302,9 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
                 ...entry.payload,
                 attempts: entry.attempts,
                 error: entry.error,
+                progress: entry.progress ?? deriveOutboxProgress(entry.payload),
             }));
-    }, [outboxItems, selectedRoomId]);
+    }, [outboxItems, selectedRoomId, deriveOutboxProgress]);
 
     const buildPendingMessage = useCallback((entry: PendingQueueSummary): Message | null => {
         if (entry.type !== EventType.RoomMessage) {
@@ -1307,10 +1350,12 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
             (pending as any).outboxError = entry.error;
         }
 
-        const firstAttachment = entry.attachments?.[0];
-        if (firstAttachment?.dataUrl) {
+        const firstAttachment = entry.attachments?.[0] as any;
+        if (typeof firstAttachment?.dataUrl === 'string') {
             (pending as any).localUrl = firstAttachment.dataUrl;
-        } else if (firstAttachment?.remoteUrl) {
+        } else if (typeof firstAttachment?.remoteUrl === 'string') {
+            (pending as any).localUrl = firstAttachment.remoteUrl;
+        } else if (firstAttachment?.mode === 'remote' && typeof firstAttachment.remoteUrl === 'string') {
             (pending as any).localUrl = firstAttachment.remoteUrl;
         }
 
@@ -1423,6 +1468,28 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
 
         const nextHiddenRoomIds: string[] = [];
 
+        const scheduledCountByRoom = allScheduledMessages.reduce<Record<string, number>>((acc, message) => {
+            if (!message || typeof message.roomId !== 'string') {
+                return acc;
+            }
+            if (message.status === 'sent') {
+                return acc;
+            }
+            acc[message.roomId] = (acc[message.roomId] ?? 0) + 1;
+            return acc;
+        }, {});
+
+        const secureAlertCounts = Object.entries(secureCloudAlerts).reduce<Record<string, number>>(
+            (acc, [roomId, alerts]) => {
+                if (!Array.isArray(alerts) || alerts.length === 0) {
+                    return acc;
+                }
+                acc[roomId] = alerts.length;
+                return acc;
+            },
+            {},
+        );
+
         const roomData: UIRoom[] = sortedRooms.map(room => {
             const lastEvent = room.timeline[room.timeline.length - 1];
             const pinnedEvent = room.currentState.getStateEvents(EventType.RoomPinnedEvents, '');
@@ -1453,6 +1520,11 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
             if (hidden) {
                 nextHiddenRoomIds.push(room.roomId);
             }
+            const mentionCount = room.getUnreadNotificationCount(NotificationCountType.Highlight);
+            const scheduledCount = scheduledCountByRoom[room.roomId] ?? 0;
+            const secureAlerts = secureAlertCounts[room.roomId] ?? 0;
+            const isServiceRoom = roomType === 'm.server_notice';
+
             const uiRoom: UIRoom = {
                 roomId: room.roomId,
                 name: room.name,
@@ -1470,6 +1542,10 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
                 canonicalAlias: canonicalAlias ?? null,
                 isHidden: hidden,
                 selfDestructSeconds: ttlSeconds,
+                mentionCount,
+                scheduledMessageCount: scheduledCount,
+                secureAlertCount: secureAlerts,
+                isServiceRoom,
             };
 
             if (room.roomId === savedMessagesRoomId) {
@@ -1486,6 +1562,9 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
                     name: '🔒 Hidden chat',
                     lastMessage: null,
                     unreadCount: 0,
+                    mentionCount: 0,
+                    scheduledMessageCount: 0,
+                    secureAlertCount: 0,
                 };
             }
 
@@ -1501,7 +1580,15 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
 
         setIsRoomsLoading(false);
         setHiddenRoomIds(nextHiddenRoomIds);
-    }, [client, savedMessagesRoomId, parseMatrixEvent, appLockState.enabled, appLockState.unlocked]);
+    }, [
+        client,
+        savedMessagesRoomId,
+        parseMatrixEvent,
+        appLockState.enabled,
+        appLockState.unlocked,
+        allScheduledMessages,
+        secureCloudAlerts,
+    ]);
 
     useEffect(() => {
         loadRooms();

@@ -2,6 +2,13 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { searchMessages } from '@matrix-messenger/core';
 import type { MatrixClient, Room, SearchMessagesResponse, SearchResultItem } from '@matrix-messenger/core';
 import type { SearchKey } from 'matrix-js-sdk';
+import { useAccountStore } from '../services/accountManager';
+import type { UnifiedRoomSummary } from '../utils/chatSelectors';
+import {
+    searchUniversalMessages,
+    type UniversalSearchCursor,
+    type UniversalSearchResultItem,
+} from '../services/universalSearchService';
 
 interface SearchModalProps {
     isOpen: boolean;
@@ -35,6 +42,7 @@ interface AppliedFilters {
     dateFrom?: string;
     dateTo?: string;
     keys: SearchKey[];
+    accountLabel?: string;
 }
 
 const createInitialAppliedFilters = (): AppliedFilters => ({
@@ -59,6 +67,19 @@ const normalizeDateInputValue = (value?: string | number | Date): string | undef
     return value;
 };
 
+const deriveHomeserverName = (userId: string, homeserverUrl: string): string => {
+    const [, domain] = userId.split(':');
+    if (domain) {
+        return domain;
+    }
+    try {
+        const url = new URL(homeserverUrl);
+        return url.hostname;
+    } catch {
+        return homeserverUrl.replace(/^https?:\/\//, '').replace(/\/+$/, '');
+    }
+};
+
 type SearchOverride = Partial<{
     roomId?: string;
     keys?: SearchKey[];
@@ -70,9 +91,11 @@ type SearchOverride = Partial<{
 
 const SearchModal: React.FC<SearchModalProps> = ({ isOpen, onClose, client, rooms, onSelectResult }) => {
     const [query, setQuery] = useState('');
-    const [results, setResults] = useState<SearchResultItem[]>([]);
+    const [results, setResults] = useState<UniversalSearchResultItem[]>([]);
     const [highlights, setHighlights] = useState<string[]>([]);
     const [nextBatch, setNextBatch] = useState<string | undefined>();
+    const [universalCursor, setUniversalCursor] = useState<UniversalSearchCursor | null>(null);
+    const [hasMoreUniversal, setHasMoreUniversal] = useState(false);
     const [isSearching, setIsSearching] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const [selectedIndex, setSelectedIndex] = useState(0);
@@ -88,6 +111,29 @@ const SearchModal: React.FC<SearchModalProps> = ({ isOpen, onClose, client, room
     const [appliedFilters, setAppliedFilters] = useState<AppliedFilters>(() => createInitialAppliedFilters());
     const inputRef = useRef<HTMLInputElement>(null);
 
+    const [universalMode, aggregatedRooms, accountState] = useAccountStore(state => [
+        state.universalMode,
+        state.aggregatedRooms,
+        state.accounts,
+    ]);
+
+    const isUniversal = universalMode === 'all';
+
+    const activeAccountMetadata = useMemo(() => {
+        const runtime = Object.values(accountState).find(entry => entry.client === client);
+        if (!runtime) {
+            return null;
+        }
+
+        return {
+            accountKey: runtime.creds.key,
+            accountUserId: runtime.creds.user_id,
+            accountDisplayName: runtime.displayName ?? runtime.creds.user_id,
+            accountAvatarUrl: runtime.avatarUrl ?? null,
+            homeserverName: deriveHomeserverName(runtime.creds.user_id, runtime.creds.homeserver_url),
+        };
+    }, [accountState, client]);
+
     const resetFilterSelections = useCallback(() => {
         setSelectedRoomId('');
         setSelectedSenders([]);
@@ -97,6 +143,8 @@ const SearchModal: React.FC<SearchModalProps> = ({ isOpen, onClose, client, room
         setDateFrom('');
         setDateTo('');
         setSelectedKeys([...DEFAULT_KEYS]);
+        setUniversalCursor(null);
+        setHasMoreUniversal(false);
     }, []);
 
     useEffect(() => {
@@ -105,6 +153,8 @@ const SearchModal: React.FC<SearchModalProps> = ({ isOpen, onClose, client, room
             setResults([]);
             setHighlights([]);
             setNextBatch(undefined);
+            setUniversalCursor(null);
+            setHasMoreUniversal(false);
             setSelectedIndex(0);
             setError(null);
             setActiveResultId(null);
@@ -129,12 +179,14 @@ const SearchModal: React.FC<SearchModalProps> = ({ isOpen, onClose, client, room
         return () => window.removeEventListener('keydown', handleKeydown);
     }, [isOpen, onClose]);
 
-    const handleSearch = async (batch?: string, append = false, overrides: SearchOverride = {}) => {
+    const handleSearch = async (append = false, overrides: SearchOverride = {}) => {
         const trimmed = query.trim();
         if (!trimmed) {
             setResults([]);
             setHighlights([]);
             setNextBatch(undefined);
+            setUniversalCursor(null);
+            setHasMoreUniversal(false);
             setError(null);
             setAppliedFilters(createInitialAppliedFilters());
             return;
@@ -151,32 +203,80 @@ const SearchModal: React.FC<SearchModalProps> = ({ isOpen, onClose, client, room
         const effectiveKeys = keysCandidate && keysCandidate.length > 0 ? keysCandidate : DEFAULT_KEYS;
         const sendersFilter = Array.isArray(sendersCandidate) && sendersCandidate.length > 0 ? sendersCandidate : undefined;
         const messageTypesFilter = Array.isArray(messageTypesCandidate) && messageTypesCandidate.length > 0 ? messageTypesCandidate : undefined;
+        const selectedUniversalRoom = isUniversal && roomIdCandidate
+            ? aggregatedRooms.find(room => room.compositeId === roomIdCandidate)
+            : undefined;
+        const actualRoomId = isUniversal ? selectedUniversalRoom?.roomId : roomIdCandidate || undefined;
+        const includedAccounts = isUniversal && selectedUniversalRoom ? [selectedUniversalRoom.accountKey] : undefined;
 
         setIsSearching(true);
         setError(null);
         try {
-            const response: SearchMessagesResponse = await searchMessages(client, {
-                searchTerm: trimmed,
-                nextBatch: batch,
-                roomId: roomIdCandidate || undefined,
-                keys: effectiveKeys,
-                senders: sendersFilter,
-                messageTypes: messageTypesFilter,
-                dateRange: dateRangeCandidate,
-                hasMedia: hasMediaCandidate,
-            });
-            setHighlights(response.highlights);
-            setNextBatch(response.nextBatch);
-            setResults(prev => append ? [...prev, ...response.results] : response.results);
+            if (isUniversal) {
+                const response = await searchUniversalMessages({
+                    searchTerm: trimmed,
+                    roomId: actualRoomId,
+                    keys: effectiveKeys,
+                    senders: sendersFilter,
+                    messageTypes: messageTypesFilter,
+                    dateRange: dateRangeCandidate,
+                    hasMedia: hasMediaCandidate,
+                    cursor: append ? universalCursor : null,
+                    includedAccountKeys: includedAccounts,
+                });
+
+                setHighlights(response.highlights);
+                setUniversalCursor(response.cursor ?? null);
+                setHasMoreUniversal(Boolean(response.cursor));
+                setResults(prev => (append ? [...prev, ...response.results] : response.results));
+                setNextBatch(undefined);
+            } else {
+                const response: SearchMessagesResponse = await searchMessages(client, {
+                    searchTerm: trimmed,
+                    nextBatch: append ? nextBatch : undefined,
+                    roomId: actualRoomId,
+                    keys: effectiveKeys,
+                    senders: sendersFilter,
+                    messageTypes: messageTypesFilter,
+                    dateRange: dateRangeCandidate,
+                    hasMedia: hasMediaCandidate,
+                });
+
+                const decorated = response.results.map(item =>
+                    activeAccountMetadata
+                        ? {
+                            ...item,
+                            accountKey: activeAccountMetadata.accountKey,
+                            accountUserId: activeAccountMetadata.accountUserId,
+                            accountDisplayName: activeAccountMetadata.accountDisplayName,
+                            accountAvatarUrl: activeAccountMetadata.accountAvatarUrl,
+                            homeserverName: activeAccountMetadata.homeserverName,
+                        } satisfies UniversalSearchResultItem
+                        : ({
+                            ...item,
+                            accountKey: 'local',
+                            accountUserId: client.getUserId?.() ?? 'unknown',
+                            accountDisplayName: client.getUserId?.() ?? 'unknown',
+                            accountAvatarUrl: null,
+                            homeserverName: client.getUserId?.()?.split(':')[1] ?? '',
+                        } as UniversalSearchResultItem),
+                );
+
+                setHighlights(response.highlights);
+                setNextBatch(response.nextBatch);
+                setHasMoreUniversal(Boolean(response.nextBatch));
+                setResults(prev => (append ? [...prev, ...decorated] : decorated));
+            }
             setSelectedIndex(0);
             setAppliedFilters({
-                roomId: roomIdCandidate || undefined,
+                roomId: isUniversal ? selectedUniversalRoom?.roomId : actualRoomId || undefined,
                 senders: sendersFilter ? [...sendersFilter] : [],
                 messageTypes: messageTypesFilter ? [...messageTypesFilter] : [],
                 hasMedia: Boolean(hasMediaCandidate),
                 dateFrom: normalizeDateInputValue(dateRangeCandidate?.from),
                 dateTo: normalizeDateInputValue(dateRangeCandidate?.to),
                 keys: [...effectiveKeys],
+                accountLabel: selectedUniversalRoom?.accountDisplayName,
             });
         } catch (err) {
             console.error('Failed to search messages:', err);
@@ -192,8 +292,12 @@ const SearchModal: React.FC<SearchModalProps> = ({ isOpen, onClose, client, room
     };
 
     const handleLoadMore = () => {
-        if (nextBatch) {
-            void handleSearch(nextBatch, true);
+        if (isUniversal) {
+            if (hasMoreUniversal) {
+                void handleSearch(true);
+            }
+        } else if (nextBatch) {
+            void handleSearch(true);
         }
     };
 
@@ -257,7 +361,7 @@ const SearchModal: React.FC<SearchModalProps> = ({ isOpen, onClose, client, room
         const initial = createInitialAppliedFilters();
         setAppliedFilters(initial);
         if (query.trim()) {
-            void handleSearch(undefined, false, {
+            void handleSearch(false, {
                 roomId: undefined,
                 keys: initial.keys,
                 senders: [],
@@ -269,22 +373,45 @@ const SearchModal: React.FC<SearchModalProps> = ({ isOpen, onClose, client, room
     };
 
     const roomMap = useMemo(() => {
+        if (isUniversal) {
+            return aggregatedRooms.reduce<Record<string, UnifiedRoomSummary>>((acc, room) => {
+                acc[room.compositeId] = room;
+                return acc;
+            }, {});
+        }
+
         return rooms.reduce<Record<string, Room>>((acc, room) => {
             acc[room.roomId] = room;
             return acc;
         }, {});
-    }, [rooms]);
+    }, [aggregatedRooms, isUniversal, rooms]);
+
+    const resolvedRooms = useMemo(() => {
+        if (isUniversal) {
+            return aggregatedRooms;
+        }
+        return rooms;
+    }, [aggregatedRooms, isUniversal, rooms]);
 
     const highlightWords = useMemo(() => highlights.map(h => h.toLowerCase()), [highlights]);
 
     const activeFilterChips = useMemo(() => {
         const chips: { key: string; label: string; value: string }[] = [];
         if (appliedFilters.roomId) {
-            const room = roomMap[appliedFilters.roomId];
+            const room = isUniversal
+                ? aggregatedRooms.find(r => r.roomId === appliedFilters.roomId)
+                : rooms.find(r => r.roomId === appliedFilters.roomId);
             chips.push({
                 key: 'room',
                 label: 'Комната',
                 value: room?.name || appliedFilters.roomId,
+            });
+        }
+        if (appliedFilters.accountLabel) {
+            chips.push({
+                key: 'account',
+                label: 'Аккаунт',
+                value: appliedFilters.accountLabel,
             });
         }
         if (appliedFilters.senders.length > 0) {
@@ -327,7 +454,7 @@ const SearchModal: React.FC<SearchModalProps> = ({ isOpen, onClose, client, room
             });
         }
         return chips;
-    }, [appliedFilters, roomMap]);
+    }, [aggregatedRooms, appliedFilters, isUniversal, rooms]);
 
     const renderHighlighted = (text: string) => {
         if (!text) return <span className="text-text-primary">Без текста</span>;
@@ -357,7 +484,7 @@ const SearchModal: React.FC<SearchModalProps> = ({ isOpen, onClose, client, room
         );
     };
 
-    const handleResultSelect = async (result: SearchResultItem) => {
+    const handleResultSelect = async (result: UniversalSearchResultItem) => {
         const eventId = result.event.getId();
         if (!eventId) return;
         setActiveResultId(eventId);
@@ -422,11 +549,21 @@ const SearchModal: React.FC<SearchModalProps> = ({ isOpen, onClose, client, room
                                 className="w-full bg-bg-primary border border-border-secondary rounded-md px-3 py-2 text-sm text-text-primary focus:outline-none focus:ring-1 focus:ring-accent"
                             >
                                 <option value="">Все комнаты</option>
-                                {rooms.map(room => (
-                                    <option key={room.roomId} value={room.roomId}>
-                                        {room.name || room.roomId}
-                                    </option>
-                                ))}
+                                {resolvedRooms.map(room => {
+                                    const optionKey = isUniversal
+                                        ? (room as UnifiedRoomSummary).compositeId
+                                        : (room as Room).roomId;
+                                    const optionLabel = room.name || (room as Room).roomId;
+                                    const homeserverLabel = isUniversal
+                                        ? (room as UnifiedRoomSummary).homeserverName
+                                        : undefined;
+                                    return (
+                                        <option key={optionKey} value={optionKey}>
+                                            {optionLabel}
+                                            {isUniversal && homeserverLabel ? ` • ${homeserverLabel}` : ''}
+                                        </option>
+                                    );
+                                })}
                             </select>
                         </div>
                         <div className="flex flex-col gap-2">
@@ -566,7 +703,9 @@ const SearchModal: React.FC<SearchModalProps> = ({ isOpen, onClose, client, room
                             const eventId = result.event.getId();
                             const content = result.event.getContent();
                             const body = content?.body || `[${result.event.getType()}]`;
-                            const room = roomMap[result.roomId];
+                            const room = isUniversal
+                                ? aggregatedRooms.find(r => r.roomId === result.roomId && r.accountKey === result.accountKey)
+                                : roomMap[result.roomId];
                             const timestamp = result.event.getTs();
                             const isActive = index === selectedIndex;
                             const isLoading = activeResultId === eventId;
@@ -583,6 +722,14 @@ const SearchModal: React.FC<SearchModalProps> = ({ isOpen, onClose, client, room
                                             <span className="font-semibold text-text-primary truncate">{room?.name || result.roomId}</span>
                                             <span>{timestamp ? new Date(timestamp).toLocaleString() : ''}</span>
                                         </div>
+                                        {isUniversal && (
+                                            <div className="flex items-center gap-2 text-[10px] uppercase tracking-wide text-text-secondary">
+                                                <span className="inline-flex items-center gap-1 rounded-full border border-border-secondary bg-bg-tertiary px-2 py-0.5 text-[10px] font-semibold text-text-secondary">
+                                                    {result.homeserverName}
+                                                </span>
+                                                <span className="text-text-secondary truncate">{result.accountDisplayName}</span>
+                                            </div>
+                                        )}
                                         <div className="text-sm leading-relaxed">
                                             {renderHighlighted(body)}
                                         </div>
@@ -600,12 +747,12 @@ const SearchModal: React.FC<SearchModalProps> = ({ isOpen, onClose, client, room
                 </div>
                 <div className="border-t border-border-secondary bg-bg-secondary/60 p-4 flex items-center justify-between">
                     <div className="text-xs text-text-secondary">
-                        {results.length > 0 ? `Найдено результатов: ${results.length}${nextBatch ? '+' : ''}` : 'Нет результатов'}
+                        {results.length > 0 ? `Найдено результатов: ${results.length}${(nextBatch || hasMoreUniversal) ? '+' : ''}` : 'Нет результатов'}
                     </div>
-                    {nextBatch && (
+                    {(nextBatch || hasMoreUniversal) && (
                         <button
                             onClick={handleLoadMore}
-                            className="px-4 py-1.5 text-sm font-semibold text-text-primary bg-bg-tertiary rounded-md hover:bg-bg-secondary transition"
+                            className="px-4 py-1.5 text-sm font-semibold text-text-primary bg-bg-terтиary rounded-md hover:bg-bg-secondary transition"
                             disabled={isSearching}
                         >
                             Показать ещё

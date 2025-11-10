@@ -61,6 +61,12 @@ const PluginRow: React.FC<{
           {manifest.requiredEvents.join(', ')}
         </div>
       )}
+      {manifest.integrity && (
+        <div className="text-xs text-text-secondary break-all">
+          <span className="font-semibold text-text-primary">Подпись:</span>{' '}
+          <code className="text-[11px] bg-bg-tertiary px-1 py-0.5 rounded">{manifest.integrity}</code>
+        </div>
+      )}
       <div className="text-xs text-text-secondary">
         <span className="font-semibold text-text-primary">Разрешения:</span>{' '}
         {formatPermissions(manifest.permissions)}

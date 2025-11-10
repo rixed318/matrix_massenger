@@ -1,10 +1,16 @@
-import React, { useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import { Room, MatrixClient, Folder } from '@matrix-messenger/core';
 import RoomListItem from './RoomListItem';
 import Avatar from './Avatar';
 import { mxcToHttp } from '@matrix-messenger/core';
-import { AccountListItemSnapshot } from '../services/accountManager';
-import type { PresenceSummary } from '../utils/presence';
+import { AccountListItemSnapshot, useAccountStore } from '../services/accountManager';
+import {
+  UNIVERSAL_QUICK_FILTER_METADATA,
+  UNIVERSAL_QUICK_FILTER_ORDER,
+  evaluateQuickFilterMembership,
+  type UniversalQuickFilterId,
+} from '../utils/chatSelectors';
+import { buildSearchIndexFromRooms, type RoomSearchResult } from '../utils/roomSearchIndex';
 
 interface RoomListProps {
   rooms: Room[];
@@ -30,6 +36,30 @@ interface RoomListProps {
   presenceSummaries?: Map<string, PresenceSummary>;
 }
 
+const quickFilterChipClass = (isActive: boolean) =>
+  `px-3 py-1.5 text-xs font-medium rounded-full transition-colors ${
+    isActive
+      ? 'bg-chip-selected text-text-inverted shadow-sm'
+      : 'bg-bg-tertiary text-text-secondary hover:text-text-primary'
+  }`;
+
+const MATCH_SOURCE_LABELS: Record<RoomSearchResult['source'], string> = {
+  name: 'Название',
+  alias: 'Алиас',
+  message: 'Сообщение',
+  account: 'Аккаунт',
+};
+
+const SUGGESTION_CATEGORY_PRIORITY: UniversalQuickFilterId[] = [
+  'mentions',
+  'secure',
+  'scheduled',
+  'hidden',
+  'pinned',
+  'unread',
+  'service',
+];
+
 const RoomList: React.FC<RoomListProps> = ({
   rooms, selectedRoomId, onSelectRoom, isLoading, onLogout, client,
   onOpenSettings, onOpenPlugins, onOpenCreateRoom, folders, activeFolderId, onSelectFolder, onManageFolders,
@@ -40,24 +70,160 @@ const RoomList: React.FC<RoomListProps> = ({
   const user = client.getUser(client.getUserId());
   const userAvatarUrl = mxcToHttp(client, user?.avatarUrl);
   const [searchQuery, setSearchQuery] = useState('');
+  const [isSearchFocused, setIsSearchFocused] = useState(false);
 
-  const filteredRoomsByFolder = (activeFolderId === 'all'
-    ? rooms
-    : rooms.filter(r => folders.find(f => f.id === activeFolderId)?.roomIds.includes(r.roomId))
+  const { activeQuickFilterId, setActiveQuickFilterId } = useAccountStore(state => ({
+    activeQuickFilterId: state.activeQuickFilterId,
+    setActiveQuickFilterId: state.setActiveQuickFilterId,
+  }));
+
+  const activeAccount = accounts.find(account => account.key === activeAccountKey) ?? null;
+  const accountBadge = activeAccount?.displayName ?? activeAccount?.userId ?? null;
+
+  const roomsByFolder = useMemo(() => {
+    if (activeFolderId === 'all') {
+      return rooms;
+    }
+    const activeFolder = folders.find(folder => folder.id === activeFolderId);
+    if (!activeFolder) {
+      return rooms;
+    }
+    const allowedIds = new Set(activeFolder.roomIds);
+    return rooms.filter(room => allowedIds.has(room.roomId));
+  }, [rooms, folders, activeFolderId]);
+
+  const quickFilterMap = useMemo(() => {
+    const map = new Map<string, ReturnType<typeof evaluateQuickFilterMembership>>();
+    rooms.forEach(room => {
+      map.set(
+        room.roomId,
+        evaluateQuickFilterMembership({
+          unreadCount: room.unreadCount,
+          isServiceRoom: room.isServiceRoom,
+          mentionCount: room.mentionCount,
+          scheduledMessageCount: room.scheduledMessageCount,
+          secureAlertCount: room.secureAlertCount,
+          isHidden: room.isHidden,
+          pinnedEvents: room.pinnedEvents,
+        }),
+      );
+    });
+    return map;
+  }, [rooms]);
+
+  const quickFilterSummaries = useMemo(() => {
+    const accumulator = UNIVERSAL_QUICK_FILTER_ORDER.reduce(
+      (acc, id) => {
+        acc[id] = { roomCount: 0, unreadCount: 0 };
+        return acc;
+      },
+      {} as Record<UniversalQuickFilterId, { roomCount: number; unreadCount: number }>,
+    );
+
+    rooms.forEach(room => {
+      const membership = quickFilterMap.get(room.roomId);
+      if (!membership) {
+        return;
+      }
+      (Object.entries(membership) as Array<[UniversalQuickFilterId, boolean]>).forEach(([id, matches]) => {
+        if (!matches) {
+          return;
+        }
+        accumulator[id].roomCount += 1;
+        accumulator[id].unreadCount += room.unreadCount ?? 0;
+      });
+    });
+
+    return UNIVERSAL_QUICK_FILTER_ORDER
+      .filter(id => id === 'all' || accumulator[id].roomCount > 0)
+      .map(id => ({
+        id,
+        roomCount: accumulator[id].roomCount,
+        unreadCount: accumulator[id].unreadCount,
+        label: UNIVERSAL_QUICK_FILTER_METADATA[id].label,
+        description: UNIVERSAL_QUICK_FILTER_METADATA[id].description,
+      }));
+  }, [rooms, quickFilterMap]);
+
+  const roomsMatchingFilter = useMemo(() => {
+    return roomsByFolder.filter(room => {
+      const membership = quickFilterMap.get(room.roomId);
+      if (!membership) {
+        return false;
+      }
+      return membership[activeQuickFilterId];
+    });
+  }, [roomsByFolder, quickFilterMap, activeQuickFilterId]);
+
+  const searchIndex = useMemo(
+    () => buildSearchIndexFromRooms(roomsMatchingFilter, accountBadge),
+    [roomsMatchingFilter, accountBadge],
   );
 
-  const filteredRooms = filteredRoomsByFolder.filter(room => 
-    room.name.toLowerCase().includes(searchQuery.toLowerCase())
-  );
+  const searchResults = useMemo(() => {
+    const trimmed = searchQuery.trim();
+    if (!trimmed) {
+      return [] as RoomSearchResult[];
+    }
+    return searchIndex.search(trimmed, 8);
+  }, [searchIndex, searchQuery]);
+
+  const roomById = useMemo(() => {
+    const map = new Map<string, Room>();
+    roomsMatchingFilter.forEach(room => {
+      map.set(room.roomId, room);
+    });
+    return map;
+  }, [roomsMatchingFilter]);
+
+  const orderedRooms = useMemo(() => {
+    const trimmed = searchQuery.trim();
+    if (!trimmed) {
+      return roomsMatchingFilter;
+    }
+    const orderMap = new Map<string, number>();
+    searchResults.forEach((result, index) => {
+      orderMap.set(result.roomId, index);
+    });
+    return roomsMatchingFilter
+      .filter(room => orderMap.has(room.roomId))
+      .sort((a, b) => (orderMap.get(a.roomId) ?? 0) - (orderMap.get(b.roomId) ?? 0));
+  }, [roomsMatchingFilter, searchResults, searchQuery]);
+
+  const suggestions = useMemo(() => {
+    if (!searchQuery.trim()) {
+      return [] as Array<{ room: Room; result: RoomSearchResult; category: UniversalQuickFilterId }>;
+    }
+    return searchResults
+      .map(result => {
+        const room = roomById.get(result.roomId);
+        if (!room) {
+          return null;
+        }
+        const membership = quickFilterMap.get(room.roomId);
+        let category: UniversalQuickFilterId = 'all';
+        if (membership) {
+          const matched = SUGGESTION_CATEGORY_PRIORITY.find(id => membership[id]);
+          if (matched) {
+            category = matched;
+          } else if (membership.unread) {
+            category = 'unread';
+          }
+        }
+        return { room, result, category };
+      })
+      .filter((entry): entry is { room: Room; result: RoomSearchResult; category: UniversalQuickFilterId } => Boolean(entry))
+      .slice(0, 5);
+  }, [searchResults, roomById, quickFilterMap, searchQuery]);
   
   const getFolderUnreadCount = (folder: Folder) => {
     return folder.roomIds.reduce((acc, roomId) => {
       const room = rooms.find(r => r.roomId === roomId);
-      return acc + (room?.unreadCount || 0);
+      return acc + (room?.unreadCount ?? 0);
     }, 0);
   };
 
-  const allChatsUnreadCount = rooms.reduce((acc, room) => acc + room.unreadCount, 0);
+  const allChatsUnreadCount = rooms.reduce((acc, room) => acc + (room.unreadCount ?? 0), 0);
 
   const FolderTab: React.FC<{id: string; name: string; unreadCount: number;}> = ({id, name, unreadCount}) => (
     <button 
@@ -129,13 +295,77 @@ const RoomList: React.FC<RoomListProps> = ({
       </div>
 
       <div className="p-2 border-b border-border-primary">
-        <input
-          type="text"
-          placeholder="Search chats..."
-          value={searchQuery}
-          onChange={e => setSearchQuery(e.target.value)}
-          className="w-full bg-bg-secondary text-text-primary px-3 py-2 rounded-md focus:outline-none focus:ring-1 focus:ring-ring-focus sm:text-sm"
-        />
+        <div className="relative">
+          <input
+            type="text"
+            placeholder="Search chats..."
+            value={searchQuery}
+            onChange={e => setSearchQuery(e.target.value)}
+            onFocus={() => setIsSearchFocused(true)}
+            onBlur={() => window.setTimeout(() => setIsSearchFocused(false), 120)}
+            className="w-full bg-bg-secondary text-text-primary px-3 py-2 pr-9 rounded-md focus:outline-none focus:ring-1 focus:ring-ring-focus sm:text-sm"
+          />
+          {searchQuery && (
+            <button
+              type="button"
+              onMouseDown={event => {
+                event.preventDefault();
+                setSearchQuery('');
+              }}
+              className="absolute right-2 top-1/2 -translate-y-1/2 text-text-secondary hover:text-text-primary"
+              aria-label="Очистить поиск"
+            >
+              ×
+            </button>
+          )}
+          {isSearchFocused && suggestions.length > 0 && (
+            <ul className="absolute z-20 mt-1 max-h-56 w-full overflow-auto rounded-md border border-border-secondary bg-bg-primary shadow-lg">
+              {suggestions.map(({ room, result, category }) => (
+                <li key={`${room.roomId}-${result.source}`} className="border-b border-border-tertiary last:border-none">
+                  <button
+                    type="button"
+                    onMouseDown={event => {
+                      event.preventDefault();
+                      setSearchQuery('');
+                      setIsSearchFocused(false);
+                      onSelectRoom(room.roomId);
+                    }}
+                    className="flex w-full flex-col gap-1 px-3 py-2 text-left hover:bg-bg-tertiary"
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-sm font-semibold text-text-primary truncate">{room.name}</span>
+                      <span className="text-[11px] uppercase tracking-wide text-text-secondary">
+                        {UNIVERSAL_QUICK_FILTER_METADATA[category].label}
+                      </span>
+                    </div>
+                    <span className="text-[11px] text-text-secondary">
+                      Совпадение: {MATCH_SOURCE_LABELS[result.source]}
+                    </span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      </div>
+
+      <div className="px-2 py-2 border-b border-border-primary">
+        <div className="flex flex-wrap gap-2">
+          {quickFilterSummaries.map(summary => (
+            <button
+              key={summary.id}
+              type="button"
+              onClick={() => setActiveQuickFilterId(summary.id)}
+              className={quickFilterChipClass(activeQuickFilterId === summary.id)}
+              title={summary.description ?? summary.label}
+            >
+              <span>{summary.label}</span>
+              <span className="ml-2 inline-flex min-w-[1.5rem] items-center justify-center rounded-full bg-bg-secondary px-1.5 text-[11px] font-semibold">
+                {summary.id === 'all' ? summary.roomCount : summary.unreadCount || summary.roomCount}
+              </span>
+            </button>
+          ))}
+        </div>
       </div>
 
       {!isHiddenUnlocked && hiddenRoomIds.length > 0 && (
@@ -152,7 +382,7 @@ const RoomList: React.FC<RoomListProps> = ({
           <div className="p-4 text-text-secondary">Loading rooms...</div>
         ) : (
           <ul>
-            {filteredRooms.map(room => (
+            {orderedRooms.map(room => (
               <RoomListItem
                 key={room.roomId}
                 room={room}
