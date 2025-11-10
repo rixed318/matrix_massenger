@@ -1,4 +1,5 @@
 import type { MatrixClient as RealMatrixClient, MatrixEvent as RealMatrixEvent, Room as RealRoom, User as RealUser, MatrixCall as RealMatrixCall } from 'matrix-js-sdk';
+import type { MessageTranscript } from './services/transcriptionService';
 
 export type MatrixClient = RealMatrixClient;
 export type MatrixEvent = RealMatrixEvent;
@@ -154,6 +155,7 @@ export interface Message {
     ttlMs?: number;
   } | null;
   localThumbnailUrl?: string;
+  transcript?: MessageTranscript | null;
 }
 
 export interface ActiveThread {

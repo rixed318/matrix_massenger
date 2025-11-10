@@ -4,6 +4,7 @@ export * from '../../../src/services/matrixService';
 export * from '../../../src/services/e2eeService';
 export * from '../../../src/services/matrixService_appendix';
 export * from '../../../src/services/mediaIndexService';
+export * from '../../../src/services/transcriptionService';
 export * from '../../../src/services/schedulerService';
 export * from '../../../src/services/secureCloudService';
 export * from '../../../src/services/animatedReactions';

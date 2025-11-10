@@ -1,6 +1,7 @@
 import { MatrixClient, MatrixEvent, Message, Reaction, Poll, PollResult, ReplyInfo, LinkPreviewData } from '../types';
 import { EventType, RelationType } from 'matrix-js-sdk';
 import { mxcToHttp } from '../services/matrixService';
+import { pickLatestTranscript } from '../services/transcriptionService';
 
 export function parseMatrixEvent(client: MatrixClient, event: MatrixEvent): Message {
     const sender = event.sender;
@@ -142,6 +143,13 @@ export function parseMatrixEvent(client: MatrixClient, event: MatrixEvent): Mess
         }
     }
 
+    let transcript = null;
+    const eventId = event.getId();
+    if (eventId && room) {
+        const related = (room as any).getRelatedEventsForEvent?.(eventId, RelationType.Annotation, EventType.RoomMessage) as MatrixEvent[] | undefined;
+        transcript = pickLatestTranscript(related);
+    }
+
     return {
         id: event.getId()!,
         sender: {
@@ -169,5 +177,6 @@ export function parseMatrixEvent(client: MatrixClient, event: MatrixEvent): Mess
         isSticker,
         isGif,
         selfDestruct,
+        transcript: transcript ?? undefined,
     };
 }

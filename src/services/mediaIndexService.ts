@@ -5,6 +5,7 @@ import type { EventTimeline } from "matrix-js-sdk/src/models/event-timeline";
 import type { MatrixClient } from "matrix-js-sdk/src/client";
 import { RelationType, EventType } from "matrix-js-sdk";
 import * as matrixService from "./matrixService";
+import type { MessageTranscript } from "./transcriptionService";
 import {
   getSmartCollections as loadSmartCollections,
   loadRoomIndex as loadRoomFromStore,
@@ -117,6 +118,11 @@ function isFile(m: IContent) {
 
 const URL_REGEX = /\bhttps?:\/\/[^\s<>"'`]+/gi;
 
+type TranscriptStatus = "pending" | "completed" | "error";
+
+const TRANSCRIPT_RELATION_KEY = "econix.transcript";
+const TRANSCRIPT_EVENT_FIELD = "econix.transcript";
+
 function extractLinks(body?: string): string[] {
   if (!body) return [];
   const matches = body.match(URL_REGEX);
@@ -133,6 +139,8 @@ function extractLinks(body?: string): string[] {
 
 function intoItems(roomId: string, ev: MatrixEvent): MediaItem[] {
   const m = ev.getContent() as IContent;
+  const relationKey = ev.getRelation?.()?.key;
+  if (relationKey === TRANSCRIPT_RELATION_KEY) return [];
   const items: MediaItem[] = [];
   const ts = ev.getTs();
   const sender = ev.getSender() || "";
@@ -240,19 +248,66 @@ function collectReactions(room: Room | null | undefined, ev: MatrixEvent): strin
   return Array.from(keys);
 }
 
+function collectTranscript(room: Room | null | undefined, ev: MatrixEvent): MessageTranscript | null {
+  if (!room) return null;
+  const id = ev.getId();
+  if (!id) return null;
+  const related = (room as any).getRelatedEventsForEvent?.(id, RelationType.Annotation, EventType.RoomMessage) as MatrixEvent[] | undefined;
+  if (!related || !related.length) return null;
+  let latest: MatrixEvent | null = null;
+  for (const candidate of related) {
+    const relation = candidate.getRelation?.();
+    if (relation?.key !== TRANSCRIPT_RELATION_KEY) continue;
+    if (candidate.isRedacted?.()) continue;
+    if (!latest) {
+      latest = candidate;
+      continue;
+    }
+    const tsA = candidate.getTs?.() ?? 0;
+    const tsB = latest.getTs?.() ?? 0;
+    if (tsA >= tsB) {
+      latest = candidate;
+    }
+  }
+  if (!latest) return null;
+  const content: any = latest.getContent?.() ?? {};
+  const meta: any = content?.[TRANSCRIPT_EVENT_FIELD] ?? {};
+  const statusRaw = typeof meta.status === "string" ? meta.status : undefined;
+  const status: TranscriptStatus = statusRaw === "pending" || statusRaw === "error" || statusRaw === "completed" ? statusRaw : "completed";
+  const text = typeof meta.text === "string" ? meta.text : (typeof content.body === "string" ? content.body : undefined);
+  return {
+    status,
+    text: status === "completed" ? text : undefined,
+    language: typeof meta.language === "string" ? meta.language : undefined,
+    updatedAt: typeof meta.updatedAt === "number" ? meta.updatedAt : latest.getTs?.(),
+    error: typeof meta.error === "string" ? meta.error : undefined,
+    attempts: typeof meta.attempts === "number" ? meta.attempts : undefined,
+    eventId: latest.getId?.() ?? undefined,
+    durationMs: typeof meta.durationMs === "number" ? meta.durationMs : undefined,
+  };
+}
+
 function intoMetadata(roomId: string, ev: MatrixEvent, mediaItems: MediaItem[], room: Room | null): IndexedMessageMetadata | null {
   const id = ev.getId();
   if (!id) return null;
   const sender = ev.getSender() || "";
   const timestamp = ev.getTs();
   const content = ev.getContent() as IContent;
+  const relationKey = ev.getRelation?.()?.key;
+  if (relationKey === TRANSCRIPT_RELATION_KEY) return null;
   const body = typeof content?.body === "string" ? content.body : undefined;
-  const tokens = Array.from(new Set([...tokenize(body), sender.toLowerCase()]));
+  let tokens = Array.from(new Set([...tokenize(body), sender.toLowerCase()]));
   const tags = extractTags(content);
   const reactions = collectReactions(room, ev);
   const mediaTypes = mediaItems.map(item => item.type);
   const hasMedia = mediaTypes.length > 0;
-  if (!body && !tokens.length && !tags.length && !reactions.length) return null;
+  const transcript = collectTranscript(room, ev);
+  let transcriptTokens: string[] = [];
+  if (transcript?.status === "completed" && transcript.text) {
+    transcriptTokens = tokenize(transcript.text);
+    tokens = Array.from(new Set([...tokens.filter(token => !transcriptTokens.includes(token)), ...transcriptTokens, sender.toLowerCase()]));
+  }
+  if (!body && !tokens.length && !tags.length && !reactions.length && !transcriptTokens.length) return null;
   return {
     eventId: id,
     roomId,
@@ -264,6 +319,13 @@ function intoMetadata(roomId: string, ev: MatrixEvent, mediaItems: MediaItem[], 
     reactions,
     hasMedia,
     mediaTypes,
+    transcriptText: transcript?.text,
+    transcriptStatus: transcript?.status,
+    transcriptLanguage: transcript?.language,
+    transcriptTokens,
+    transcriptUpdatedAt: transcript?.updatedAt,
+    transcriptError: transcript?.error,
+    transcriptDurationMs: transcript?.durationMs,
   };
 }
 
@@ -355,6 +417,30 @@ function dedupeMessages(items: IndexedMessageMetadata[]): IndexedMessageMetadata
     }
   }
   return out;
+}
+
+export function applyTranscriptUpdate(roomId: string, eventId: string, transcript: MessageTranscript): void {
+  const idx = load(roomId);
+  const target = idx.messages.find(m => m.eventId === eventId);
+  if (!target) return;
+  const previousTranscriptTokens = target.transcriptTokens ?? [];
+  const baseTokens = target.tokens.filter(token => !previousTranscriptTokens.includes(token));
+  let newTokens: string[] = [];
+  if (transcript.status === "completed" && transcript.text) {
+    newTokens = tokenize(transcript.text);
+  }
+  target.tokens = Array.from(new Set([...baseTokens, ...newTokens]));
+  target.transcriptTokens = newTokens;
+  target.transcriptText = transcript.text;
+  target.transcriptStatus = transcript.status;
+  target.transcriptLanguage = transcript.language;
+  target.transcriptUpdatedAt = transcript.updatedAt ?? Date.now();
+  target.transcriptError = transcript.error;
+  target.transcriptDurationMs = transcript.durationMs;
+  idx.messages = dedupeMessages(idx.messages).sort((a, b) => a.timestamp - b.timestamp);
+  inMemory.set(roomId, idx);
+  persist(roomId);
+  void upsertIndexEntries(roomId, [target], []);
 }
 
 export function startLiveIndexing(roomId: string) {

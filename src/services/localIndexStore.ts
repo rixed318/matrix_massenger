@@ -16,6 +16,13 @@ export interface IndexedMessageRecord {
   reactions: string[];
   hasMedia: boolean;
   mediaTypes: string[];
+  transcriptText?: string;
+  transcriptStatus?: string;
+  transcriptLanguage?: string;
+  transcriptTokens?: string[];
+  transcriptUpdatedAt?: number;
+  transcriptError?: string;
+  transcriptDurationMs?: number;
 }
 
 export interface PersistedRoomIndex {
@@ -180,9 +187,9 @@ function matchesQuery(record: IndexedMessageRecord, query: LocalSearchQuery, men
   if (mentionTarget && !record.tokens.some(token => token.includes(mentionTarget))) return false;
   if (query.term && query.term.trim()) {
     const needle = query.term.trim().toLowerCase();
-    const haystack = [record.body ?? "", record.sender, record.tags.join(" "), record.reactions.join(" ")]
-      .join(" ")
-      .toLowerCase();
+  const haystack = [record.body ?? "", record.sender, record.tags.join(" "), record.reactions.join(" "), record.transcriptText ?? ""]
+    .join(" ")
+    .toLowerCase();
     if (!haystack.includes(needle)) {
       const tokens = record.tokens.join(" ");
       if (!tokens.includes(needle)) return false;
