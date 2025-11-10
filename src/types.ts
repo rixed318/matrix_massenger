@@ -190,16 +190,61 @@ export interface ScheduledMessage {
   nextRetryAt?: number;
 }
 
+export interface StickerInfo {
+    w?: number;
+    h?: number;
+    mimetype?: string;
+    size?: number;
+    duration?: number;
+    thumbnail_url?: string;
+    file?: Record<string, any>;
+}
+
 export interface Sticker {
     id: string;
     url: string;
     body: string;
-    info: {
-        w: number;
-        h: number;
-        mimetype: 'image/svg+xml' | 'image/png' | 'image/webp';
-        size: number;
-    }
+    info?: StickerInfo;
+    /**
+     * Optional list of emoji unicode values suggested when using this asset as a custom emoji.
+     */
+    emoji?: string[];
+    /**
+     * Shortcodes or aliases that can be used to trigger this sticker/emoji.
+     */
+    shortcodes?: string[];
+    /** Identifier of the pack this sticker belongs to. */
+    packId?: string;
+    /**
+     * Indicates whether the sticker should behave like an emoji (inline) rather than an attachment.
+     */
+    isCustomEmoji?: boolean;
+}
+
+export type CustomEmoji = Sticker;
+
+export type StickerPackSource = 'local' | 'account_data' | 'room' | 'user';
+
+export interface StickerPack {
+    /** Unique identifier for the sticker pack (includes source prefix). */
+    id: string;
+    name: string;
+    description?: string;
+    avatarUrl?: string | null;
+    attribution?: string;
+    isEmojiPack?: boolean;
+    source: StickerPackSource;
+    roomId?: string;
+    creatorUserId?: string;
+    stickers: Sticker[];
+    isEnabled?: boolean;
+    lastUpdated?: number;
+}
+
+export interface StickerLibraryState {
+    packs: StickerPack[];
+    favorites: string[];
+    enabledPackIds: string[];
 }
 
 export interface Gif {

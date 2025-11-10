@@ -2001,8 +2001,15 @@ const handleSpotlightParticipant = useCallback((participantId: string) => {
     
     const handleSendSticker = async (sticker: Sticker) => {
         if (!selectedRoomId) return;
+        if (sticker.isCustomEmoji) {
+            const shortcode = sticker.shortcodes?.[0] ?? sticker.body;
+            if (shortcode) {
+                await handleSendMessage({ body: shortcode });
+            }
+            return;
+        }
         try {
-            await sendStickerMessage(client, selectedRoomId, sticker.url, sticker.body, sticker.info);
+            await sendStickerMessage(client, selectedRoomId, sticker.url, sticker.body, sticker.info ?? {});
         } catch (error) {
             console.error('Failed to send sticker:', error);
         }
