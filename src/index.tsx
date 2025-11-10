@@ -16,7 +16,7 @@ root.render(
 );
 
 if ('serviceWorker' in navigator) {
-  const swUrl = new URL('./offline/serviceWorker.ts', import.meta.url);
+  const swUrl = new URL('./pwa/service-worker.ts', import.meta.url);
   const registerServiceWorker = async () => {
     try {
       const registration = await navigator.serviceWorker.register(swUrl, { type: 'module' });

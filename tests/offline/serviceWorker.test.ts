@@ -165,3 +165,92 @@ describe('offline service worker media cache', () => {
     expect(await response.text()).toBe('cached-body');
   });
 });
+
+describe('pwa service worker integration', () => {
+  const globalAny = globalThis as any;
+  let listeners: Record<string, Array<(event: any) => void>>;
+  let staticCache: ReturnType<typeof createFakeCache>;
+  let runtimeCache: ReturnType<typeof createFakeCache>;
+  let clients: { postMessage: ReturnType<typeof vi.fn> }[];
+
+  const getLastListener = (type: string) => listeners[type]?.[listeners[type].length - 1];
+
+  beforeEach(async () => {
+    vi.resetModules();
+    listeners = { install: [], activate: [], fetch: [], message: [], sync: [] };
+    staticCache = createFakeCache();
+    runtimeCache = createFakeCache();
+    clients = [{ postMessage: vi.fn() }];
+
+    globalAny.fetch = vi.fn(async () => new Response('network', { status: 200 }));
+    globalAny.caches = {
+      open: vi.fn(async (name: string) => {
+        if (name === 'econix-static-v1') return staticCache.cache;
+        if (name === 'econix-runtime-v1') return runtimeCache.cache;
+        return createFakeCache().cache;
+      }),
+      keys: vi.fn(async () => []),
+      delete: vi.fn(async () => true),
+    } satisfies Partial<CacheStorage>;
+
+    globalAny.self = {
+      addEventListener: vi.fn((type: string, handler: (event: any) => void) => {
+        (listeners[type] ??= []).push(handler);
+      }),
+      skipWaiting: vi.fn(),
+      clients: {
+        matchAll: vi.fn().mockResolvedValue(clients),
+        claim: vi.fn().mockResolvedValue(undefined),
+      },
+      registration: {
+        sync: { register: vi.fn().mockResolvedValue(undefined) },
+      },
+      location: { origin: 'https://app.example' },
+    } as any;
+
+    await import('../../src/pwa/service-worker');
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    delete globalAny.self;
+    delete globalAny.caches;
+    delete globalAny.fetch;
+  });
+
+  it('pre-caches core assets on install', async () => {
+    const install = getLastListener('install');
+    expect(install).toBeTruthy();
+    const waitUntil = vi.fn(async (promise: Promise<any>) => promise);
+    await install?.({ waitUntil });
+    expect(globalAny.caches.open).toHaveBeenCalledWith('econix-static-v1');
+    expect(staticCache.cache.addAll).toHaveBeenCalledWith(expect.arrayContaining(['/']));
+    expect(globalAny.self.skipWaiting).toHaveBeenCalled();
+  });
+
+  it('serves cached static assets with background revalidation', async () => {
+    const request = new Request('https://app.example/assets/app.js');
+    await runtimeCache.cache.put(request, new Response('cached', { status: 200 }));
+    const fetchListener = getLastListener('fetch');
+    expect(fetchListener).toBeTruthy();
+    const respondWith = vi.fn(async (value: any) => value);
+    await fetchListener?.({ request, respondWith });
+    const served = await respondWith.mock.calls[0][0];
+    expect(await served.text()).toBe('cached');
+    expect(globalAny.fetch).toHaveBeenCalledWith(request);
+  });
+
+  it('registers background sync when outbox is pending and notifies clients on sync', async () => {
+    const messageListener = getLastListener('message');
+    const syncListener = getLastListener('sync');
+    expect(messageListener).toBeTruthy();
+    expect(syncListener).toBeTruthy();
+
+    const waitUntil = vi.fn(async (promise: Promise<any>) => promise);
+    await messageListener?.({ data: { type: 'OUTBOX_PENDING' }, waitUntil });
+    expect(globalAny.self.registration.sync.register).toHaveBeenCalledWith('matrix-outbox-flush');
+
+    await syncListener?.({ tag: 'matrix-outbox-flush', waitUntil });
+    expect(clients[0].postMessage).toHaveBeenCalledWith({ type: 'OUTBOX_FLUSH' });
+  });
+});
