@@ -41,6 +41,7 @@ vi.mock('../../src/services/accountManager', () => ({
     accounts: {},
     activeKey: null,
     removeAccount: vi.fn(),
+    activeCalls: {},
   }),
 }));
 
