@@ -9,6 +9,9 @@ export interface TranscriptionSettings {
   enabled?: boolean;
   language?: string;
   maxDurationSec?: number;
+  provider?: 'disabled' | 'local' | 'cloud';
+  privacy?: 'local' | 'cloud';
+  targetLanguage?: string;
 }
 
 export interface RuntimeTranscriptionConfig {
@@ -20,6 +23,9 @@ export interface RuntimeTranscriptionConfig {
   defaultLanguage?: string;
   maxDurationSec?: number;
   retryLimit: number;
+  liveChunkDurationMs?: number;
+  defaultTargetLanguage?: string;
+  privacy?: 'local' | 'cloud';
 }
 
 export interface MessageTranscript {
@@ -31,6 +37,50 @@ export interface MessageTranscript {
   attempts?: number;
   eventId?: string;
   durationMs?: number;
+}
+
+export interface LiveTranscriptChunk {
+  callId: string;
+  chunkId: string;
+  text: string;
+  language?: string;
+  timestamp: number;
+  final: boolean;
+  source: 'local' | 'remote';
+  translatedText?: string;
+  targetLanguage?: string;
+}
+
+export interface LiveTranscriptionSession {
+  callId: string;
+  stream: MediaStream;
+  language?: string;
+  lastSequence: number;
+  recorder: MediaRecorder | null;
+  listeners: Set<(chunk: LiveTranscriptChunk) => void>;
+  pendingBlobs: Blob[];
+  active: boolean;
+}
+
+export interface LiveTranscriptionOptions {
+  language?: string;
+  callId: string;
+  chunkDurationMs?: number;
+}
+
+export interface CaptionTranslationContext {
+  callId: string;
+  text: string;
+  sourceLanguage?: string;
+  targetLanguage: string;
+  signal?: AbortSignal;
+}
+
+export type CaptionTranslationProvider = (context: CaptionTranslationContext) => Promise<string | null | undefined>;
+
+export interface TranslateCaptionOptions {
+  providerPreference?: 'local' | 'cloud';
+  signal?: AbortSignal;
 }
 
 const env = (typeof import.meta !== 'undefined' ? (import.meta as any).env : undefined) || (typeof process !== 'undefined' ? process.env : {});
@@ -59,6 +109,11 @@ let runtimeConfig: RuntimeTranscriptionConfig = {
   defaultLanguage: (env?.VITE_TRANSCRIPTION_LANGUAGE ?? env?.TRANSCRIPTION_LANGUAGE) as string | undefined,
   maxDurationSec: toNumber(env?.VITE_TRANSCRIPTION_MAX_DURATION ?? env?.TRANSCRIPTION_MAX_DURATION),
   retryLimit: Math.max(1, Math.min(5, Number.parseInt((env?.VITE_TRANSCRIPTION_RETRY_LIMIT ?? env?.TRANSCRIPTION_RETRY_LIMIT) as string, 10) || 3)),
+  liveChunkDurationMs: toNumber(env?.VITE_TRANSCRIPTION_LIVE_CHUNK_MS ?? env?.TRANSCRIPTION_LIVE_CHUNK_MS) ?? 5000,
+  defaultTargetLanguage: (env?.VITE_TRANSCRIPTION_TARGET_LANGUAGE ?? env?.TRANSCRIPTION_TARGET_LANGUAGE) as string | undefined,
+  privacy: ((env?.VITE_TRANSCRIPTION_PRIVACY ?? env?.TRANSCRIPTION_PRIVACY) as string | undefined)?.toLowerCase() === 'cloud'
+    ? 'cloud'
+    : 'local',
 };
 
 if (!['disabled', 'local', 'cloud'].includes(runtimeConfig.provider)) {
@@ -90,6 +145,21 @@ const jobs: InternalJob[] = [];
 const jobsByLocal = new Map<string, InternalJob>();
 const jobsByEvent = new Map<string, InternalJob>();
 let processing = false;
+
+const liveSessions = new Map<string, LiveTranscriptionSession>();
+const liveListeners = new Map<string, Set<(chunk: LiveTranscriptChunk) => void>>();
+interface LiveChunkHistory {
+  order: string[];
+  entries: Map<string, LiveTranscriptChunk>;
+}
+const liveChunkHistory = new Map<string, LiveChunkHistory>();
+const LIVE_CHUNK_HISTORY_LIMIT = 200;
+const translationCaches = new Map<string, Map<string, { value: string; updatedAt: number }>>();
+
+const translationProviders: Record<'local' | 'cloud', CaptionTranslationProvider | null> = {
+  local: null,
+  cloud: null,
+};
 
 const delay = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 
@@ -130,6 +200,83 @@ const effectiveRetryLimit = (): number => {
 };
 
 const computeRetryDelay = (attempt: number) => Math.min(RETRY_MAX_DELAY, RETRY_BASE_DELAY * Math.max(1, attempt));
+
+const getLiveListeners = (callId: string) => {
+  let listeners = liveListeners.get(callId);
+  if (!listeners) {
+    listeners = new Set();
+    liveListeners.set(callId, listeners);
+  }
+  return listeners;
+};
+
+const getLiveChunkHistory = (callId: string): LiveChunkHistory => {
+  let history = liveChunkHistory.get(callId);
+  if (!history) {
+    history = { order: [], entries: new Map() };
+    liveChunkHistory.set(callId, history);
+  }
+  return history;
+};
+
+const storeLiveChunk = (chunk: LiveTranscriptChunk): LiveTranscriptChunk => {
+  const history = getLiveChunkHistory(chunk.callId);
+  const stored: LiveTranscriptChunk = { ...chunk };
+  if (!history.entries.has(stored.chunkId)) {
+    history.order.push(stored.chunkId);
+  }
+  history.entries.set(stored.chunkId, stored);
+  while (history.order.length > LIVE_CHUNK_HISTORY_LIMIT) {
+    const expired = history.order.shift();
+    if (expired) {
+      history.entries.delete(expired);
+    }
+  }
+  return stored;
+};
+
+const dispatchLiveChunk = (chunk: LiveTranscriptChunk) => {
+  const stored = storeLiveChunk(chunk);
+  const listeners = liveListeners.get(chunk.callId);
+  if (!listeners || listeners.size === 0) return;
+  listeners.forEach(listener => {
+    try {
+      listener({ ...stored });
+    } catch (error) {
+      console.warn('Live transcription listener failed', error);
+    }
+  });
+};
+
+const normalizeLanguage = (value?: string) => {
+  if (!value || typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  return trimmed.toLowerCase();
+};
+
+const captionCacheKey = (text: string, targetLanguage: string, sourceLanguage?: string) =>
+  `${normalizeLanguage(sourceLanguage) || 'auto'}:${normalizeLanguage(targetLanguage) || 'auto'}:${text}`;
+
+const getTranslationCache = (callId: string) => {
+  let cache = translationCaches.get(callId);
+  if (!cache) {
+    cache = new Map();
+    translationCaches.set(callId, cache);
+  }
+  return cache;
+};
+
+const pruneTranslationCache = (callId: string, limit = 200) => {
+  const cache = translationCaches.get(callId);
+  if (!cache || cache.size <= limit) return;
+  const sorted = Array.from(cache.entries()).sort((a, b) => a[1].updatedAt - b[1].updatedAt);
+  while (sorted.length > limit) {
+    const entry = sorted.shift();
+    if (!entry) break;
+    cache.delete(entry[0]);
+  }
+};
 
 const ensurePendingEvent = async (job: InternalJob) => {
   if (!job.eventId || job.sentPending) return;
@@ -251,17 +398,26 @@ const resolveEventContent = async (job: InternalJob): Promise<{ blob: Blob; mime
   return null;
 };
 
-const performTranscription = async (job: InternalJob, blob: Blob): Promise<string> => {
+const buildFormData = (blob: Blob, job?: InternalJob, language?: string) => {
+  const form = new FormData();
+  const fileName = job?.msgType === MsgType.Video
+    ? 'video-message.webm'
+    : job?.msgType === MsgType.Audio
+      ? 'audio-message.ogg'
+      : 'audio-stream.webm';
+  form.append('file', blob, fileName);
+  const lang = normalizeLanguage(language ?? (job ? effectiveLanguage(job) : runtimeConfig.defaultLanguage));
+  if (lang) form.append('language', lang);
+  if (runtimeConfig.model) form.append('model', runtimeConfig.model);
+  form.append('response_format', 'json');
+  return form;
+};
+
+const performBlobTranscription = async (blob: Blob, job?: InternalJob, language?: string): Promise<string> => {
   if (!runtimeConfig.endpoint) {
     throw new Error('Transcription endpoint is not configured');
   }
-  const form = new FormData();
-  const fileName = job.msgType === MsgType.Audio ? 'audio-message.ogg' : 'video-message.webm';
-  form.append('file', blob, fileName);
-  const language = effectiveLanguage(job);
-  if (language) form.append('language', language);
-  if (runtimeConfig.model) form.append('model', runtimeConfig.model);
-  form.append('response_format', 'json');
+  const form = buildFormData(blob, job, language);
 
   const headers: Record<string, string> = {};
   if (runtimeConfig.apiKey) {
@@ -288,6 +444,13 @@ const performTranscription = async (job: InternalJob, blob: Blob): Promise<strin
     throw new Error('Transcription response did not include text');
   }
   return text;
+};
+
+const performTranscription = async (job: InternalJob, blob: Blob): Promise<string> => {
+  if (!runtimeConfig.endpoint) {
+    throw new Error('Transcription endpoint is not configured');
+  }
+  return performBlobTranscription(blob, job, effectiveLanguage(job));
 };
 
 const runJob = async (job: InternalJob) => {
@@ -434,6 +597,71 @@ export const updateRuntimeTranscriptionConfig = (config: Partial<RuntimeTranscri
 
 export const getTranscriptionRuntimeConfig = (): RuntimeTranscriptionConfig => ({ ...runtimeConfig });
 
+export const registerCaptionTranslationProvider = (
+  type: 'local' | 'cloud',
+  provider: CaptionTranslationProvider | null,
+) => {
+  translationProviders[type] = provider ?? null;
+};
+
+const resolveTranslationProvider = (preferred?: 'local' | 'cloud'): CaptionTranslationProvider | null => {
+  if (preferred && translationProviders[preferred]) {
+    return translationProviders[preferred];
+  }
+  if (runtimeConfig.provider !== 'disabled') {
+    const candidate = translationProviders[runtimeConfig.provider];
+    if (candidate) return candidate;
+  }
+  return translationProviders.cloud ?? translationProviders.local ?? null;
+};
+
+export const translateCaption = async (
+  callId: string,
+  text: string,
+  targetLanguage: string,
+  sourceLanguage?: string,
+  options?: TranslateCaptionOptions,
+): Promise<string | null> => {
+  const normalizedTarget = normalizeLanguage(targetLanguage);
+  const normalizedSource = normalizeLanguage(sourceLanguage);
+  if (!callId || !text || !normalizedTarget) return null;
+  const key = captionCacheKey(text, normalizedTarget, normalizedSource);
+  const cache = getTranslationCache(callId);
+  const cached = cache.get(key);
+  if (cached) {
+    return cached.value;
+  }
+  const provider = resolveTranslationProvider(options?.providerPreference);
+  if (!provider) {
+    return null;
+  }
+  try {
+    const result = await provider({
+      callId,
+      text,
+      sourceLanguage: normalizedSource,
+      targetLanguage: normalizedTarget,
+      signal: options?.signal,
+    });
+    if (typeof result === 'string' && result.trim().length) {
+      cache.set(key, { value: result, updatedAt: Date.now() });
+      pruneTranslationCache(callId);
+      return result;
+    }
+  } catch (error) {
+    console.warn('Caption translation provider failed', error);
+  }
+  return null;
+};
+
+export const clearCaptionTranslationCache = (callId?: string) => {
+  if (callId) {
+    translationCaches.delete(callId);
+    return;
+  }
+  translationCaches.clear();
+};
+
 export const pickLatestTranscript = (relations: MatrixEvent[] | undefined): MessageTranscript | null => {
   if (!relations || !relations.length) return null;
   const relevant = relations.filter(ev => {
@@ -470,10 +698,174 @@ export const __resetTranscriptionQueueForTests = () => {
   jobsByLocal.clear();
   jobsByEvent.clear();
   processing = false;
+  liveSessions.forEach(session => {
+    try {
+      session.recorder?.stop();
+    } catch (_) {
+      /* noop */
+    }
+  });
+  liveSessions.clear();
+  liveListeners.clear();
+  liveChunkHistory.clear();
+  translationCaches.clear();
 };
 
 export const __waitForTranscriptionIdle = async () => {
   while (processing || jobs.some(job => job.status !== 'idle')) {
     await delay(5);
   }
+};
+
+const handleLiveBlob = (session: LiveTranscriptionSession, blob: Blob) => {
+  if (!session.active || !blob || blob.size === 0) return;
+  const sequence = session.lastSequence + 1;
+  session.lastSequence = sequence;
+  const chunkId = `${session.callId}:${sequence}`;
+  const timestamp = Date.now();
+  const base: LiveTranscriptChunk = {
+    callId: session.callId,
+    chunkId,
+    text: '',
+    language: session.language,
+    timestamp,
+    final: false,
+    source: 'local',
+  };
+  dispatchLiveChunk(base);
+  session.pendingBlobs.push(blob);
+  void performBlobTranscription(blob, undefined, session.language)
+    .then(text => {
+      const chunk: LiveTranscriptChunk = {
+        ...base,
+        text,
+        final: true,
+      };
+      dispatchLiveChunk(chunk);
+    })
+    .catch(error => {
+      const chunk: LiveTranscriptChunk = {
+        ...base,
+        text: `[transcription error] ${(error instanceof Error ? error.message : String(error))}`,
+        final: true,
+      };
+      dispatchLiveChunk(chunk);
+    });
+};
+
+const stopLiveRecorder = (session: LiveTranscriptionSession) => {
+  try {
+    session.recorder?.stop();
+  } catch (error) {
+    console.warn('Failed to stop live transcription recorder', error);
+  }
+  session.recorder = null;
+  session.active = false;
+};
+
+export const startLiveTranscriptionSession = (
+  stream: MediaStream,
+  options: LiveTranscriptionOptions,
+): LiveTranscriptionSession | null => {
+  if (!stream) {
+    return null;
+  }
+  const callId = options.callId;
+  if (!callId) {
+    throw new Error('callId is required for live transcription');
+  }
+  if (!runtimeEnabled()) {
+    console.warn('Live transcription is disabled by runtime configuration');
+    return null;
+  }
+  const existing = liveSessions.get(callId);
+  if (existing) {
+    return existing;
+  }
+  if (typeof MediaRecorder === 'undefined') {
+    console.warn('MediaRecorder API is not available for live transcription');
+    return null;
+  }
+  const session: LiveTranscriptionSession = {
+    callId,
+    stream,
+    language: normalizeLanguage(options.language ?? runtimeConfig.defaultLanguage),
+    lastSequence: 0,
+    recorder: null,
+    listeners: getLiveListeners(callId),
+    pendingBlobs: [],
+    active: false,
+  };
+  try {
+    const recorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+    recorder.ondataavailable = event => {
+      const data = event.data as Blob;
+      handleLiveBlob(session, data);
+    };
+    recorder.onerror = event => {
+      console.warn('Live transcription recorder error', event);
+      stopLiveRecorder(session);
+    };
+    const chunkDuration = Math.max(1000, options.chunkDurationMs ?? runtimeConfig.liveChunkDurationMs ?? 5000);
+    recorder.start(chunkDuration);
+    session.recorder = recorder;
+    session.active = true;
+  } catch (error) {
+    console.warn('Failed to start live transcription', error);
+    return null;
+  }
+  liveSessions.set(callId, session);
+  return session;
+};
+
+export const stopLiveTranscriptionSession = (callId: string) => {
+  const session = liveSessions.get(callId);
+  if (!session) return;
+  stopLiveRecorder(session);
+  liveSessions.delete(callId);
+  liveListeners.delete(callId);
+  liveChunkHistory.delete(callId);
+  translationCaches.delete(callId);
+};
+
+export const subscribeLiveTranscription = (
+  callId: string,
+  listener: (chunk: LiveTranscriptChunk) => void,
+): (() => void) => {
+  if (!callId || !listener) {
+    return () => undefined;
+  }
+  const listeners = getLiveListeners(callId);
+  listeners.add(listener);
+  const history = liveChunkHistory.get(callId);
+  if (history) {
+    history.order.forEach(chunkId => {
+      const stored = history.entries.get(chunkId);
+      if (stored) {
+        try {
+          listener({ ...stored });
+        } catch (error) {
+          console.warn('Live transcription history listener failed', error);
+        }
+      }
+    });
+  }
+  return () => {
+    const target = liveListeners.get(callId);
+    target?.delete(listener);
+  };
+};
+
+export const emitRemoteLiveTranscriptionChunk = (chunk: LiveTranscriptChunk) => {
+  if (!chunk?.callId || !chunk.chunkId) {
+    return;
+  }
+  dispatchLiveChunk({
+    ...chunk,
+    source: chunk.source ?? 'remote',
+  });
+};
+
+export const getLiveTranscriptionSession = (callId: string): LiveTranscriptionSession | null => {
+  return liveSessions.get(callId) ?? null;
 };

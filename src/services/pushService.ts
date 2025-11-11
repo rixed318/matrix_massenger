@@ -53,20 +53,18 @@ const postToServiceWorker = (type: string, payload: Record<string, unknown>) => 
   }
 };
 
-let travelModeState: { enabled: boolean; hiddenRooms: Set<string> } = {
-  enabled: false,
-  hiddenRooms: new Set(),
-};
+export interface CallTranscriptNotification {
+  callId: string;
+  roomId: string;
+  text: string;
+  language?: string;
+  targetLanguage?: string;
+  timestamp: number;
+  sender: string;
+}
 
-export const setTravelModePushState = (enabled: boolean, roomIds: string[]): void => {
-  travelModeState = {
-    enabled: Boolean(enabled),
-    hiddenRooms: new Set(Array.isArray(roomIds) ? roomIds.filter(id => typeof id === 'string') : []),
-  };
-  postToServiceWorker('TRAVEL_MODE_STATE', {
-    enabled: travelModeState.enabled,
-    hiddenRooms: Array.from(travelModeState.hiddenRooms),
-  });
+export const announceCallTranscript = (transcript: CallTranscriptNotification) => {
+  postToServiceWorker('CALL_TRANSCRIPT_READY', transcript as unknown as Record<string, unknown>);
 };
 
 export interface StoredPushSubscription {
