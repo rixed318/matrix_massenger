@@ -71,12 +71,22 @@ import {
     getCallSessionForAccount,
     setCallSessionForClient,
     updateLocalCallDeviceState,
+    getTravelModeAccountData,
+    setTravelModeAccountData,
 } from '../services/matrixService';
 import GroupCallCoordinator from '../services/webrtc/groupCallCoordinator';
 import { GROUP_CALL_STATE_EVENT_TYPE, GroupCallStageState } from '../services/webrtc/groupCallConstants';
 import type { CallLayout } from './CallView';
 import { useAccountStore } from '../services/accountManager';
-import { getAppLockSnapshot, unlockWithPin, unlockWithBiometric, isSessionUnlocked, ensureAppLockConsistency } from '../services/appLockService';
+import {
+    getAppLockSnapshot,
+    unlockWithPin,
+    unlockWithBiometric,
+    isSessionUnlocked,
+    ensureAppLockConsistency,
+    hasActiveTravelModeWindow,
+    type TravelModeSnapshot,
+} from '../services/appLockService';
 import { presenceReducer, PresenceEventContent } from '../state/presenceReducer';
 import { useStoryStore, markActiveStoryAsRead, toggleActiveStoryReaction } from '../state/storyStore';
 import {
@@ -100,7 +110,7 @@ import {
     generateRoomDigest,
     DEFAULT_DIGEST_ACCOUNT_KEY,
 } from '../services/digestService';
-import { bindKnowledgeBaseToClient } from '../services/knowledgeBaseService';
+import { purgeRoomsFromIndex } from '../services/localIndexStore';
 
 interface ChatPageProps {
     client?: MatrixClient;
@@ -891,6 +901,7 @@ const ChatSidePanels: React.FC<ChatSidePanelsProps> = ({
                     onSendParticipantToAudience={groupCall.onSendToAudience}
                     localUserId={groupCall.localUserId}
                     canModerateParticipants={groupCall.canModerateParticipants}
+                    coordinator={groupCallCoordinator}
                 />
             )}
 
@@ -1264,16 +1275,33 @@ const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, s
     const [isPluginCatalogOpen, setIsPluginCatalogOpen] = useState(false);
     const [outboxItems, setOutboxItems] = useState<Record<string, { payload: OutboxPayload; attempts: number; error?: string; progress?: OutboxProgressState }>>({});
     const [currentSelfDestructSeconds, setCurrentSelfDestructSeconds] = useState<number | null>(null);
-    const [appLockState, setAppLockState] = useState<{ enabled: boolean; biometricEnabled: boolean; unlocked: boolean }>(() => ({
+    const [appLockState, setAppLockState] = useState<{
+        enabled: boolean;
+        biometricEnabled: boolean;
+        unlocked: boolean;
+        travelMode: TravelModeSnapshot;
+    }>(() => ({
         enabled: false,
         biometricEnabled: false,
         unlocked: isSessionUnlocked(),
+        travelMode: {
+            enabled: false,
+            autoDeactivateTimeoutMs: null,
+            autoDeactivateAt: null,
+            autoLogout: false,
+            clearCacheOnEnable: false,
+            temporaryPinWindows: [],
+        },
     }));
     const [isPinPromptOpen, setIsPinPromptOpen] = useState(false);
     const [pinInput, setPinInput] = useState('');
     const [pinError, setPinError] = useState<string | null>(null);
     const [pendingHiddenRoomId, setPendingHiddenRoomId] = useState<string | null>(null);
     const [hiddenRoomIds, setHiddenRoomIds] = useState<string[]>([]);
+    const [travelModeHiddenRooms, setTravelModeHiddenRooms] = useState<string[]>([]);
+    const [showTravelModeBanner, setShowTravelModeBanner] = useState(false);
+    const previousTravelModeEnabledRef = useRef<boolean>(false);
+    const isProcessingTravelModeRef = useRef(false);
     const [highlightedMessage, setHighlightedMessage] = useState<{ roomId: string; eventId: string } | null>(null);
     const [pendingScrollTarget, setPendingScrollTarget] = useState<{ roomId: string; eventId: string } | null>(null);
     const normalizeAttachments = (attachments: unknown): DraftAttachment[] => {
@@ -1379,35 +1407,67 @@ const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, s
             try {
                 await ensureAppLockConsistency();
                 const snapshot = await getAppLockSnapshot();
+                const unlocked = snapshot.enabled
+                    ? isSessionUnlocked() || hasActiveTravelModeWindow(snapshot.travelMode)
+                    : true;
                 setAppLockState({
                     enabled: snapshot.enabled,
                     biometricEnabled: snapshot.biometricEnabled,
-                    unlocked: snapshot.enabled ? isSessionUnlocked() : true,
+                    unlocked,
+                    travelMode: snapshot.travelMode,
                 });
+                previousTravelModeEnabledRef.current = snapshot.travelMode.enabled;
+                if (client) {
+                    const travelAccount = getTravelModeAccountData(client);
+                    setTravelModeHiddenRooms(travelAccount.hiddenRooms);
+                    if (snapshot.travelMode.enabled !== travelAccount.enabled
+                        || travelAccount.autoDeactivateAt !== (snapshot.travelMode.autoDeactivateAt ?? null)) {
+                        try {
+                            await setTravelModeAccountData(client, {
+                                enabled: snapshot.travelMode.enabled,
+                                hiddenRooms: travelAccount.hiddenRooms,
+                                autoDeactivateAt: snapshot.travelMode.autoDeactivateAt ?? null,
+                                autoDeactivateTimeoutMs: snapshot.travelMode.autoDeactivateTimeoutMs ?? null,
+                            });
+                        } catch (syncError) {
+                            console.warn('Failed to sync travel mode account data', syncError);
+                        }
+                    }
+                }
             } catch (error) {
                 console.warn('Failed to load app lock snapshot', error);
             }
         };
         void initialiseAppLock();
-    }, []);
+    }, [client]);
 
     useEffect(() => {
-        if (!isSettingsOpen) {
-            const refreshSnapshot = async () => {
-                try {
-                    const snapshot = await getAppLockSnapshot();
-                    setAppLockState(prev => ({
-                        enabled: snapshot.enabled,
-                        biometricEnabled: snapshot.biometricEnabled,
-                        unlocked: snapshot.enabled ? isSessionUnlocked() : true,
-                    }));
-                } catch (error) {
-                    console.warn('Failed to refresh app lock snapshot', error);
-                }
-            };
-            void refreshSnapshot();
+        if (isSettingsOpen) {
+            return;
         }
-    }, [isSettingsOpen]);
+        const refreshSnapshot = async () => {
+            try {
+                const snapshot = await getAppLockSnapshot();
+                const unlocked = snapshot.enabled
+                    ? isSessionUnlocked() || hasActiveTravelModeWindow(snapshot.travelMode)
+                    : true;
+                setAppLockState({
+                    enabled: snapshot.enabled,
+                    biometricEnabled: snapshot.biometricEnabled,
+                    unlocked,
+                    travelMode: snapshot.travelMode,
+                });
+                previousTravelModeEnabledRef.current = snapshot.travelMode.enabled;
+                if (client) {
+                    const travelAccount = getTravelModeAccountData(client);
+                    setTravelModeHiddenRooms(travelAccount.hiddenRooms);
+                }
+            } catch (error) {
+                console.warn('Failed to refresh app lock snapshot', error);
+            }
+        };
+        void refreshSnapshot();
+    }, [isSettingsOpen, client]);
 
     const describeTimer = useCallback((seconds: number | null): string => {
         if (!seconds) return 'отключено';
@@ -1423,6 +1483,94 @@ const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, s
         const days = Math.round(seconds / 86400);
         return `${days} дней`;
     }, []);
+
+    useEffect(() => {
+        if (!client) return;
+        const travelMode = appLockState.travelMode;
+        const wasEnabled = previousTravelModeEnabledRef.current;
+        const process = async () => {
+            if (isProcessingTravelModeRef.current) {
+                return;
+            }
+            if (travelMode.enabled && !wasEnabled) {
+                isProcessingTravelModeRef.current = true;
+                try {
+                    const accountState = getTravelModeAccountData(client);
+                    const roomsToHide = Array.from(new Set([
+                        ...accountState.hiddenRooms,
+                        ...hiddenRoomIds,
+                    ]));
+                    setTravelModeHiddenRooms(roomsToHide);
+                    if (travelMode.clearCacheOnEnable && roomsToHide.length > 0) {
+                        await purgeRoomsFromIndex(roomsToHide);
+                    }
+                    await Promise.all(roomsToHide.map(roomId => setRoomHidden(client, roomId, true)));
+                    await setTravelModeAccountData(client, {
+                        enabled: true,
+                        hiddenRooms: roomsToHide,
+                        autoDeactivateAt: travelMode.autoDeactivateAt ?? null,
+                        autoDeactivateTimeoutMs: travelMode.autoDeactivateTimeoutMs ?? null,
+                    });
+                    await loadRooms();
+                    setShowTravelModeBanner(true);
+                    if (travelMode.autoLogout && typeof onLogout === 'function') {
+                        onLogout();
+                    }
+                } catch (error) {
+                    console.warn('Failed to apply travel mode state', error);
+                } finally {
+                    previousTravelModeEnabledRef.current = true;
+                    isProcessingTravelModeRef.current = false;
+                }
+            } else if (!travelMode.enabled && wasEnabled) {
+                previousTravelModeEnabledRef.current = false;
+                setShowTravelModeBanner(false);
+                setTravelModeHiddenRooms([]);
+                try {
+                    await setTravelModeAccountData(client, {
+                        enabled: false,
+                        autoDeactivateAt: null,
+                    });
+                } catch (error) {
+                    console.warn('Failed to update travel mode account data on disable', error);
+                }
+            }
+        };
+        void process();
+    }, [appLockState.travelMode, client, hiddenRoomIds, loadRooms, onLogout]);
+
+    useEffect(() => {
+        if (!client) return;
+        if (!appLockState.travelMode.enabled) {
+            return;
+        }
+        const combined = Array.from(new Set([
+            ...travelModeHiddenRooms,
+            ...hiddenRoomIds,
+        ]));
+        const sortedNext = [...combined].sort();
+        const sortedCurrent = [...travelModeHiddenRooms].sort();
+        const changed =
+            sortedNext.length !== sortedCurrent.length
+            || sortedNext.some((roomId, index) => roomId !== sortedCurrent[index]);
+        if (!changed) {
+            return;
+        }
+        const updateAccountRooms = async () => {
+            try {
+                setTravelModeHiddenRooms(sortedNext);
+                await setTravelModeAccountData(client, {
+                    enabled: true,
+                    hiddenRooms: sortedNext,
+                    autoDeactivateAt: appLockState.travelMode.autoDeactivateAt ?? null,
+                    autoDeactivateTimeoutMs: appLockState.travelMode.autoDeactivateTimeoutMs ?? null,
+                });
+            } catch (error) {
+                console.warn('Failed to sync travel mode rooms', error);
+            }
+        };
+        void updateAccountRooms();
+    }, [client, hiddenRoomIds, appLockState.travelMode, travelModeHiddenRooms]);
 
     const notifyTimerChange = useCallback(async (seconds: number | null) => {
         if (!selectedRoomId) return;
@@ -3048,7 +3196,19 @@ const handleSendParticipantToAudience = useCallback((participantId: string) => {
             setPinError(result.error ?? 'Не удалось проверить PIN');
             return;
         }
-        setAppLockState(prev => ({ ...prev, unlocked: true }));
+        try {
+            const snapshot = await getAppLockSnapshot();
+            setAppLockState({
+                enabled: snapshot.enabled,
+                biometricEnabled: snapshot.biometricEnabled,
+                unlocked: true,
+                travelMode: snapshot.travelMode,
+            });
+            previousTravelModeEnabledRef.current = snapshot.travelMode.enabled;
+        } catch (error) {
+            console.warn('Failed to refresh app lock snapshot after PIN unlock', error);
+            setAppLockState(prev => ({ ...prev, unlocked: true }));
+        }
         setIsPinPromptOpen(false);
         const target = pendingHiddenRoomId;
         setPendingHiddenRoomId(null);
@@ -3063,7 +3223,19 @@ const handleSendParticipantToAudience = useCallback((participantId: string) => {
             setPinError(result.error ?? 'Биометрическая проверка не удалась');
             return;
         }
-        setAppLockState(prev => ({ ...prev, unlocked: true }));
+        try {
+            const snapshot = await getAppLockSnapshot();
+            setAppLockState({
+                enabled: snapshot.enabled,
+                biometricEnabled: snapshot.biometricEnabled,
+                unlocked: true,
+                travelMode: snapshot.travelMode,
+            });
+            previousTravelModeEnabledRef.current = snapshot.travelMode.enabled;
+        } catch (error) {
+            console.warn('Failed to refresh app lock snapshot after biometric unlock', error);
+            setAppLockState(prev => ({ ...prev, unlocked: true }));
+        }
         setIsPinPromptOpen(false);
         const target = pendingHiddenRoomId;
         setPendingHiddenRoomId(null);
@@ -4268,6 +4440,32 @@ const handleSendParticipantToAudience = useCallback((participantId: string) => {
                 className={`flex-1 flex flex-col bg-bg-tertiary relative transition-all duration-300 bg-cover bg-center ${activeThread ? 'w-1/2' : 'w-full'}`}>
                 {storiesHydrated && storyGroups.length > 0 && (
                     <StoriesTray client={client} stories={stories} onSelect={handleOpenStory} />
+                )}
+                {showTravelModeBanner && (
+                    <div className="mx-4 mt-2 mb-2 flex items-start justify-between gap-3 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-100">
+                        <div>
+                            <p className="font-semibold text-emerald-200">Travel Mode активен</p>
+                            <p className="text-emerald-100/80">
+                                Скрытые чаты защищены, уведомления от них временно отключены.
+                            </p>
+                        </div>
+                        <div className="flex items-center gap-2">
+                            <button
+                                type="button"
+                                className="rounded-md border border-emerald-400/40 px-3 py-1 text-xs font-medium text-emerald-100 hover:bg-emerald-500/20"
+                                onClick={() => setIsSettingsOpen(true)}
+                            >
+                                Настройки
+                            </button>
+                            <button
+                                type="button"
+                                className="rounded-md border border-emerald-400/40 px-3 py-1 text-xs font-medium text-emerald-100 hover:bg-emerald-500/20"
+                                onClick={() => setShowTravelModeBanner(false)}
+                            >
+                                Скрыть
+                            </button>
+                        </div>
+                    </div>
                 )}
                 {selectedRoom ? (
                     <>
