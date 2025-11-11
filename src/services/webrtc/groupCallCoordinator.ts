@@ -103,6 +103,9 @@ export class GroupCallCoordinator {
     private readonly iceServers?: RTCIceServer[];
     private readonly emitter = new TypedEmitter();
     private localStream: MediaStream | null = null;
+    private rawLocalStream: MediaStream | null = null;
+    private localEffectsController: MediaEffectsController | null = null;
+    private localEffectsConfig: VideoEffectsConfiguration = videoEffectsService.getDefaultConfiguration();
     private screenStream: MediaStream | null = null;
     private coWatchState: GroupCallStateEventContent['coWatch'] = { active: false };
     private handRaiseQueue: string[] = [];
@@ -123,6 +126,9 @@ export class GroupCallCoordinator {
     private dataChannels = new Map<string, RTCDataChannel>();
     private captionChannels = new Map<string, RTCDataChannel>();
     private pendingSignals = new Map<string, PendingSignal[]>();
+    private incomingEffectsControllers = new Map<string, MediaEffectsController>();
+    private incomingEffectsConfig = new Map<string, VideoEffectsConfiguration>();
+    private incomingStreams = new Map<string, MediaStream>();
     private disposed = false;
     private joinNonce = randomId();
     private scheduleSyncHandle: number | null = null;
@@ -151,7 +157,9 @@ export class GroupCallCoordinator {
 
     private async initialise(constraints?: MediaStreamConstraints) {
         try {
-            this.localStream = await navigator.mediaDevices.getUserMedia(constraints || { audio: true, video: true });
+            this.rawLocalStream = await navigator.mediaDevices.getUserMedia(constraints || { audio: true, video: true });
+            await this.configureLocalEffects();
+            this.localStream = this.getEffectiveLocalStream();
         } catch (error) {
             console.error('Failed to acquire local media stream', error);
             this.emitter.emit('error', error instanceof Error ? error : new Error(String(error)));
@@ -163,8 +171,8 @@ export class GroupCallCoordinator {
             displayName: this.localMember.displayName,
             avatarUrl: this.localMember.avatarUrl,
             role: this.localMember.role ?? 'host',
-            isMuted: this.localStream.getAudioTracks().every(track => !track.enabled),
-            isVideoMuted: this.localStream.getVideoTracks().every(track => !track.enabled),
+            isMuted: this.localStream?.getAudioTracks().every(track => !track.enabled) ?? true,
+            isVideoMuted: this.localStream?.getVideoTracks().every(track => !track.enabled) ?? true,
             isScreensharing: false,
             isLocal: true,
             stream: this.localStream,
@@ -194,6 +202,131 @@ export class GroupCallCoordinator {
         };
         this.client.on(RoomEvent.Timeline, handler);
         this.clientListener = handler;
+    }
+
+    private getEffectiveLocalStream(): MediaStream | null {
+        return this.localStream ?? this.rawLocalStream;
+    }
+
+    private refreshLocalParticipantStream() {
+        const stream = this.getEffectiveLocalStream();
+        if (!stream) return;
+        const participant = this.participants.get(this.localMember.userId);
+        if (!participant) return;
+        participant.stream = stream;
+        participant.isMuted = stream.getAudioTracks().every(track => !track.enabled);
+        participant.isVideoMuted = stream.getVideoTracks().every(track => !track.enabled);
+        this.participants.set(this.localMember.userId, participant);
+    }
+
+    private updateOutgoingSenders(stream: MediaStream) {
+        this.peers.forEach(pc => {
+            const senders = pc.getSenders();
+            senders
+                .filter(sender => {
+                    if (!sender.track) return false;
+                    if (this.screenStream && this.screenStream.getTracks().includes(sender.track)) {
+                        return false;
+                    }
+                    return !stream.getTracks().includes(sender.track);
+                })
+                .forEach(sender => {
+                    void sender.replaceTrack(null);
+                });
+            stream.getTracks().forEach(track => {
+                const existing = senders.find(sender => {
+                    if (!sender.track) return false;
+                    if (this.screenStream && this.screenStream.getTracks().includes(sender.track)) {
+                        return false;
+                    }
+                    return sender.track.kind === track.kind;
+                });
+                if (existing) {
+                    void existing.replaceTrack(track);
+                } else {
+                    pc.addTrack(track, stream);
+                }
+            });
+        });
+    }
+
+    private async configureLocalEffects(config?: VideoEffectsConfiguration) {
+        if (!this.rawLocalStream) {
+            return;
+        }
+        this.localEffectsController?.dispose();
+        const nextConfig = config ?? this.localEffectsConfig;
+        try {
+            this.localEffectsController = await videoEffectsService.create(this.rawLocalStream, nextConfig);
+            this.localStream = this.localEffectsController.stream;
+            this.localEffectsConfig = nextConfig;
+            this.refreshLocalParticipantStream();
+            this.updateOutgoingSenders(this.localStream);
+        } catch (error) {
+            console.warn('Failed to initialise local video effects', error);
+            this.localEffectsController = null;
+            this.localStream = this.rawLocalStream;
+            this.refreshLocalParticipantStream();
+            if (this.localStream) {
+                this.updateOutgoingSenders(this.localStream);
+            }
+        }
+        this.emitter.emit('participants-changed', this.getParticipants());
+    }
+
+    private disposeIncomingController(participantId: string) {
+        const existing = this.incomingEffectsControllers.get(participantId);
+        if (existing) {
+            existing.dispose();
+            this.incomingEffectsControllers.delete(participantId);
+        }
+    }
+
+    private async prepareIncomingStream(participantId: string, stream: MediaStream): Promise<MediaStream> {
+        this.incomingStreams.set(participantId, stream);
+        const config = this.incomingEffectsConfig.get(participantId);
+        this.disposeIncomingController(participantId);
+        if (!config) {
+            return stream;
+        }
+        try {
+            const controller = await videoEffectsService.create(stream, config);
+            this.incomingEffectsControllers.set(participantId, controller);
+            return controller.stream;
+        } catch (error) {
+            console.warn('Failed to apply incoming media effects', error);
+            return stream;
+        }
+    }
+
+    private async handleIncomingTrack(
+        remoteUserId: string,
+        kind: MediaStreamTrack['kind'],
+        stream: MediaStream,
+        pc: RTCPeerConnection,
+    ) {
+        let preparedStream = stream;
+        if (kind === 'video') {
+            preparedStream = await this.prepareIncomingStream(remoteUserId, stream);
+        } else {
+            this.incomingStreams.set(remoteUserId, stream);
+        }
+        const participant = this.participants.get(remoteUserId) || ({
+            userId: remoteUserId,
+            displayName: remoteUserId,
+        } as InternalParticipant);
+        if (kind === 'video') {
+            participant.stream = preparedStream;
+            participant.isVideoMuted = false;
+        }
+        if (kind === 'audio') {
+            participant.isMuted = false;
+        }
+        participant.connectionState = pc.connectionState;
+        participant.lastActive = Date.now();
+        this.participants.set(remoteUserId, participant);
+        this.scheduleParticipantsSync();
+        this.emitter.emit('participants-changed', this.getParticipants());
     }
 
     private async announceJoin() {
@@ -267,22 +400,7 @@ export class GroupCallCoordinator {
 
         pc.ontrack = event => {
             const stream = event.streams[0];
-            const participant = this.participants.get(remoteUserId) || {
-                userId: remoteUserId,
-                displayName: remoteUserId,
-            } as InternalParticipant;
-            if (event.track.kind === 'video') {
-                participant.stream = stream;
-                participant.isVideoMuted = false;
-            }
-            if (event.track.kind === 'audio') {
-                participant.isMuted = false;
-            }
-            participant.connectionState = pc!.connectionState;
-            participant.lastActive = Date.now();
-            this.participants.set(remoteUserId, participant);
-            this.scheduleParticipantsSync();
-            this.emitter.emit('participants-changed', this.getParticipants());
+            void this.handleIncomingTrack(remoteUserId, event.track.kind, stream, pc!);
         };
 
         pc.onconnectionstatechange = () => {
@@ -754,6 +872,9 @@ export class GroupCallCoordinator {
             this.handRaiseQueue = this.handRaiseQueue.filter(id => id !== remoteUserId);
             this.emitter.emit('participants-changed', this.getParticipants());
         }
+        this.disposeIncomingController(remoteUserId);
+        this.incomingEffectsConfig.delete(remoteUserId);
+        this.incomingStreams.delete(remoteUserId);
         const pc = this.peers.get(remoteUserId);
         if (pc) {
             pc.close();
@@ -948,6 +1069,55 @@ export class GroupCallCoordinator {
         return this.localStream;
     }
 
+    getLocalEffectsConfiguration(): VideoEffectsConfiguration {
+        return cloneEffectsConfig(this.localEffectsConfig);
+    }
+
+    async setLocalEffectsConfiguration(config: VideoEffectsConfiguration): Promise<void> {
+        this.localEffectsConfig = cloneEffectsConfig(config);
+        await this.configureLocalEffects(this.localEffectsConfig);
+    }
+
+    getIncomingEffectsConfiguration(participantId: string): VideoEffectsConfiguration | null {
+        const config = this.incomingEffectsConfig.get(participantId);
+        return config ? cloneEffectsConfig(config) : null;
+    }
+
+    async setIncomingEffectsConfiguration(
+        participantId: string,
+        config: VideoEffectsConfiguration | null,
+    ): Promise<void> {
+        if (!config) {
+            this.incomingEffectsConfig.delete(participantId);
+            this.disposeIncomingController(participantId);
+            const original = this.incomingStreams.get(participantId);
+            if (original) {
+                const participant = this.participants.get(participantId);
+                if (participant) {
+                    participant.stream = original;
+                    participant.isVideoMuted = original.getVideoTracks().every(track => !track.enabled);
+                    this.participants.set(participantId, participant);
+                    this.emitter.emit('participants-changed', this.getParticipants());
+                }
+            }
+            return;
+        }
+        const cloned = cloneEffectsConfig(config);
+        this.incomingEffectsConfig.set(participantId, cloned);
+        const stream = this.incomingStreams.get(participantId);
+        if (!stream) {
+            return;
+        }
+        const processed = await this.prepareIncomingStream(participantId, stream);
+        const participant = this.participants.get(participantId);
+        if (participant) {
+            participant.stream = processed;
+            participant.isVideoMuted = processed.getVideoTracks().every(track => !track.enabled);
+            this.participants.set(participantId, participant);
+            this.emitter.emit('participants-changed', this.getParticipants());
+        }
+    }
+
     getParticipants(): GroupCallParticipant[] {
         return Array.from(this.participants.values()).map(participant => ({ ...participant }));
     }
@@ -960,10 +1130,14 @@ export class GroupCallCoordinator {
         if (!this.localStream) return;
         const audioTrack = this.localStream.getAudioTracks()[0];
         if (!audioTrack) return;
-        audioTrack.enabled = !audioTrack.enabled;
+        const nextEnabled = !audioTrack.enabled;
+        audioTrack.enabled = nextEnabled;
+        this.rawLocalStream?.getAudioTracks().forEach(track => {
+            track.enabled = nextEnabled;
+        });
         const participant = this.participants.get(this.localMember.userId);
         if (participant) {
-            participant.isMuted = !audioTrack.enabled;
+            participant.isMuted = !nextEnabled;
             this.participants.set(this.localMember.userId, participant);
         }
         this.scheduleParticipantsSync();
@@ -978,10 +1152,14 @@ export class GroupCallCoordinator {
         if (!this.localStream) return;
         const videoTrack = this.localStream.getVideoTracks()[0];
         if (!videoTrack) return;
-        videoTrack.enabled = !videoTrack.enabled;
+        const nextEnabled = !videoTrack.enabled;
+        videoTrack.enabled = nextEnabled;
+        this.rawLocalStream?.getVideoTracks().forEach(track => {
+            track.enabled = nextEnabled;
+        });
         const participant = this.participants.get(this.localMember.userId);
         if (participant) {
-            participant.isVideoMuted = !videoTrack.enabled;
+            participant.isVideoMuted = !nextEnabled;
             this.participants.set(this.localMember.userId, participant);
         }
         this.scheduleParticipantsSync();
@@ -1194,6 +1372,9 @@ export class GroupCallCoordinator {
         pc?.close();
         this.peers.delete(participantId);
         this.dataChannels.delete(participantId);
+        this.disposeIncomingController(participantId);
+        this.incomingEffectsConfig.delete(participantId);
+        this.incomingStreams.delete(participantId);
         this.scheduleParticipantsSync();
         this.updateStageState(true);
         this.broadcastStageUpdate();
@@ -1257,7 +1438,13 @@ export class GroupCallCoordinator {
         }
         await this.announceLeave();
         this.broadcastControl({ type: 'participants-sync', payload: [{ userId: this.localMember.userId, left: true }] });
+        this.localEffectsController?.dispose();
+        this.localEffectsController = null;
+        this.incomingEffectsControllers.forEach(controller => controller.dispose());
+        this.incomingEffectsControllers.clear();
+        this.incomingStreams.clear();
         this.localStream?.getTracks().forEach(track => track.stop());
+        this.rawLocalStream?.getTracks().forEach(track => track.stop());
         this.screenStream?.getTracks().forEach(track => track.stop());
         this.peers.forEach(pc => pc.close());
         this.peers.clear();

@@ -16,6 +16,7 @@ export interface Participant {
     lastActive?: number;
     handRaisedAt?: number | null;
     presenceSummary?: PresenceSummary;
+    effectsEnabled?: boolean;
 }
 
 interface Props {
@@ -215,6 +216,19 @@ const CallParticipantsPanel: React.FC<Props> = ({
                                             type="button"
                                         >
                                             {p.isVideoMuted ? 'Включить видео' : 'Выключить видео'}
+                                        </button>
+                                    )}
+                                    {onToggleEffects && !isSelf && (
+                                        <button
+                                            className={`text-xs px-2 py-1 rounded ${
+                                                p.effectsEnabled
+                                                    ? 'bg-indigo-600/80 text-white hover:bg-indigo-500'
+                                                    : 'bg-bg-tertiary hover:bg-bg-secondary'
+                                            }`}
+                                            onClick={() => onToggleEffects(p.id, !p.effectsEnabled)}
+                                            type="button"
+                                        >
+                                            {p.effectsEnabled ? 'Отключить фон' : 'Применить фон'}
                                         </button>
                                     )}
                                     {onSpotlight && (

@@ -2,6 +2,7 @@ import { MatrixClient, MatrixEvent, MatrixRoom, MatrixUser, Sticker, Gif, RoomCr
 import type { SecureCloudProfile } from './secureCloudService';
 import { normaliseSecureCloudProfile } from './secureCloudService';
 import GroupCallCoordinator, { GroupCallParticipant as CoordinatorParticipant } from './webrtc/groupCallCoordinator';
+import type { VideoEffectsConfiguration } from './videoEffectsService';
 import { buildGeoUri, buildStaticMapUrl, buildExternalNavigationUrl, MAP_ZOOM_DEFAULT, STATIC_MAP_HEIGHT, STATIC_MAP_WIDTH, sanitizeZoom } from '../utils/location';
 import { setTravelModeNotificationState } from './notificationService';
 import { setTravelModePushState } from './pushService';
@@ -199,6 +200,12 @@ const idbDeleteChunks = async (attachmentId: string) => {
 const CALL_SESSION_EVENT_TYPE = 'econix.call_session';
 
 export type CallSessionStatus = 'ringing' | 'connecting' | 'connected' | 'ended';
+
+export interface CallDeviceEffectsState {
+    presetId?: string | null;
+    configuration: VideoEffectsConfiguration;
+    applyToRemote?: boolean;
+}
 
 export interface CallSessionDeviceState {
     userId: string;
@@ -712,6 +719,10 @@ export const updateLocalCallDeviceState = (client: MatrixClient, patch: Partial<
         return;
     }
     const now = nextCallStateTimestamp();
+    const hasEffectsPatch = Object.prototype.hasOwnProperty.call(patch, 'effects');
+    const normalisedEffects = hasEffectsPatch
+        ? normaliseDeviceEffectsState(patch.effects as CallDeviceEffectsState | undefined)
+        : undefined;
     const devices = current.devices.map(device => {
         if (device.deviceId !== deviceId) {
             return device;
@@ -719,6 +730,7 @@ export const updateLocalCallDeviceState = (client: MatrixClient, patch: Partial<
         return {
             ...device,
             ...patch,
+            effects: hasEffectsPatch ? cloneDeviceEffectsState(normalisedEffects) : device.effects,
             lastSeenTs: now,
             captionPreferences: patch.captionPreferences
                 ? sanitiseCaptionPreferences({
@@ -870,6 +882,7 @@ export const buildCallSessionSnapshot = (
             connected: true,
             isRemote: true,
             lastSeenTs: now,
+            effects: cloneDeviceEffectsState(existingRemote?.effects),
         };
         const remoteIndex = devices.findIndex(device => device.deviceId === remoteDeviceId);
         if (remoteIndex >= 0) {
@@ -889,6 +902,7 @@ export const buildCallSessionSnapshot = (
             ? true
             : existing?.devices?.find(device => device.deviceId === deviceId)?.connected ?? false,
         lastSeenTs: now,
+        effects: cloneDeviceEffectsState(existing?.devices?.find(device => device.deviceId === deviceId)?.effects),
     });
     return {
         sessionId,

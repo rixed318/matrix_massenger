@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { MatrixCall, MatrixClient, CallSessionState, updateLocalCallDeviceState } from '@matrix-messenger/core';
 import Avatar from './Avatar';
 import { mxcToHttp } from '@matrix-messenger/core';
@@ -21,6 +21,7 @@ interface ExtendedParticipant extends CallParticipant {
     stream?: MediaStream | null;
     screenshareStream?: MediaStream | null;
     dominant?: boolean;
+    effectsEnabled?: boolean;
 }
 
 interface CallViewProps {
@@ -774,6 +775,152 @@ const CallView: React.FC<CallViewProps> = ({
                         ☎️
                     </button>
                 </div>
+
+                {effectsPanelOpen && (
+                    <div
+                        className={`fixed ${showParticipantsPanel ? 'right-[22rem]' : 'right-4'} top-24 bottom-4 w-80 bg-bg-secondary border border-border-primary rounded-xl shadow-xl p-4 z-50 overflow-y-auto`}
+                    >
+                        <div className="flex items-center justify-between mb-3">
+                            <h3 className="text-sm font-semibold text-text-primary">Эффекты камеры</h3>
+                            <button
+                                type="button"
+                                className="text-xs px-2 py-1 rounded bg-bg-tertiary hover:bg-bg-secondary text-text-secondary"
+                                onClick={() => setEffectsPanelOpen(false)}
+                            >
+                                Закрыть
+                            </button>
+                        </div>
+                        <div className="aspect-video rounded-lg overflow-hidden bg-black/80 mb-4">
+                            <video
+                                ref={effectsPreviewRef}
+                                muted
+                                autoPlay
+                                playsInline
+                                className="w-full h-full object-cover"
+                            />
+                        </div>
+                        <div className="space-y-4 text-sm text-text-primary">
+                            <div>
+                                <label className="block text-xs text-text-secondary mb-1" htmlFor="call-effects-preset">
+                                    Пресет
+                                </label>
+                                <select
+                                    id="call-effects-preset"
+                                    value={localEffectsState?.presetId ?? ''}
+                                    onChange={event => handlePresetSelect(event.target.value)}
+                                    className="w-full rounded-md border border-border-primary bg-bg-tertiary px-2 py-1 text-sm text-text-primary focus:outline-none focus:ring-2 focus:ring-ring-focus"
+                                    disabled={!onLocalEffectsChange}
+                                >
+                                    <option value="">Своя настройка</option>
+                                    {presets.map(preset => (
+                                        <option key={preset.id} value={preset.id}>
+                                            {preset.label}
+                                        </option>
+                                    ))}
+                                </select>
+                            </div>
+                            <div>
+                                <span className="block text-xs text-text-secondary mb-1">Фон</span>
+                                <div className="flex flex-wrap gap-2">
+                                    <button
+                                        type="button"
+                                        className={`px-2 py-1 rounded text-xs ${
+                                            backgroundMode === 'none'
+                                                ? 'bg-indigo-600 text-white'
+                                                : 'bg-bg-tertiary hover:bg-bg-secondary text-text-secondary'
+                                        }`}
+                                        onClick={() => handleBackgroundMode('none')}
+                                        disabled={!onLocalEffectsChange}
+                                    >
+                                        Обычный
+                                    </button>
+                                    <button
+                                        type="button"
+                                        className={`px-2 py-1 rounded text-xs ${
+                                            backgroundMode === 'gradient'
+                                                ? 'bg-indigo-600 text-white'
+                                                : 'bg-bg-tertiary hover:bg-bg-secondary text-text-secondary'
+                                        }`}
+                                        onClick={() => handleBackgroundMode('gradient')}
+                                        disabled={!onLocalEffectsChange}
+                                    >
+                                        Градиент
+                                    </button>
+                                    <button
+                                        type="button"
+                                        className="px-2 py-1 rounded text-xs bg-bg-tertiary hover:bg-bg-secondary text-text-secondary"
+                                        onClick={() => backgroundFileInputRef.current?.click()}
+                                        disabled={!onLocalEffectsChange}
+                                    >
+                                        Из файла…
+                                    </button>
+                                    <input
+                                        type="file"
+                                        ref={backgroundFileInputRef}
+                                        accept="image/*"
+                                        onChange={handleBackgroundUpload}
+                                        className="hidden"
+                                    />
+                                </div>
+                                {backgroundEffect?.assetUrl && (
+                                    <p className="mt-1 text-xs text-text-secondary break-words">
+                                        Используется пользовательское изображение.
+                                    </p>
+                                )}
+                            </div>
+                            <div>
+                                <label className="block text-xs text-text-secondary mb-1" htmlFor="call-effects-blur">
+                                    Размытие ({Math.round(blurIntensity)} px)
+                                </label>
+                                <input
+                                    id="call-effects-blur"
+                                    type="range"
+                                    min={0}
+                                    max={15}
+                                    step={1}
+                                    value={Math.round(blurIntensity)}
+                                    onChange={event => handleBlurIntensity(Number(event.target.value))}
+                                    className="w-full"
+                                    disabled={!onLocalEffectsChange}
+                                />
+                            </div>
+                            <div>
+                                <label className="block text-xs text-text-secondary mb-1" htmlFor="call-effects-noise">
+                                    Шумоподавление ({Math.round(noiseLevel * 100)}%)
+                                </label>
+                                <input
+                                    id="call-effects-noise"
+                                    type="range"
+                                    min={0}
+                                    max={1}
+                                    step={0.1}
+                                    value={Number(noiseLevel.toFixed(1))}
+                                    onChange={event => handleNoiseLevel(Number(event.target.value))}
+                                    className="w-full"
+                                    disabled={!onLocalEffectsChange}
+                                />
+                            </div>
+                            <label className="flex items-center gap-2 text-xs text-text-primary">
+                                <input
+                                    type="checkbox"
+                                    className="h-4 w-4 text-accent focus:ring-ring-focus"
+                                    checked={applyEffectsToRemote}
+                                    onChange={event => handleApplyEffectsToRemote(event.target.checked)}
+                                    disabled={!onLocalEffectsChange}
+                                />
+                                Применять к входящему видео
+                            </label>
+                            <button
+                                type="button"
+                                className="w-full px-3 py-2 text-xs rounded bg-indigo-600 text-white hover:bg-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed"
+                                onClick={() => void handleSavePreset()}
+                                disabled={!onSaveEffectsPreset || !onLocalEffectsChange}
+                            >
+                                Сохранить как пресет
+                            </button>
+                        </div>
+                    </div>
+                )}
 
                 {showParticipantsPanel && (
                     <CallParticipantsPanel
