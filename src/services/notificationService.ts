@@ -9,6 +9,8 @@ const isTauriEnvironment = () =>
 let permissionGranted: boolean | null = null;
 let listenersInitialized = false;
 let roomNotificationPreferences: Record<string, RoomNotificationMode> = {};
+let travelModeEnabled = false;
+let travelModeHiddenRooms = new Set<string>();
 
 const base64ToUint8Array = (base64: string): Uint8Array => {
     const padding = '='.repeat((4 - (base64.length % 4)) % 4);
@@ -47,10 +49,10 @@ const resolveVapidKey = (explicit?: string): Uint8Array | undefined => {
 };
 
 const postPreferencesToServiceWorker = async (preferences: Record<string, RoomNotificationMode>) => {
-    if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) {
-        return;
-    }
-    try {
+  if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) {
+    return;
+  }
+  try {
         const registration = await navigator.serviceWorker.ready;
         registration.active?.postMessage({
             type: 'ROOM_NOTIFICATION_PREFERENCES',
@@ -62,7 +64,28 @@ const postPreferencesToServiceWorker = async (preferences: Record<string, RoomNo
         });
     } catch (error) {
         console.warn('Failed to sync notification preferences with service worker', error);
-    }
+  }
+};
+
+const postTravelModeToServiceWorker = async (enabled: boolean, hiddenRooms: string[]): Promise<void> => {
+  if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) {
+    return;
+  }
+  try {
+    const registration = await navigator.serviceWorker.ready;
+    registration.active?.postMessage({
+      type: 'TRAVEL_MODE_STATE',
+      enabled,
+      hiddenRooms,
+    });
+    navigator.serviceWorker.controller?.postMessage?.({
+      type: 'TRAVEL_MODE_STATE',
+      enabled,
+      hiddenRooms,
+    });
+  } catch (error) {
+    console.warn('Failed to sync travel mode state with service worker', error);
+  }
 };
 
 export interface SendNotificationOptions {
@@ -75,17 +98,20 @@ export interface SendNotificationOptions {
 }
 
 const shouldSuppressNotification = (options: SendNotificationOptions): boolean => {
-    if (options.type === 'story') {
-        return false;
-    }
-    if (!options.roomId) {
-        return false;
-    }
-    const preference = roomNotificationPreferences[options.roomId];
-    if (!preference || preference === 'all') {
-        return false;
-    }
-    if (preference === 'mute') {
+  if (options.type === 'story') {
+    return false;
+  }
+  if (!options.roomId) {
+    return false;
+  }
+  if (travelModeEnabled && travelModeHiddenRooms.has(options.roomId)) {
+    return true;
+  }
+  const preference = roomNotificationPreferences[options.roomId];
+  if (!preference || preference === 'all') {
+    return false;
+  }
+  if (preference === 'mute') {
         return true;
     }
     return !options.isMention;
@@ -111,8 +137,14 @@ export const getRoomNotificationPreference = (roomId: string): RoomNotificationM
     roomNotificationPreferences[roomId];
 
 export const getRoomNotificationPreferences = (): Record<string, RoomNotificationMode> => ({
-    ...roomNotificationPreferences,
+  ...roomNotificationPreferences,
 });
+
+export const setTravelModeNotificationState = (enabled: boolean, roomIds: string[]): void => {
+  travelModeEnabled = Boolean(enabled);
+  travelModeHiddenRooms = new Set(Array.isArray(roomIds) ? roomIds.filter(id => typeof id === 'string') : []);
+  void postTravelModeToServiceWorker(travelModeEnabled, Array.from(travelModeHiddenRooms));
+};
 
 export const isWebPushSupported = (): boolean =>
     typeof window !== 'undefined'
