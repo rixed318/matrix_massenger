@@ -32,7 +32,15 @@ interface Props {
     onLowerHand?: (participantId: string) => void;
     localUserId?: string;
     canModerate?: boolean;
-    onToggleEffects?: (participantId: string, enabled: boolean) => void;
+    captionLanguage?: string;
+    captionTargetLanguage?: string;
+    captionAutoTranslate?: boolean;
+    captionShowForAll?: boolean;
+    onCaptionLanguageChange?: (value: string) => void;
+    onCaptionTargetLanguageChange?: (value: string) => void;
+    onCaptionAutoTranslateChange?: (value: boolean) => void;
+    onCaptionShowForAllChange?: (value: boolean) => void;
+    availableLanguages?: Array<{ value: string; label: string }>;
 }
 
 const roleLabels: Record<NonNullable<Participant['role']>, string> = {
@@ -43,6 +51,18 @@ const roleLabels: Record<NonNullable<Participant['role']>, string> = {
     listener: 'Слушатель',
     requesting_speak: 'Хочет выступить',
 };
+
+const DEFAULT_LANGUAGE_OPTIONS: Array<{ value: string; label: string }> = [
+    { value: 'auto', label: 'Авто' },
+    { value: 'ru', label: 'Русский' },
+    { value: 'en', label: 'English' },
+    { value: 'es', label: 'Español' },
+    { value: 'de', label: 'Deutsch' },
+    { value: 'fr', label: 'Français' },
+    { value: 'uk', label: 'Українська' },
+    { value: 'it', label: 'Italiano' },
+    { value: 'zh', label: '中文' },
+];
 
 const CallParticipantsPanel: React.FC<Props> = ({
     participants,
@@ -57,7 +77,15 @@ const CallParticipantsPanel: React.FC<Props> = ({
     onLowerHand,
     localUserId,
     canModerate = false,
-    onToggleEffects,
+    captionLanguage = 'auto',
+    captionTargetLanguage = '',
+    captionAutoTranslate = false,
+    captionShowForAll = false,
+    onCaptionLanguageChange,
+    onCaptionTargetLanguageChange,
+    onCaptionAutoTranslateChange,
+    onCaptionShowForAllChange,
+    availableLanguages,
 }) => {
     return (
         <div className="fixed right-4 top-20 bottom-4 w-80 bg-bg-secondary border border-border-primary rounded-xl shadow-xl p-3 z-50 overflow-y-auto">
@@ -68,6 +96,50 @@ const CallParticipantsPanel: React.FC<Props> = ({
                         Закрыть
                     </button>
                 )}
+            </div>
+            <div className="mb-3 space-y-2 rounded-lg bg-bg-primary/70 p-3">
+                <div className="flex items-center justify-between">
+                    <span className="text-sm font-medium">Субтитры</span>
+                    <label className="flex items-center gap-2 text-xs text-text-secondary">
+                        <input
+                            type="checkbox"
+                            checked={captionShowForAll}
+                            onChange={event => onCaptionShowForAllChange?.(event.target.checked)}
+                        />
+                        Показать всем
+                    </label>
+                </div>
+                <label className="block text-xs text-text-secondary" htmlFor="caption-language-select">Язык оригинала</label>
+                <select
+                    id="caption-language-select"
+                    className="w-full rounded-md border border-border-primary bg-bg-tertiary px-2 py-1 text-sm focus:outline-none focus:ring-2 focus:ring-accent"
+                    value={captionLanguage}
+                    onChange={event => onCaptionLanguageChange?.(event.target.value)}
+                >
+                    {(availableLanguages ?? DEFAULT_LANGUAGE_OPTIONS).map(option => (
+                        <option key={option.value} value={option.value}>
+                            {option.label}
+                        </option>
+                    ))}
+                </select>
+                <div className="flex items-center justify-between text-xs text-text-secondary">
+                    <label className="flex items-center gap-2">
+                        <input
+                            type="checkbox"
+                            checked={captionAutoTranslate}
+                            onChange={event => onCaptionAutoTranslateChange?.(event.target.checked)}
+                        />
+                        Автоперевод
+                    </label>
+                </div>
+                <input
+                    type="text"
+                    placeholder="Целевой язык (например, en)"
+                    className="w-full rounded-md border border-border-primary bg-bg-tertiary px-2 py-1 text-sm focus:outline-none focus:ring-2 focus:ring-accent"
+                    value={captionTargetLanguage}
+                    onChange={event => onCaptionTargetLanguageChange?.(event.target.value)}
+                    disabled={!captionAutoTranslate}
+                />
             </div>
             <ul className="space-y-2">
                 {participants.map(p => {

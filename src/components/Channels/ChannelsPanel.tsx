@@ -1,5 +1,7 @@
 import React, { useMemo } from 'react';
+import type { MatrixClient } from '@matrix-messenger/core';
 import type { SpaceHierarchyNode } from '../../services/matrixService';
+import KnowledgeBasePanel from '../KnowledgeBase/KnowledgeBasePanel';
 
 interface ChannelsPanelProps {
     spaces: SpaceHierarchyNode[];
@@ -9,6 +11,7 @@ interface ChannelsPanelProps {
     emptyStateMessage?: string;
     className?: string;
     title?: string;
+    client?: MatrixClient;
 }
 
 interface ChannelNodeProps {
@@ -110,6 +113,7 @@ const ChannelsPanel: React.FC<ChannelsPanelProps> = ({
     emptyStateMessage = 'No channels available',
     className = '',
     title = 'Channels',
+    client,
 }) => {
     const flattenedCount = useMemo(() => {
         const stack = [...spaces];
@@ -154,6 +158,7 @@ const ChannelsPanel: React.FC<ChannelsPanelProps> = ({
                     ))}
                 </div>
             )}
+            <KnowledgeBasePanel client={client} className="mt-2" />
         </section>
     );
 };

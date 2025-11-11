@@ -118,6 +118,9 @@ const SettingsModal: React.FC<SettingsModalProps> = ({
     const [transcriptionMaxDuration, setTranscriptionMaxDuration] = useState<string>(
         typeof runtimeTranscription.maxDurationSec === 'number' ? String(runtimeTranscription.maxDurationSec) : ''
     );
+    const [transcriptionProvider, setTranscriptionProvider] = useState<'disabled' | 'local' | 'cloud'>(runtimeTranscription.provider);
+    const [transcriptionPrivacy, setTranscriptionPrivacy] = useState<'local' | 'cloud'>(runtimeTranscription.privacy ?? 'local');
+    const [transcriptionTargetLanguage, setTranscriptionTargetLanguage] = useState<string>(runtimeTranscription.defaultTargetLanguage ?? '');
     const [smartRepliesEnabled, setSmartRepliesEnabled] = useState<boolean>(false);
     const [smartReplyMaxMessages, setSmartReplyMaxMessages] = useState<string>('12');
     const [smartReplyMaxCharacters, setSmartReplyMaxCharacters] = useState<string>('4000');
@@ -168,6 +171,15 @@ const SettingsModal: React.FC<SettingsModalProps> = ({
                     ? String(settings.maxDurationSec)
                     : ''
             );
+            if (settings?.provider) {
+                setTranscriptionProvider(settings.provider);
+            }
+            if (settings?.privacy) {
+                setTranscriptionPrivacy(settings.privacy);
+            }
+            if (settings?.targetLanguage) {
+                setTranscriptionTargetLanguage(settings.targetLanguage);
+            }
         } catch (_) {
             /* noop */
         }
@@ -197,10 +209,13 @@ const SettingsModal: React.FC<SettingsModalProps> = ({
                 enabled: transcriptionEnabled,
                 language: transcriptionLanguage || undefined,
                 maxDurationSec: safeDuration,
+                provider: transcriptionProvider,
+                privacy: transcriptionPrivacy,
+                targetLanguage: transcriptionTargetLanguage.trim() || undefined,
             });
         }, 400);
         return () => clearTimeout(handle);
-    }, [transcriptionEnabled, transcriptionLanguage, transcriptionMaxDuration, client, isOpen]);
+    }, [transcriptionEnabled, transcriptionLanguage, transcriptionMaxDuration, transcriptionProvider, transcriptionPrivacy, transcriptionTargetLanguage, client, isOpen]);
 
     useEffect(() => {
         if (!isOpen) return;
@@ -582,6 +597,31 @@ const SettingsModal: React.FC<SettingsModalProps> = ({
                                         <option key={option.value || 'default'} value={option.value}>{option.label}</option>
                                     ))}
                                 </select>
+                                <label htmlFor="transcriptionProvider" className="block text-sm font-medium text-text-secondary mt-3 mb-1">
+                                    Провайдер
+                                </label>
+                                <select
+                                    id="transcriptionProvider"
+                                    value={transcriptionProvider}
+                                    onChange={event => setTranscriptionProvider(event.target.value as 'disabled' | 'local' | 'cloud')}
+                                    className="block w-full px-3 py-2 border border-border-primary bg-bg-secondary text-text-primary rounded-md focus:outline-none focus:ring-ring-focus focus:border-ring-focus sm:text-sm"
+                                >
+                                    <option value="disabled">Отключено</option>
+                                    <option value="local">Локальная модель</option>
+                                    <option value="cloud">Облачный сервис</option>
+                                </select>
+                                <label htmlFor="transcriptionPrivacy" className="block text-sm font-medium text-text-secondary mt-3 mb-1">
+                                    Конфиденциальность
+                                </label>
+                                <select
+                                    id="transcriptionPrivacy"
+                                    value={transcriptionPrivacy}
+                                    onChange={event => setTranscriptionPrivacy(event.target.value === 'cloud' ? 'cloud' : 'local')}
+                                    className="block w-full px-3 py-2 border border-border-primary bg-bg-secondary text-text-primary rounded-md focus:outline-none focus:ring-ring-focus focus:border-ring-focus sm:text-sm"
+                                >
+                                    <option value="local">Только локально</option>
+                                    <option value="cloud">Отправлять в облако</option>
+                                </select>
                             </div>
                             <div>
                                 <label htmlFor="transcriptionMaxDuration" className="block text-sm font-medium text-text-secondary mb-1">
@@ -596,6 +636,17 @@ const SettingsModal: React.FC<SettingsModalProps> = ({
                                     disabled={!transcriptionEnabled}
                                     className="appearance-none block w-full px-3 py-2 border border-border-primary bg-bg-secondary text-text-primary placeholder-text-secondary rounded-md focus:outline-none focus:ring-ring-focus focus:border-ring-focus sm:text-sm disabled:opacity-60"
                                     placeholder="без ограничений"
+                                />
+                                <label htmlFor="transcriptionTargetLanguage" className="block text-sm font-medium text-text-secondary mt-3 mb-1">
+                                    Целевой язык субтитров
+                                </label>
+                                <input
+                                    id="transcriptionTargetLanguage"
+                                    type="text"
+                                    value={transcriptionTargetLanguage}
+                                    onChange={(event) => setTranscriptionTargetLanguage(event.target.value)}
+                                    placeholder="например, en"
+                                    className="block w-full px-3 py-2 border border-border-primary bg-bg-secondary text-text-primary rounded-md focus:outline-none focus:ring-ring-focus focus:border-ring-focus sm:text-sm"
                                 />
                                 <p className="text-xs text-text-secondary mt-1">Оставьте пустым, чтобы не ограничивать продолжительность записи.</p>
                             </div>

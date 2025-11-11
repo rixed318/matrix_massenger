@@ -5,8 +5,15 @@ import { mxcToHttp } from '@matrix-messenger/core';
 import { CallEvent } from 'matrix-js-sdk';
 import CallParticipantsPanel, { Participant as CallParticipant } from './CallParticipantsPanel';
 import { GroupCallStageState } from '../services/webrtc/groupCallConstants';
-import type { CallDeviceEffectsState } from '../services/matrixService';
-import type { VideoEffectsConfiguration, VideoEffectsPreset } from '../services/videoEffectsService';
+import GroupCallCoordinator from '../services/webrtc/groupCallCoordinator';
+import {
+    startLiveTranscriptionSession,
+    stopLiveTranscriptionSession,
+    subscribeLiveTranscription,
+    translateCaption,
+    LiveTranscriptChunk,
+    getTranscriptionRuntimeConfig,
+} from '../services/transcriptionService';
 
 export type CallLayout = 'spotlight' | 'grid';
 
@@ -50,11 +57,7 @@ interface CallViewProps {
     callSession?: CallSessionState | null;
     onHandover?: () => void;
     localDeviceId?: string | null;
-    localEffectsState?: CallDeviceEffectsState | null;
-    onLocalEffectsChange?: (state: CallDeviceEffectsState) => void;
-    effectsPresets?: VideoEffectsPreset[];
-    onSaveEffectsPreset?: (preset: VideoEffectsPreset) => void | Promise<void>;
-    onToggleParticipantEffects?: (participantId: string, enabled: boolean) => void;
+    coordinator?: GroupCallCoordinator | null;
 }
 
 interface VideoTileInfo {
@@ -155,11 +158,7 @@ const CallView: React.FC<CallViewProps> = ({
     callSession,
     onHandover,
     localDeviceId,
-    localEffectsState,
-    onLocalEffectsChange,
-    effectsPresets,
-    onSaveEffectsPreset,
-    onToggleParticipantEffects,
+    coordinator,
 }) => {
     const [callState, setCallState] = useState<string>(call?.state ?? '');
     const [duration, setDuration] = useState(0);
@@ -168,13 +167,19 @@ const CallView: React.FC<CallViewProps> = ({
     const durationIntervalRef = useRef<number | null>(null);
     const localVideoRef = useRef<HTMLVideoElement>(null);
     const remoteVideoRef = useRef<HTMLVideoElement>(null);
-    const effectsPreviewRef = useRef<HTMLVideoElement>(null);
-    const backgroundFileInputRef = useRef<HTMLInputElement>(null);
-    const [effectsPanelOpen, setEffectsPanelOpen] = useState(false);
-    const BLUR_EFFECT_ID = 'local-blur';
-    const BACKGROUND_EFFECT_ID = 'local-background';
-    const NOISE_EFFECT_ID = 'local-noise';
-    const presets = effectsPresets ?? [];
+    const [liveCaptions, setLiveCaptions] = useState<Record<string, LiveTranscriptChunk>>({});
+    const [captionOrder, setCaptionOrder] = useState<string[]>([]);
+    const [captionLanguage, setCaptionLanguage] = useState<string>('auto');
+    const [captionTargetLanguage, setCaptionTargetLanguage] = useState<string>('');
+    const [captionAutoTranslate, setCaptionAutoTranslate] = useState<boolean>(false);
+    const [captionShowForAll, setCaptionShowForAll] = useState<boolean>(false);
+    const [captionsEnabled, setCaptionsEnabled] = useState<boolean>(true);
+    const captionSettingsRef = useRef({
+        autoTranslate: captionAutoTranslate,
+        targetLanguage: captionTargetLanguage,
+        showForAll: captionShowForAll,
+    });
+    const broadcastedChunksRef = useRef<Set<string>>(new Set());
 
     const isGroupCall = Boolean(participants && participants.length > 0);
     const stageSpeakers = useMemo(
@@ -186,213 +191,185 @@ const CallView: React.FC<CallViewProps> = ({
         [participants],
     );
     const queueOrder = stageState?.handRaiseQueue ?? [];
-    const videoEffects = localEffectsState?.configuration.video ?? [];
-    const audioEffects = localEffectsState?.configuration.audio ?? [];
-    const blurEffect = videoEffects.find(effect => effect.type === 'blur');
-    const blurIntensity = typeof blurEffect?.intensity === 'number' ? blurEffect.intensity : 0;
-    const backgroundEffect = videoEffects.find(effect => effect.type === 'background');
-    const backgroundMode: 'none' | 'gradient' | 'custom' = backgroundEffect
-        ? backgroundEffect.assetUrl
-            ? 'custom'
-            : 'gradient'
-        : 'none';
-    const noiseEffect = audioEffects.find(effect => effect.type === 'noise-suppression');
-    const noiseLevel = typeof noiseEffect?.intensity === 'number' ? noiseEffect.intensity : 0;
-    const applyEffectsToRemote = Boolean(localEffectsState?.applyToRemote);
-
-    const updateConfiguration = useCallback(
-        (
-            updater: (config: VideoEffectsConfiguration) => VideoEffectsConfiguration,
-            extra?: Partial<CallDeviceEffectsState>,
-        ) => {
-            if (!onLocalEffectsChange) {
-                return;
+    const callIdentifier = useMemo(() => {
+        if (callSession?.callId) return callSession.callId;
+        if (coordinator) return coordinator.sessionId;
+        const directId = (call as any)?.callId ?? (call as any)?.groupCallId;
+        return typeof directId === 'string' ? directId : null;
+    }, [callSession?.callId, coordinator, call]);
+    const latestCaption = useMemo(() => {
+        for (let idx = captionOrder.length - 1; idx >= 0; idx -= 1) {
+            const chunk = liveCaptions[captionOrder[idx]];
+            if (chunk && (chunk.final || chunk.text)) {
+                return chunk;
             }
-            const baseConfig: VideoEffectsConfiguration = {
-                video: videoEffects.map(effect => ({ ...effect })),
-                audio: audioEffects.map(effect => ({ ...effect })),
-            };
-            const baseState: CallDeviceEffectsState = {
-                presetId: localEffectsState?.presetId ?? null,
-                applyToRemote: localEffectsState?.applyToRemote ?? false,
-                configuration: baseConfig,
-            };
-            const nextConfig = updater(baseState.configuration);
-            onLocalEffectsChange({
-                presetId: extra?.presetId ?? baseState.presetId,
-                applyToRemote: extra?.applyToRemote ?? baseState.applyToRemote,
-                configuration: nextConfig,
-            });
-        },
-        [onLocalEffectsChange, videoEffects, audioEffects, localEffectsState],
-    );
-
-    const handleBlurIntensity = useCallback(
-        (value: number) => {
-            updateConfiguration(
-                config => {
-                    const filtered = config.video.filter(effect => effect.type !== 'blur');
-                    if (value > 0) {
-                        const existing = config.video.find(effect => effect.type === 'blur');
-                        filtered.push({
-                            id: existing?.id ?? BLUR_EFFECT_ID,
-                            type: 'blur',
-                            intensity: value,
-                            enabled: true,
-                            assetUrl: existing?.assetUrl,
-                        });
-                    }
-                    return { ...config, video: filtered };
-                },
-                { presetId: null },
-            );
-        },
-        [updateConfiguration],
-    );
-
-    const handleBackgroundMode = useCallback(
-        (mode: 'none' | 'gradient' | 'custom', assetUrl?: string | null) => {
-            updateConfiguration(
-                config => {
-                    const filtered = config.video.filter(effect => effect.type !== 'background');
-                    if (mode === 'none') {
-                        return { ...config, video: filtered };
-                    }
-                    const existing = config.video.find(effect => effect.type === 'background');
-                    const nextEffect = {
-                        id: existing?.id ?? BACKGROUND_EFFECT_ID,
-                        type: 'background' as const,
-                        intensity: typeof existing?.intensity === 'number' ? existing.intensity : 1,
-                        assetUrl: mode === 'gradient' ? null : assetUrl ?? existing?.assetUrl ?? null,
-                        enabled: true,
-                    };
-                    return { ...config, video: [nextEffect, ...filtered] };
-                },
-                { presetId: null },
-            );
-        },
-        [updateConfiguration],
-    );
-
-    const handleNoiseLevel = useCallback(
-        (value: number) => {
-            updateConfiguration(
-                config => {
-                    const filtered = config.audio.filter(effect => effect.type !== 'noise-suppression');
-                    if (value <= 0) {
-                        return { ...config, audio: filtered };
-                    }
-                    const existing = config.audio.find(effect => effect.type === 'noise-suppression');
-                    filtered.push({
-                        id: existing?.id ?? NOISE_EFFECT_ID,
-                        type: 'noise-suppression',
-                        intensity: value,
-                        enabled: true,
-                    });
-                    return { ...config, audio: filtered };
-                },
-                { presetId: null },
-            );
-        },
-        [updateConfiguration],
-    );
-
-    const handleApplyEffectsToRemote = useCallback(
-        (enabled: boolean) => {
-            updateConfiguration(config => ({ ...config }), { applyToRemote: enabled });
-        },
-        [updateConfiguration],
-    );
-
-    const handlePresetSelect = useCallback(
-        (presetId: string) => {
-            if (!onLocalEffectsChange) return;
-            if (!presetId) {
-                onLocalEffectsChange({
-                    presetId: null,
-                    applyToRemote: localEffectsState?.applyToRemote ?? false,
-                    configuration: {
-                        video: videoEffects.map(effect => ({ ...effect })),
-                        audio: audioEffects.map(effect => ({ ...effect })),
-                    },
-                });
-                return;
-            }
-            const preset = presets.find(item => item.id === presetId);
-            if (preset) {
-                onLocalEffectsChange({
-                    presetId: preset.id,
-                    applyToRemote: localEffectsState?.applyToRemote ?? false,
-                    configuration: {
-                        video: preset.video.map(effect => ({ ...effect })),
-                        audio: preset.audio.map(effect => ({ ...effect })),
-                    },
-                });
-            }
-        },
-        [onLocalEffectsChange, presets, localEffectsState, videoEffects, audioEffects],
-    );
-
-    const handleSavePreset = useCallback(async () => {
-        if (!onSaveEffectsPreset || !onLocalEffectsChange) return;
-        const suggested = localEffectsState?.presetId ? `Копия ${localEffectsState.presetId}` : 'Мой пресет';
-        const label = window.prompt('Название пресета', suggested);
-        if (!label) return;
-        const trimmed = label.trim();
-        if (!trimmed) return;
-        const preset: VideoEffectsPreset = {
-            id: `preset-${Date.now().toString(36)}`,
-            label: trimmed,
-            video: videoEffects.map(effect => ({ ...effect })),
-            audio: audioEffects.map(effect => ({ ...effect })),
-            updatedAt: Date.now(),
-        };
-        await onSaveEffectsPreset(preset);
-        onLocalEffectsChange({
-            presetId: preset.id,
-            applyToRemote: localEffectsState?.applyToRemote ?? false,
-            configuration: {
-                video: preset.video.map(effect => ({ ...effect })),
-                audio: preset.audio.map(effect => ({ ...effect })),
-            },
-        });
-    }, [onSaveEffectsPreset, onLocalEffectsChange, localEffectsState, videoEffects, audioEffects]);
-
-    const handleBackgroundUpload = useCallback(
-        (event: React.ChangeEvent<HTMLInputElement>) => {
-            const file = event.target.files?.[0];
-            if (!file) return;
-            const reader = new FileReader();
-            reader.onload = () => {
-                const result = typeof reader.result === 'string' ? reader.result : null;
-                if (result) {
-                    handleBackgroundMode('custom', result);
-                }
-            };
-            reader.readAsDataURL(file);
-            if (backgroundFileInputRef.current) {
-                backgroundFileInputRef.current.value = '';
-            }
-            event.target.value = '';
-        },
-        [handleBackgroundMode],
-    );
+        }
+        return null;
+    }, [captionOrder, liveCaptions]);
 
     useEffect(() => {
-        if (!effectsPreviewRef.current) return;
-        const localStream = participants?.find(participant => participant.isLocal)?.stream ?? null;
-        const element = effectsPreviewRef.current;
-        try {
-            if (localStream) {
-                (element as HTMLVideoElement).srcObject = localStream;
-                void element.play().catch(() => undefined);
-            } else {
-                (element as HTMLVideoElement).srcObject = null;
-            }
-        } catch (error) {
-            console.warn('Failed to attach preview stream', error);
+        captionSettingsRef.current = {
+            autoTranslate: captionAutoTranslate,
+            targetLanguage: captionTargetLanguage,
+            showForAll: captionShowForAll,
+        };
+    }, [captionAutoTranslate, captionTargetLanguage, captionShowForAll]);
+
+    useEffect(() => {
+        if (callSession) return;
+        const runtime = getTranscriptionRuntimeConfig();
+        if (!captionTargetLanguage && runtime.defaultTargetLanguage) {
+            setCaptionTargetLanguage(runtime.defaultTargetLanguage);
         }
-    }, [participants]);
+        if (captionLanguage === 'auto' && runtime.defaultLanguage) {
+            setCaptionLanguage(runtime.defaultLanguage);
+        }
+    }, [callSession, captionLanguage, captionTargetLanguage]);
+
+    useEffect(() => {
+        if (!callSession) {
+            return;
+        }
+        const deviceId = localDeviceId ?? client.getDeviceId?.() ?? null;
+        const device = deviceId ? callSession.devices.find(d => d.deviceId === deviceId) : null;
+        const prefs = device?.captionPreferences;
+        if (prefs) {
+            if (typeof prefs.language === 'string') {
+                setCaptionLanguage(prefs.language || 'auto');
+            }
+            if (typeof prefs.targetLanguage === 'string') {
+                setCaptionTargetLanguage(prefs.targetLanguage);
+            }
+            setCaptionAutoTranslate(prefs.autoTranslate === true);
+            setCaptionShowForAll(prefs.showForAll === true);
+        }
+    }, [callSession, localDeviceId, client]);
+
+    useEffect(() => {
+        if (!callIdentifier) return;
+        const unsubscribe = subscribeLiveTranscription(callIdentifier, chunk => {
+            setLiveCaptions(prev => ({
+                ...prev,
+                [chunk.chunkId]: {
+                    ...(prev[chunk.chunkId] ?? {}),
+                    ...chunk,
+                },
+            }));
+            setCaptionOrder(prev => (prev.includes(chunk.chunkId) ? prev : [...prev, chunk.chunkId]));
+            if (chunk.final && chunk.source === 'local' && coordinator && captionSettingsRef.current.showForAll) {
+                if (!broadcastedChunksRef.current.has(chunk.chunkId)) {
+                    coordinator.publishCaption(chunk.text, {
+                        id: chunk.chunkId,
+                        language: chunk.language,
+                        final: chunk.final,
+                        translatedText: chunk.translatedText,
+                        targetLanguage: chunk.targetLanguage,
+                    });
+                    broadcastedChunksRef.current.add(chunk.chunkId);
+                }
+            }
+            if (chunk.final) {
+                const settings = captionSettingsRef.current;
+                if (
+                    settings.autoTranslate &&
+                    typeof settings.targetLanguage === 'string' &&
+                    settings.targetLanguage.trim().length > 0 &&
+                    !chunk.translatedText
+                ) {
+                    const target = settings.targetLanguage.trim();
+                    void translateCaption(callIdentifier, chunk.text, target, chunk.language)
+                        .then(result => {
+                            if (!result) return;
+                            setLiveCaptions(current => {
+                                const existing = current[chunk.chunkId];
+                                if (!existing) return current;
+                                return {
+                                    ...current,
+                                    [chunk.chunkId]: {
+                                        ...existing,
+                                        translatedText: result,
+                                        targetLanguage: target,
+                                    },
+                                };
+                            });
+                            if (settings.showForAll && coordinator) {
+                                const key = `${chunk.chunkId}:tl:${target}`;
+                                if (!broadcastedChunksRef.current.has(key)) {
+                                    coordinator.publishCaptionTranslation(chunk.chunkId, result, target);
+                                    broadcastedChunksRef.current.add(key);
+                                }
+                            }
+                        })
+                        .catch(error => console.warn('Failed to translate caption', error));
+                }
+            }
+        });
+        return unsubscribe;
+    }, [callIdentifier, coordinator]);
+
+    useEffect(() => {
+        if (!coordinator || !callIdentifier) return;
+        if (!(captionsEnabled || captionShowForAll || captionAutoTranslate)) {
+            return;
+        }
+        const stream = coordinator.getLocalStream();
+        if (!stream) {
+            return;
+        }
+        const session = startLiveTranscriptionSession(stream, {
+            callId: callIdentifier,
+            language: captionLanguage === 'auto' ? undefined : captionLanguage,
+        });
+        return () => {
+            if (session) {
+                stopLiveTranscriptionSession(callIdentifier);
+            }
+        };
+    }, [coordinator, callIdentifier, captionLanguage, captionsEnabled, captionShowForAll, captionAutoTranslate]);
+
+    const persistCaptionPreferences = (
+        next: {
+            language?: string;
+            targetLanguage?: string;
+            autoTranslate?: boolean;
+            showForAll?: boolean;
+        },
+    ) => {
+        const effective = {
+            language: next.language ?? captionLanguage,
+            targetLanguage: next.targetLanguage ?? captionTargetLanguage,
+            autoTranslate: next.autoTranslate ?? captionAutoTranslate,
+            showForAll: next.showForAll ?? captionShowForAll,
+        };
+        updateLocalCallDeviceState(client, {
+            captionPreferences: {
+                language: effective.language === 'auto' ? undefined : effective.language,
+                targetLanguage: effective.targetLanguage?.trim() || undefined,
+                autoTranslate: effective.autoTranslate,
+                showForAll: effective.showForAll,
+            },
+        });
+    };
+
+    const handleCaptionLanguageChange = (value: string) => {
+        setCaptionLanguage(value);
+        persistCaptionPreferences({ language: value });
+    };
+
+    const handleCaptionTargetChange = (value: string) => {
+        setCaptionTargetLanguage(value);
+        persistCaptionPreferences({ targetLanguage: value });
+    };
+
+    const handleCaptionAutoTranslateChange = (enabled: boolean) => {
+        setCaptionAutoTranslate(enabled);
+        persistCaptionPreferences({ autoTranslate: enabled });
+    };
+
+    const handleCaptionShowForAllChange = (enabled: boolean) => {
+        setCaptionShowForAll(enabled);
+        persistCaptionPreferences({ showForAll: enabled });
+    };
 
     useEffect(() => {
         if (!call || isGroupCall) return;
@@ -614,16 +591,11 @@ const CallView: React.FC<CallViewProps> = ({
                 <div className="absolute top-6 right-6 flex items-center gap-3">
                     <div className="text-sm text-text-secondary">{headerTitle || 'Групповой звонок'}</div>
                     <button
-                        className={`px-3 py-1 rounded-full text-sm ${
-                            effectsPanelOpen
-                                ? 'bg-indigo-600 text-white'
-                                : 'bg-bg-secondary hover:bg-bg-tertiary text-text-secondary'
-                        } ${!onLocalEffectsChange ? 'opacity-50 cursor-not-allowed hover:bg-bg-secondary' : ''}`}
-                        onClick={() => onLocalEffectsChange && setEffectsPanelOpen(prev => !prev)}
+                        className={`px-3 py-1 rounded-full text-sm ${captionsEnabled ? 'bg-indigo-600 text-white' : 'bg-bg-secondary hover:bg-bg-tertiary text-text-secondary'}`}
+                        onClick={() => setCaptionsEnabled(prev => !prev)}
                         type="button"
-                        disabled={!onLocalEffectsChange}
                     >
-                        ✨ Эффекты
+                        {captionsEnabled ? 'CC вкл.' : 'CC выкл.'}
                     </button>
                     <button
                         className="px-3 py-1 rounded-full text-sm bg-bg-secondary hover:bg-bg-tertiary"
@@ -735,6 +707,20 @@ const CallView: React.FC<CallViewProps> = ({
                         </div>
                     )}
                 </div>
+
+                {captionsEnabled && latestCaption && (
+                    <div className="absolute bottom-36 inset-x-0 flex justify-center pointer-events-none px-6">
+                        <div className="max-w-3xl bg-black/70 text-white px-4 py-3 rounded-2xl text-center text-base shadow-lg">
+                            <div className="font-medium break-words">{latestCaption.translatedText ?? latestCaption.text}</div>
+                            <div className="text-xs text-white/70 mt-1">
+                                {(latestCaption.language || 'auto').toUpperCase()}
+                                {latestCaption.translatedText
+                                    ? ` → ${(latestCaption.targetLanguage || captionTargetLanguage || '').toUpperCase()}`
+                                    : ''}
+                            </div>
+                        </div>
+                    </div>
+                )}
 
                 <div className="absolute bottom-12 inset-x-0 flex flex-wrap items-center justify-center gap-4">
                     {canRaise && (
@@ -950,7 +936,14 @@ const CallView: React.FC<CallViewProps> = ({
                         onLowerHand={id => onLowerHand?.(id)}
                         localUserId={localUserId}
                         canModerate={canModerateParticipants}
-                        onToggleEffects={onToggleParticipantEffects}
+                        captionLanguage={captionLanguage}
+                        captionTargetLanguage={captionTargetLanguage}
+                        captionAutoTranslate={captionAutoTranslate}
+                        captionShowForAll={captionShowForAll}
+                        onCaptionLanguageChange={handleCaptionLanguageChange}
+                        onCaptionTargetLanguageChange={handleCaptionTargetChange}
+                        onCaptionAutoTranslateChange={handleCaptionAutoTranslateChange}
+                        onCaptionShowForAllChange={handleCaptionShowForAllChange}
                     />
                 )}
             </div>
@@ -984,6 +977,16 @@ const CallView: React.FC<CallViewProps> = ({
                     className="absolute top-0 left-0 w-full h-full object-cover"
                 />
             )}
+
+            <div className="absolute top-6 right-6 flex items-center gap-3 z-10">
+                <button
+                    className={`px-3 py-1 rounded-full text-sm ${captionsEnabled ? 'bg-indigo-600 text-white' : 'bg-bg-secondary hover:bg-bg-tertiary text-text-secondary'}`}
+                    onClick={() => setCaptionsEnabled(prev => !prev)}
+                    type="button"
+                >
+                    {captionsEnabled ? 'CC вкл.' : 'CC выкл.'}
+                </button>
+            </div>
 
             <div className="relative text-center z-10">
                 {!isVideoCall && <Avatar name={peerName} imageUrl={peerAvatar} size="md" />}
@@ -1031,6 +1034,20 @@ const CallView: React.FC<CallViewProps> = ({
                     muted
                     className={`absolute bottom-40 right-8 w-48 h-auto rounded-lg shadow-lg border-2 border-gray-700 transition-opacity ${computedVideoMuted ? 'opacity-0' : 'opacity-100'}`}
                 />
+            )}
+
+            {captionsEnabled && latestCaption && (
+                <div className="absolute bottom-28 inset-x-0 flex justify-center pointer-events-none px-6 z-10">
+                    <div className="max-w-2xl bg-black/70 text-white px-4 py-3 rounded-2xl text-center text-base shadow-lg">
+                        <div className="font-medium break-words">{latestCaption.translatedText ?? latestCaption.text}</div>
+                        <div className="text-xs text-white/70 mt-1">
+                            {(latestCaption.language || 'auto').toUpperCase()}
+                            {latestCaption.translatedText
+                                ? ` → ${(latestCaption.targetLanguage || captionTargetLanguage || '').toUpperCase()}`
+                                : ''}
+                        </div>
+                    </div>
+                </div>
             )}
 
             <div className="absolute bottom-16 flex items-center gap-8 z-10">

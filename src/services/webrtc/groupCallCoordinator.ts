@@ -12,7 +12,10 @@ import {
     GroupCallStageState,
     SerializedGroupCallParticipant,
 } from './groupCallConstants';
-import { MediaEffectsController, VideoEffectsConfiguration, videoEffectsService } from '../videoEffectsService';
+import { appendCallCaptionEvent, CallCaptionEvent } from '../matrixService';
+import { emitRemoteLiveTranscriptionChunk, LiveTranscriptChunk } from '../transcriptionService';
+import { recordCallCaption } from '../mediaIndexService';
+import { announceCallTranscript } from '../pushService';
 
 export interface GroupCallParticipant extends SerializedGroupCallParticipant {
     stream?: MediaStream | null;
@@ -86,10 +89,10 @@ interface PendingSignal {
     payload: any;
 }
 
-const cloneEffectsConfig = (config: VideoEffectsConfiguration): VideoEffectsConfiguration => ({
-    video: config.video.map(effect => ({ ...effect })),
-    audio: config.audio.map(effect => ({ ...effect })),
-});
+type CaptionMessage =
+    | { type: 'call.caption'; payload: CallCaptionEvent }
+    | { type: 'call.caption_translation'; payload: { captionId: string; text: string; targetLanguage: string; sender: string; timestamp: number } }
+    | { type: 'call.caption_history'; payload: CallCaptionEvent[] };
 
 export class GroupCallCoordinator {
     readonly roomId: string;
@@ -121,6 +124,7 @@ export class GroupCallCoordinator {
     private participants = new Map<string, InternalParticipant>();
     private peers = new Map<string, RTCPeerConnection>();
     private dataChannels = new Map<string, RTCDataChannel>();
+    private captionChannels = new Map<string, RTCDataChannel>();
     private pendingSignals = new Map<string, PendingSignal[]>();
     private incomingEffectsControllers = new Map<string, MediaEffectsController>();
     private incomingEffectsConfig = new Map<string, VideoEffectsConfiguration>();
@@ -129,6 +133,7 @@ export class GroupCallCoordinator {
     private joinNonce = randomId();
     private scheduleSyncHandle: number | null = null;
     private clientListener?: (event: MatrixEvent) => void;
+    private captionHistory: CallCaptionEvent[] = [];
 
     private constructor(options: GroupCallCoordinatorOptions) {
         this.client = options.client;
@@ -416,11 +421,17 @@ export class GroupCallCoordinator {
         };
 
         pc.ondatachannel = event => {
-            this.setupDataChannel(remoteUserId, event.channel);
+            if (event.channel.label === 'captions') {
+                this.setupCaptionChannel(remoteUserId, event.channel);
+            } else {
+                this.setupDataChannel(remoteUserId, event.channel);
+            }
         };
 
-        const channel = pc.createDataChannel('control');
-        this.setupDataChannel(remoteUserId, channel);
+        const controlChannel = pc.createDataChannel('control');
+        this.setupDataChannel(remoteUserId, controlChannel);
+        const captionChannel = pc.createDataChannel('captions', { ordered: true });
+        this.setupCaptionChannel(remoteUserId, captionChannel);
 
         const pending = this.pendingSignals.get(remoteUserId) || [];
         this.pendingSignals.delete(remoteUserId);
@@ -562,6 +573,162 @@ export class GroupCallCoordinator {
                 channel.send(JSON.stringify(payload));
             }
         };
+    }
+
+    private setupCaptionChannel(remoteUserId: string, channel: RTCDataChannel) {
+        this.captionChannels.set(remoteUserId, channel);
+        channel.onmessage = (event) => {
+            try {
+                const message = JSON.parse(event.data) as CaptionMessage;
+                this.handleCaptionMessage(remoteUserId, message);
+            } catch (error) {
+                console.warn('Failed to parse caption message', error);
+            }
+        };
+        channel.onopen = () => {
+            if (channel.readyState === 'open') {
+                this.sendCaptionHistory(remoteUserId);
+            }
+        };
+        channel.onclose = () => {
+            this.captionChannels.delete(remoteUserId);
+        };
+    }
+
+    private sendCaptionHistory(remoteUserId: string) {
+        const channel = this.captionChannels.get(remoteUserId);
+        if (!channel || channel.readyState !== 'open' || this.captionHistory.length === 0) {
+            return;
+        }
+        const payload: CaptionMessage = {
+            type: 'call.caption_history',
+            payload: this.captionHistory.slice(-50),
+        };
+        try {
+            channel.send(JSON.stringify(payload));
+        } catch (error) {
+            console.warn('Failed to send caption history', error);
+        }
+    }
+
+    private broadcastCaptionMessage(message: CaptionMessage) {
+        const data = JSON.stringify(message);
+        this.captionChannels.forEach(channel => {
+            if (channel.readyState === 'open') {
+                try {
+                    channel.send(data);
+                } catch (error) {
+                    console.warn('Failed to broadcast caption message', error);
+                }
+            }
+        });
+    }
+
+    private handleCaptionMessage(remoteUserId: string, message: CaptionMessage) {
+        if (message.type === 'call.caption') {
+            const event = { ...message.payload, source: 'remote' as const };
+            this.ingestCaptionEvent(event);
+        } else if (message.type === 'call.caption_translation') {
+            this.applyCaptionTranslation({
+                captionId: message.payload.captionId,
+                text: message.payload.text,
+                targetLanguage: message.payload.targetLanguage,
+                sender: message.payload.sender ?? remoteUserId,
+                timestamp: message.payload.timestamp ?? Date.now(),
+            });
+        } else if (message.type === 'call.caption_history') {
+            const events = Array.isArray(message.payload) ? message.payload : [];
+            events.forEach(event => this.ingestCaptionEvent({ ...event, source: 'remote' }));
+        }
+    }
+
+    private ingestCaptionEvent(event: CallCaptionEvent) {
+        const normalized: CallCaptionEvent = {
+            ...event,
+            callId: event.callId || this.sessionId,
+            id: event.id || `${this.sessionId}:${event.timestamp ?? Date.now()}`,
+            timestamp: event.timestamp ?? Date.now(),
+            final: event.final !== false,
+            source: event.source === 'local' ? 'local' : 'remote',
+        };
+        this.captionHistory.push(normalized);
+        this.captionHistory = this.captionHistory.slice(-100);
+        appendCallCaptionEvent(this.client, normalized);
+        recordCallCaption(this.roomId, {
+            id: normalized.id,
+            callId: normalized.callId,
+            text: normalized.text,
+            language: normalized.language,
+            translatedText: normalized.translatedText,
+            targetLanguage: normalized.targetLanguage,
+            timestamp: normalized.timestamp,
+            sender: normalized.sender,
+        });
+        announceCallTranscript({
+            callId: normalized.callId,
+            roomId: this.roomId,
+            text: normalized.translatedText ?? normalized.text,
+            language: normalized.language,
+            targetLanguage: normalized.targetLanguage,
+            timestamp: normalized.timestamp,
+            sender: normalized.sender,
+        });
+        const chunk: LiveTranscriptChunk = {
+            callId: normalized.callId,
+            chunkId: normalized.id,
+            text: normalized.text,
+            language: normalized.language,
+            timestamp: normalized.timestamp,
+            final: normalized.final,
+            source: normalized.source,
+            translatedText: normalized.translatedText,
+            targetLanguage: normalized.targetLanguage,
+        };
+        emitRemoteLiveTranscriptionChunk(chunk);
+    }
+
+    private applyCaptionTranslation(payload: { captionId: string; text: string; targetLanguage: string; sender: string; timestamp: number }) {
+        if (!payload.captionId || !payload.text) {
+            return;
+        }
+        const entry = this.captionHistory.find(event => event.id === payload.captionId);
+        if (!entry) {
+            return;
+        }
+        entry.translatedText = payload.text;
+        entry.targetLanguage = payload.targetLanguage;
+        entry.timestamp = payload.timestamp || entry.timestamp;
+        appendCallCaptionEvent(this.client, entry);
+        recordCallCaption(this.roomId, {
+            id: entry.id,
+            callId: entry.callId,
+            text: entry.text,
+            language: entry.language,
+            translatedText: entry.translatedText,
+            targetLanguage: entry.targetLanguage,
+            timestamp: entry.timestamp,
+            sender: entry.sender,
+        });
+        announceCallTranscript({
+            callId: entry.callId,
+            roomId: this.roomId,
+            text: entry.translatedText ?? entry.text,
+            language: entry.language,
+            targetLanguage: entry.targetLanguage,
+            timestamp: entry.timestamp,
+            sender: entry.sender,
+        });
+        emitRemoteLiveTranscriptionChunk({
+            callId: entry.callId,
+            chunkId: `${entry.id}:translation:${payload.targetLanguage}`,
+            text: entry.text,
+            language: entry.language,
+            timestamp: entry.timestamp,
+            final: entry.final,
+            source: 'remote',
+            translatedText: payload.text,
+            targetLanguage: payload.targetLanguage,
+        });
     }
 
     private handleControlPayload(remoteUserId: string, message: GroupCallControlMessage) {
@@ -714,6 +881,13 @@ export class GroupCallCoordinator {
             this.peers.delete(remoteUserId);
         }
         this.dataChannels.delete(remoteUserId);
+        const captionChannel = this.captionChannels.get(remoteUserId);
+        try {
+            captionChannel?.close();
+        } catch (error) {
+            console.warn('Failed to close caption channel', error);
+        }
+        this.captionChannels.delete(remoteUserId);
         this.updateStageState(true);
     }
 
@@ -1217,6 +1391,45 @@ export class GroupCallCoordinator {
         void this.sendControlMessage(message);
     }
 
+    public publishCaption(text: string, options: {
+        id?: string;
+        language?: string;
+        final?: boolean;
+        translatedText?: string;
+        targetLanguage?: string;
+    } = {}): CallCaptionEvent {
+        const event: CallCaptionEvent = {
+            id: options.id || `${this.sessionId}:${Date.now()}:${Math.random().toString(36).slice(2, 6)}`,
+            callId: this.sessionId,
+            sender: this.localMember.userId,
+            text,
+            language: options.language,
+            translatedText: options.translatedText,
+            targetLanguage: options.targetLanguage,
+            timestamp: Date.now(),
+            final: options.final !== false,
+            source: 'local',
+        };
+        this.ingestCaptionEvent(event);
+        this.broadcastCaptionMessage({ type: 'call.caption', payload: event });
+        return event;
+    }
+
+    public publishCaptionTranslation(captionId: string, text: string, targetLanguage: string) {
+        if (!captionId || !text || !targetLanguage) {
+            return;
+        }
+        const payload = {
+            captionId,
+            text,
+            targetLanguage,
+            sender: this.localMember.userId,
+            timestamp: Date.now(),
+        };
+        this.applyCaptionTranslation(payload);
+        this.broadcastCaptionMessage({ type: 'call.caption_translation', payload });
+    }
+
     async leave() {
         if (this.disposed) return;
         this.disposed = true;
@@ -1236,6 +1449,15 @@ export class GroupCallCoordinator {
         this.peers.forEach(pc => pc.close());
         this.peers.clear();
         this.dataChannels.clear();
+        this.captionChannels.forEach(channel => {
+            try {
+                channel.close();
+            } catch (error) {
+                console.warn('Failed to close caption channel on leave', error);
+            }
+        });
+        this.captionChannels.clear();
+        this.captionHistory = [];
         this.handRaiseQueue = [];
         this.stageState = {
             speakers: [],

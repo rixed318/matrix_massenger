@@ -53,6 +53,20 @@ const postToServiceWorker = (type: string, payload: Record<string, unknown>) => 
   }
 };
 
+export interface CallTranscriptNotification {
+  callId: string;
+  roomId: string;
+  text: string;
+  language?: string;
+  targetLanguage?: string;
+  timestamp: number;
+  sender: string;
+}
+
+export const announceCallTranscript = (transcript: CallTranscriptNotification) => {
+  postToServiceWorker('CALL_TRANSCRIPT_READY', transcript as unknown as Record<string, unknown>);
+};
+
 export interface StoredPushSubscription {
   endpoint: string;
   auth: string;

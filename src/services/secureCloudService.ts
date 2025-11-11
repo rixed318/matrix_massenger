@@ -2,6 +2,7 @@ import { RoomEvent, EventType } from 'matrix-js-sdk';
 import type { MatrixClient, MatrixEvent, MatrixRoom } from '../types';
 import { getLocalMlDetectors } from './secureCloudDetectors/localMl';
 import { getRegisteredDetectors } from './secureCloudDetectors/registry';
+import { getKnowledgeDocumentsBySource } from './knowledgeBaseService';
 
 export type SecureCloudMode = 'disabled' | 'managed' | 'self-hosted';
 
@@ -159,6 +160,7 @@ export interface SecureCloudLogExportOptions {
     includeHeaders?: boolean;
     fromTimestamp?: number;
     toTimestamp?: number;
+    includeKnowledgeDocs?: boolean;
 }
 
 export interface SecureCloudAggregatedExportOptions {
@@ -598,6 +600,7 @@ export const exportSuspiciousEventsLog = (
         includeHeaders = true,
         fromTimestamp,
         toTimestamp,
+        includeKnowledgeDocs = false,
     } = options;
     const notices = getSuspiciousEvents(client, roomId);
     const fromTs = typeof fromTimestamp === 'number' && Number.isFinite(fromTimestamp)
@@ -616,18 +619,49 @@ export const exportSuspiciousEventsLog = (
         }
         return true;
     });
-    const records = filtered.map(notice => ({
-        event_id: notice.eventId,
-        room_id: notice.roomId,
-        room_name: notice.roomName ?? '',
-        sender: notice.sender,
-        timestamp: new Date(notice.timestamp).toISOString(),
-        risk_score: notice.riskScore,
-        reasons: (notice.reasons ?? []).join(';'),
-        keywords: (notice.keywords ?? []).join(';'),
-        summary: notice.summary,
-        age_ms: Math.max(0, Date.now() - notice.timestamp),
-    }));
+    let knowledgeLookup: Map<string, Array<{ id: string; title: string; tags: string[]; channel_id: string | null; space_id: string | null; updated_at: string }>> | null = null;
+    if (includeKnowledgeDocs) {
+        const eventIds = filtered
+            .map(notice => notice.eventId)
+            .filter((value): value is string => typeof value === 'string' && value.length > 0);
+        if (eventIds.length) {
+            knowledgeLookup = new Map();
+            const documents = getKnowledgeDocumentsBySource(eventIds);
+            for (const doc of documents) {
+                for (const source of doc.sources) {
+                    if (!source.eventId) {
+                        continue;
+                    }
+                    const existing = knowledgeLookup.get(source.eventId) ?? [];
+                    existing.push({
+                        id: doc.id,
+                        title: doc.title,
+                        tags: (doc.tags ?? []).map(tag => tag.toLowerCase()),
+                        channel_id: doc.channelId ?? null,
+                        space_id: doc.spaceId ?? null,
+                        updated_at: new Date(doc.updatedAt).toISOString(),
+                    });
+                    knowledgeLookup.set(source.eventId, existing);
+                }
+            }
+        }
+    }
+    const records = filtered.map(notice => {
+        const docMeta = includeKnowledgeDocs && knowledgeLookup ? knowledgeLookup.get(notice.eventId ?? '') ?? [] : undefined;
+        return {
+            event_id: notice.eventId,
+            room_id: notice.roomId,
+            room_name: notice.roomName ?? '',
+            sender: notice.sender,
+            timestamp: new Date(notice.timestamp).toISOString(),
+            risk_score: notice.riskScore,
+            reasons: (notice.reasons ?? []).join(';'),
+            keywords: (notice.keywords ?? []).join(';'),
+            summary: notice.summary,
+            age_ms: Math.max(0, Date.now() - notice.timestamp),
+            knowledge_docs: docMeta && docMeta.length ? docMeta : undefined,
+        };
+    });
 
     let payload: string;
     if (format === 'csv') {
@@ -643,6 +677,9 @@ export const exportSuspiciousEventsLog = (
             'summary',
             'age_ms',
         ];
+        if (includeKnowledgeDocs) {
+            headers.push('knowledge_docs');
+        }
         const rows: string[] = [];
         if (includeHeaders) {
             rows.push(headers.join(','));
@@ -650,6 +687,13 @@ export const exportSuspiciousEventsLog = (
         for (const record of records) {
             const values = headers.map(header => {
                 const raw = record[header as keyof typeof record];
+                if (header === 'knowledge_docs') {
+                    if (!Array.isArray(raw)) {
+                        return '';
+                    }
+                    const summary = raw.map(doc => `${doc.id}:${doc.title}`).join(' | ');
+                    return escapeCsvCell(summary);
+                }
                 return escapeCsvCell(raw != null ? String(raw) : '');
             });
             rows.push(values.join(','));
