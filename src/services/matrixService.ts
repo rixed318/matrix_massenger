@@ -206,6 +206,27 @@ export interface CallSessionDeviceState {
     connected?: boolean;
     isRemote?: boolean;
     lastSeenTs: number;
+    captionPreferences?: CallCaptionPreferences;
+}
+
+export interface CallCaptionPreferences {
+    language?: string;
+    targetLanguage?: string;
+    autoTranslate?: boolean;
+    showForAll?: boolean;
+}
+
+export interface CallCaptionEvent {
+    id: string;
+    callId: string;
+    sender: string;
+    text: string;
+    language?: string;
+    translatedText?: string;
+    targetLanguage?: string;
+    timestamp: number;
+    final: boolean;
+    source: 'local' | 'remote';
 }
 
 export interface CallSessionState {
@@ -217,6 +238,8 @@ export interface CallSessionState {
     updatedAt: number;
     startedAt?: number;
     devices: CallSessionDeviceState[];
+    captions?: CallCaptionEvent[];
+    captionSequence?: number;
 }
 
 type CallStateListener = (state: CallSessionState | null) => void;
@@ -253,6 +276,29 @@ const nextCallStateTimestamp = (): number => {
     return now;
 };
 
+const sanitiseCaptionPreferences = (prefs: CallCaptionPreferences | undefined): CallCaptionPreferences | undefined => {
+    if (!prefs) {
+        return undefined;
+    }
+    const language = typeof prefs.language === 'string' && prefs.language.trim().length
+        ? prefs.language.trim().toLowerCase()
+        : undefined;
+    const targetLanguage = typeof prefs.targetLanguage === 'string' && prefs.targetLanguage.trim().length
+        ? prefs.targetLanguage.trim().toLowerCase()
+        : undefined;
+    const showForAll = prefs.showForAll === true;
+    const autoTranslate = prefs.autoTranslate === true;
+    if (!language && !targetLanguage && !showForAll && !autoTranslate) {
+        return undefined;
+    }
+    return {
+        language,
+        targetLanguage,
+        autoTranslate,
+        showForAll,
+    };
+};
+
 const sanitiseDevices = (devices: CallSessionDeviceState[] | undefined): CallSessionDeviceState[] => {
     if (!Array.isArray(devices)) {
         return [];
@@ -272,6 +318,7 @@ const sanitiseDevices = (devices: CallSessionDeviceState[] | undefined): CallSes
             connected: device.connected === true,
             isRemote: device.isRemote === true ? true : undefined,
             lastSeenTs: lastSeen,
+            captionPreferences: sanitiseCaptionPreferences(device.captionPreferences),
         });
     });
     return Array.from(deduped.values()).sort((a, b) => (b.lastSeenTs || 0) - (a.lastSeenTs || 0));
@@ -299,6 +346,21 @@ const sanitiseCallSession = (session: CallSessionState): CallSessionState => {
         updatedAt,
         startedAt: Number.isFinite(session.startedAt) ? session.startedAt : undefined,
         devices,
+        captions: Array.isArray(session.captions)
+            ? session.captions.slice(-100).map((caption): CallCaptionEvent => ({
+                id: typeof caption.id === 'string' ? caption.id : `${session.callId}:${caption.timestamp ?? Date.now()}`,
+                callId,
+                sender: typeof caption.sender === 'string' ? caption.sender : '',
+                text: typeof caption.text === 'string' ? caption.text : '',
+                language: typeof caption.language === 'string' ? caption.language : undefined,
+                translatedText: typeof caption.translatedText === 'string' ? caption.translatedText : undefined,
+                targetLanguage: typeof caption.targetLanguage === 'string' ? caption.targetLanguage : undefined,
+                timestamp: Number.isFinite(caption.timestamp) ? caption.timestamp : Date.now(),
+                final: caption.final !== false,
+                source: caption.source === 'local' ? 'local' : 'remote',
+            }))
+            : undefined,
+        captionSequence: Number.isFinite(session.captionSequence) ? session.captionSequence : undefined,
     };
 };
 
@@ -459,7 +521,21 @@ const serialiseCallSession = (session: CallSessionState) => ({
         connected: device.connected ?? undefined,
         isRemote: device.isRemote ?? undefined,
         lastSeenTs: device.lastSeenTs,
+        captionPreferences: device.captionPreferences ? { ...device.captionPreferences } : undefined,
     })),
+    captions: session.captions?.map(caption => ({
+        id: caption.id,
+        callId: caption.callId,
+        sender: caption.sender,
+        text: caption.text,
+        language: caption.language,
+        translatedText: caption.translatedText,
+        targetLanguage: caption.targetLanguage,
+        timestamp: caption.timestamp,
+        final: caption.final,
+        source: caption.source,
+    })),
+    captionSequence: session.captionSequence ?? undefined,
 });
 
 const deserialiseCallSession = (payload: any): CallSessionState | null => {
@@ -493,6 +569,21 @@ const deserialiseCallSession = (payload: any): CallSessionState | null => {
         updatedAt,
         startedAt: Number.isFinite(payload.startedAt) ? payload.startedAt : undefined,
         devices,
+        captions: Array.isArray(payload.captions)
+            ? payload.captions.map((caption: any) => ({
+                id: typeof caption?.id === 'string' ? caption.id : `${payload.callId || ''}:${caption?.timestamp ?? Date.now()}`,
+                callId: typeof caption?.callId === 'string' ? caption.callId : (typeof payload.callId === 'string' ? payload.callId : ''),
+                sender: typeof caption?.sender === 'string' ? caption.sender : '',
+                text: typeof caption?.text === 'string' ? caption.text : '',
+                language: typeof caption?.language === 'string' ? caption.language : undefined,
+                translatedText: typeof caption?.translatedText === 'string' ? caption.translatedText : undefined,
+                targetLanguage: typeof caption?.targetLanguage === 'string' ? caption.targetLanguage : undefined,
+                timestamp: Number.isFinite(caption?.timestamp) ? caption.timestamp : Date.now(),
+                final: caption?.final !== false,
+                source: caption?.source === 'local' ? 'local' : 'remote',
+            }))
+            : undefined,
+        captionSequence: Number.isFinite(payload.captionSequence) ? payload.captionSequence : undefined,
     }, updatedAt);
 };
 
@@ -627,6 +718,12 @@ export const updateLocalCallDeviceState = (client: MatrixClient, patch: Partial<
             ...device,
             ...patch,
             lastSeenTs: now,
+            captionPreferences: patch.captionPreferences
+                ? sanitiseCaptionPreferences({
+                    ...device.captionPreferences,
+                    ...patch.captionPreferences,
+                })
+                : device.captionPreferences,
         };
     });
     if (!devices.some(device => device.deviceId === deviceId)) {
@@ -638,11 +735,48 @@ export const updateLocalCallDeviceState = (client: MatrixClient, patch: Partial<
             connected: patch.connected ?? (current.status === 'connected'),
             isRemote: false,
             lastSeenTs: now,
+            captionPreferences: patch.captionPreferences ? sanitiseCaptionPreferences(patch.captionPreferences) : undefined,
         });
     }
     const nextSession: CallSessionState = {
         ...current,
         devices,
+        updatedAt: now,
+    };
+    applyCallSessionUpdate(accountKey, nextSession, now, 'local');
+    persistCallSessionAccountData(client, nextSession, now);
+};
+
+export const appendCallCaptionEvent = (client: MatrixClient, caption: CallCaptionEvent): void => {
+    const accountKey = resolveAccountKeyFromClient(client);
+    if (!accountKey) {
+        return;
+    }
+    const current = callStateByAccount.get(accountKey)?.session;
+    if (!current) {
+        return;
+    }
+    const now = nextCallStateTimestamp();
+    const existing = Array.isArray(current.captions) ? current.captions.slice() : [];
+    const event: CallCaptionEvent = {
+        id: caption.id || `${current.callId}:${now}`,
+        callId: caption.callId || current.callId,
+        sender: caption.sender || client.getUserId?.() || '',
+        text: caption.text || '',
+        language: caption.language,
+        translatedText: caption.translatedText,
+        targetLanguage: caption.targetLanguage,
+        timestamp: caption.timestamp ?? now,
+        final: caption.final !== false,
+        source: caption.source === 'remote' ? 'remote' : 'local',
+    };
+    existing.push(event);
+    const trimmed = existing.slice(-100);
+    const nextSequence = (current.captionSequence ?? 0) + 1;
+    const nextSession: CallSessionState = {
+        ...current,
+        captions: trimmed,
+        captionSequence: nextSequence,
         updatedAt: now,
     };
     applyCallSessionUpdate(accountKey, nextSession, now, 'local');
@@ -2607,6 +2741,15 @@ const sanitizeTranscriptionSettings = (value: ServiceTranscriptionSettings | nul
     if (typeof value.maxDurationSec === 'number' && Number.isFinite(value.maxDurationSec)) {
         result.maxDurationSec = Math.max(0, value.maxDurationSec);
     }
+    if (typeof value.provider === 'string' && ['disabled', 'local', 'cloud'].includes(value.provider)) {
+        result.provider = value.provider as ServiceTranscriptionSettings['provider'];
+    }
+    if (typeof value.privacy === 'string' && ['local', 'cloud'].includes(value.privacy)) {
+        result.privacy = value.privacy as ServiceTranscriptionSettings['privacy'];
+    }
+    if (typeof value.targetLanguage === 'string' && value.targetLanguage.trim().length) {
+        result.targetLanguage = value.targetLanguage.trim().toLowerCase();
+    }
     return result;
 };
 
@@ -2622,6 +2765,9 @@ const mergeTranscriptionSettings = (
         if (typeof source.enabled === 'boolean') merged.enabled = source.enabled;
         if (typeof source.language === 'string') merged.language = source.language;
         if (typeof source.maxDurationSec === 'number') merged.maxDurationSec = source.maxDurationSec;
+        if (typeof source.provider === 'string') merged.provider = source.provider;
+        if (typeof source.privacy === 'string') merged.privacy = source.privacy;
+        if (typeof source.targetLanguage === 'string') merged.targetLanguage = source.targetLanguage;
     }
     return merged;
 };
@@ -2633,6 +2779,9 @@ export function getTranscriptionSettings(client?: MatrixClient | null): ServiceT
             const base: ServiceTranscriptionSettings = { enabled: runtime.enabled };
             if (runtime.defaultLanguage) base.language = runtime.defaultLanguage;
             if (typeof runtime.maxDurationSec === 'number') base.maxDurationSec = runtime.maxDurationSec;
+            if (runtime.provider) base.provider = runtime.provider;
+            if (runtime.privacy) base.privacy = runtime.privacy;
+            if (runtime.defaultTargetLanguage) base.targetLanguage = runtime.defaultTargetLanguage;
             return base;
         })();
 
@@ -2647,6 +2796,9 @@ export function getTranscriptionSettings(client?: MatrixClient | null): ServiceT
                     enabled: typeof content.enabled === 'boolean' ? content.enabled : undefined,
                     language: typeof content.language === 'string' ? content.language : undefined,
                     maxDurationSec: typeof content.maxDurationSec === 'number' ? content.maxDurationSec : undefined,
+                    provider: typeof content.provider === 'string' ? content.provider : undefined,
+                    privacy: typeof content.privacy === 'string' ? content.privacy : undefined,
+                    targetLanguage: typeof content.targetLanguage === 'string' ? content.targetLanguage : undefined,
                 });
             }
         }
