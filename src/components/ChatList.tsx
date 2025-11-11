@@ -1,10 +1,11 @@
-import React, { useMemo } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { formatDistanceToNow } from 'date-fns';
 import { Folder, MatrixClient, Room } from '../types';
 import Avatar from './Avatar';
 import RoomListItem from './RoomListItem';
 import { mxcToHttp } from '../services/matrixService';
 import { ChatRoomStatus, ChatRoomType } from '../hooks/useChats';
+import { getSmartCollections, type SmartCollection } from '../services/mediaIndexService';
 import {
     AggregatedRoomSnapshot,
     InboxViewMode,
@@ -64,6 +65,10 @@ const modeButtonClass = (currentMode: InboxViewMode, mode: InboxViewMode) =>
             : 'text-text-secondary hover:text-text-primary'
     }`;
 
+/**
+ * Experimental aggregated inbox layout kept in sync with the production RoomList.
+ * ChatPage.tsx still renders <RoomList />; update that entry point if ChatList is promoted.
+ */
 const ChatList: React.FC<ChatListProps> = ({
     rooms,
     allRooms,

@@ -1,5 +1,6 @@
 import React from 'react';
 import { render, screen, fireEvent } from '@testing-library/react';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import ChatList from '../../src/components/ChatList';
 import { Folder, MatrixClient, Room } from '../../src/types';
 import { getAccountStore } from '../../src/services/accountManager';
@@ -55,6 +56,15 @@ const folders: Folder[] = [
 
 const accountStore = getAccountStore();
 
+beforeAll(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2024-01-01T12:00:00Z'));
+});
+
+afterAll(() => {
+    vi.useRealTimers();
+});
+
 beforeEach(() => {
     accountStore.setState({
         accounts: {},
@@ -100,6 +110,22 @@ describe('ChatList', () => {
         expect(screen.getByText('General')).toBeTruthy();
         expect(screen.getByText('Design Standup')).toBeTruthy();
         expect(screen.getByPlaceholderText('Search chats or messages')).toBeTruthy();
+    });
+
+    it('matches the default snapshot', () => {
+        const { container } = renderChatList();
+        const root = container.firstChild as HTMLElement;
+        expect({
+            tag: root.tagName,
+            className: root.className,
+            roomCount: root.querySelectorAll('li').length,
+        }).toMatchInlineSnapshot(`
+            {
+              "className": "chat-list bg-bg-primary border-r border-border-primary flex flex-col w-80",
+              "roomCount": 2,
+              "tag": "ASIDE",
+            }
+        `);
     });
 
     it('invokes callbacks for search and filters', () => {
