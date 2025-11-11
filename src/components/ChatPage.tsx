@@ -38,6 +38,9 @@ import PluginSurfaceHost from './PluginSurfaceHost';
 import { SearchResultItem } from '@matrix-messenger/core';
 import type { DraftContent, SendKeyBehavior, DraftAttachment, DraftAttachmentKind, VideoMessageMetadata, LocationContentPayload } from '../types';
 import SharedMediaPanel from './SharedMediaPanel';
+import StoriesTray from './StoriesTray';
+import StoryViewer from './StoryViewer';
+import StoryComposer, { StoryComposerDraft } from './StoryComposer';
 import type { RoomMediaSummary, SharedMediaCategory, RoomMediaItem } from '@matrix-messenger/core';
 // FIX: The `matrix-js-sdk` exports event names as enums. Import them to use with the event emitter.
 // FIX: Import event enums to use with the event emitter instead of string literals, which are not assignable.
@@ -90,7 +93,7 @@ import {
     type TravelModeSnapshot,
 } from '../services/appLockService';
 import { presenceReducer, PresenceEventContent } from '../state/presenceReducer';
-import { useStoryStore, markActiveStoryAsRead, toggleActiveStoryReaction } from '../state/storyStore';
+import { useStoryStore, markActiveStoryAsRead, toggleActiveStoryReaction, refreshActiveStoryFeed } from '../state/storyStore';
 import {
     describePresence,
     canSharePresenceInRoom,
@@ -122,6 +125,7 @@ interface ChatPageProps {
 
 const DRAFT_STORAGE_KEY = 'matrix-message-drafts';
 const DRAFT_ACCOUNT_DATA_EVENT = 'econix.message_drafts';
+const STORY_DRAFT_GLOBAL_KEY = '__global_story_draft__';
 
 type PendingQueueSummary = OutboxPayload & { attempts: number; error?: string; progress?: OutboxProgressState };
 
@@ -1171,6 +1175,47 @@ const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, s
     const [activeStoryAuthorId, setActiveStoryAuthorId] = useState<string | null>(null);
     const [activeStoryIndex, setActiveStoryIndex] = useState(0);
     const [isStoryViewerOpen, setIsStoryViewerOpen] = useState(false);
+    const [isStoryComposerOpen, setIsStoryComposerOpen] = useState(false);
+    const [storyComposerDrafts, setStoryComposerDrafts] = useState<Record<string, StoryComposerDraft>>({});
+    const storyComposerDraftsRef = useRef<Record<string, StoryComposerDraft>>({});
+    const resolveStoryDraftKey = useCallback((roomId: string | null) => roomId ?? STORY_DRAFT_GLOBAL_KEY, []);
+
+    useEffect(() => {
+        storyComposerDraftsRef.current = storyComposerDrafts;
+    }, [storyComposerDrafts]);
+
+    useEffect(() => () => {
+        Object.values(storyComposerDraftsRef.current).forEach(draftValue => {
+            const previewUrl = draftValue.media?.previewUrl;
+            if (previewUrl) {
+                URL.revokeObjectURL(previewUrl);
+            }
+        });
+    }, []);
+
+    const handleUpdateStoryDraft = useCallback((roomId: string | null, draftValue: StoryComposerDraft | null) => {
+        const key = resolveStoryDraftKey(roomId);
+        setStoryComposerDrafts(prev => {
+            const current = prev[key];
+            if (draftValue) {
+                if (current?.caption === draftValue.caption && current.media === draftValue.media) {
+                    return prev;
+                }
+                if (current?.media?.previewUrl && current.media.previewUrl !== draftValue.media?.previewUrl) {
+                    URL.revokeObjectURL(current.media.previewUrl);
+                }
+                return { ...prev, [key]: draftValue };
+            }
+            if (!current) {
+                return prev;
+            }
+            if (current.media?.previewUrl) {
+                URL.revokeObjectURL(current.media.previewUrl);
+            }
+            const { [key]: _removed, ...rest } = prev;
+            return rest;
+        });
+    }, [resolveStoryDraftKey]);
 
     const normalisePresenceContent = useCallback((content: PresenceEventContent): PresenceEventContent => {
         const enriched: PresenceEventContent = { ...content };
@@ -1223,6 +1268,30 @@ const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, s
     }, [stories]);
 
     const activeStoryGroup = useMemo(() => storyGroups.find(group => group.authorId === activeStoryAuthorId) ?? null, [storyGroups, activeStoryAuthorId]);
+    const activeStoryComposerDraft = storyComposerDrafts[resolveStoryDraftKey(selectedRoomId)] ?? null;
+
+    const handleActiveStoryDraftChange = useCallback((draftValue: StoryComposerDraft | null) => {
+        handleUpdateStoryDraft(selectedRoomId ?? null, draftValue);
+    }, [handleUpdateStoryDraft, selectedRoomId]);
+
+    const handleOpenStoryComposer = useCallback(() => {
+        setIsStoryComposerOpen(true);
+    }, []);
+
+    const handleCloseStoryComposer = useCallback(() => {
+        setIsStoryComposerOpen(false);
+    }, []);
+
+    const handleStoryPublished = useCallback(async (_story: Story) => {
+        const roomKey = selectedRoomId ?? null;
+        handleUpdateStoryDraft(roomKey, null);
+        setIsStoryComposerOpen(false);
+        try {
+            await refreshActiveStoryFeed();
+        } catch (error) {
+            console.warn('Failed to refresh story feed', error);
+        }
+    }, [handleUpdateStoryDraft, selectedRoomId]);
 
     useEffect(() => {
         if (!groupCallPermissionError) return;
@@ -4675,8 +4744,34 @@ const handleSendParticipantToAudience = useCallback((participantId: string) => {
             <main
                 style={{ backgroundImage: chatBackground ? `url(${chatBackground})` : 'none' }}
                 className={`flex-1 flex flex-col bg-bg-tertiary relative transition-all duration-300 bg-cover bg-center ${activeThread ? 'w-1/2' : 'w-full'}`}>
-                {storiesHydrated && storyGroups.length > 0 && (
-                    <StoriesTray client={client} stories={stories} onSelect={handleOpenStory} />
+                {storiesHydrated && (
+                    <>
+                        {storyGroups.length > 0 && (
+                            <StoriesTray client={client} stories={stories} onSelect={handleOpenStory} />
+                        )}
+                        <div
+                            className={`flex items-center justify-end gap-3 px-6 py-3 ${storyGroups.length > 0 ? 'bg-black/10 border-b border-white/5 -mt-px' : 'bg-black/20 border-b border-white/5'}`}
+                        >
+                            <button
+                                type="button"
+                                onClick={handleOpenStoryComposer}
+                                className="hidden md:inline-flex items-center gap-2 rounded-md border border-border-secondary px-4 py-2 text-sm text-text-secondary hover:text-text-primary hover:border-text-primary"
+                                disabled={isStoryComposerOpen}
+                            >
+                                <span className="text-base">+</span>
+                                <span>Новая история</span>
+                            </button>
+                            <button
+                                type="button"
+                                onClick={handleOpenStoryComposer}
+                                className="md:hidden inline-flex h-10 w-10 items-center justify-center rounded-full border border-border-secondary text-lg text-text-secondary hover:text-text-primary hover:border-text-primary"
+                                aria-label="Создать историю"
+                                disabled={isStoryComposerOpen}
+                            >
+                                +
+                            </button>
+                        </div>
+                    </>
                 )}
                 {showTravelModeBanner && (
                     <div className="mx-4 mt-2 mb-2 flex items-start justify-between gap-3 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-100">
@@ -4756,6 +4851,16 @@ const handleSendParticipantToAudience = useCallback((participantId: string) => {
             </main>
 
             <ChatSidePanels {...sidePanelsProps} />
+            {isStoryComposerOpen && (
+                <StoryComposer
+                    client={client}
+                    isOpen={isStoryComposerOpen}
+                    draft={activeStoryComposerDraft}
+                    onDraftChange={handleActiveStoryDraftChange}
+                    onClose={handleCloseStoryComposer}
+                    onPublished={handleStoryPublished}
+                />
+            )}
             {isStoryViewerOpen && activeStoryGroup && (
                 <StoryViewer
                     client={client}
