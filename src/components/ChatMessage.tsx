@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useMemo } from 'react';
 import { Message, Reaction, MatrixClient } from '@matrix-messenger/core';
 import Avatar from './Avatar';
 import { format } from 'date-fns';
@@ -12,6 +12,8 @@ import PollView from './PollView';
 import { EventType } from 'matrix-js-sdk';
 import LinkPreview from './LinkPreview';
 import { buildExternalNavigationUrl, buildStaticMapUrl, MAP_ZOOM_DEFAULT, formatCoordinate, sanitizeZoom } from '../utils/location';
+import KnowledgeDocModal from './KnowledgeBase/KnowledgeDocModal';
+import type { KnowledgeDocDraft } from '../services/knowledgeBaseService';
 
 interface ChatMessageProps {
     message: Message;
@@ -44,6 +46,28 @@ const ChatMessage: React.FC<ChatMessageProps> = ({
     const isReadByOthers = isOwn && Object.keys(message.readBy).some(userId => userId !== client.getUserId());
     const [remainingSeconds, setRemainingSeconds] = useState<number | null>(null);
     const [showTranscript, setShowTranscript] = useState<boolean>(message.transcript?.status === 'completed');
+    const [isKnowledgeModalOpen, setKnowledgeModalOpen] = useState(false);
+
+    const knowledgeDraft = useMemo<KnowledgeDocDraft>(() => {
+        const roomId = message.rawEvent?.getRoomId?.() ?? (typeof message.rawEvent?.getRoomId === 'function' ? message.rawEvent?.getRoomId() : undefined);
+        const baseBody = message.content.body ?? '';
+        const baseTitle = baseBody.trim().split('\n')[0]?.slice(0, 120) || `Сообщение от ${message.sender.name}`;
+        return {
+            title: baseTitle,
+            body: baseBody,
+            summary: baseBody.slice(0, 280),
+            tags: [],
+            spaceId: null,
+            channelId: roomId ?? null,
+            sources: [
+                {
+                    roomId: roomId ?? '',
+                    eventId: message.id,
+                    senderId: message.sender.id,
+                },
+            ],
+        };
+    }, [message]);
 
     useEffect(() => {
         if (isEditing) {
@@ -426,10 +450,11 @@ const ChatMessage: React.FC<ChatMessageProps> = ({
 
 
     return (
-        <div id={`message-${message.id}`} className={`group flex items-start gap-3 relative ${isOwn ? 'flex-row-reverse' : ''}`}>
-            {!isOwn && <Avatar name={message.sender.name} imageUrl={message.sender.avatarUrl} size="sm" />}
+        <>
+            <div id={`message-${message.id}`} className={`group flex items-start gap-3 relative ${isOwn ? 'flex-row-reverse' : ''}`}>
+                {!isOwn && <Avatar name={message.sender.name} imageUrl={message.sender.avatarUrl} size="sm" />}
 
-            <div className={`absolute top-[-10px] flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity z-10 ${isOwn ? 'left-[-244px]' : 'right-[-216px]'}`}>
+                <div className={`absolute top-[-10px] flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity z-10 ${isOwn ? 'left-[-244px]' : 'right-[-216px]'}`}>
                 {!isEditing && !message.isRedacted && (
                     <>
                          {message.content.msgtype === 'm.text' && (
@@ -449,6 +474,16 @@ const ChatMessage: React.FC<ChatMessageProps> = ({
                         )}
                         <button onClick={onForward} className="p-1 rounded-full bg-bg-primary hover:bg-bg-tertiary" title="Forward message">
                            <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 text-text-secondary transform scale-x-[-1]" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M7.707 3.293a1 1 0 010 1.414L5.414 7H11a7 7 0 017 7v2a1 1 0 11-2 0v-2a5 5 0 00-5-5H5.414l2.293 2.293a1 1 0 11-1.414 1.414l-4-4a1 1 0 010-1.414l4-4a1 1 0 011.414 0z" clipRule="evenodd" /></svg>
+                        </button>
+                        <button
+                            onClick={() => setKnowledgeModalOpen(true)}
+                            className="p-1 rounded-full bg-bg-primary hover:bg-bg-tertiary"
+                            title="Сохранить в базу знаний"
+                        >
+                            <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 text-text-secondary" viewBox="0 0 20 20" fill="currentColor">
+                                <path d="M4 4a2 2 0 012-2h7a1 1 0 01.707.293l2 2A1 1 0 0116 5v11a2 2 0 01-2 2H6a2 2 0 01-2-2V4z" />
+                                <path d="M8 6a1 1 0 011-1h2a1 1 0 011 1v7.5a.5.5 0 01-.777.416L10 12.333l-1.223.583A.5.5 0 018 13.5V6z" />
+                            </svg>
                         </button>
                         <button onClick={onOpenThread} className="p-1 rounded-full bg-bg-primary hover:bg-bg-tertiary" title="Reply in thread">
                            <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 text-text-secondary" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M18 5v8a2 2 0 01-2 2h-5l-5 4v-4H4a2 2 0 01-2-2V5a2 2 0 012-2h12a2 2 0 012 2zM7 8H5v2h2V8zm2 0h2v2H9V8zm6 0h-2v2h2V8z" clipRule="evenodd" /></svg>
@@ -479,7 +514,7 @@ const ChatMessage: React.FC<ChatMessageProps> = ({
                  )}
             </div>
 
-            <div className={`flex flex-col w-full ${isOwn ? 'items-end' : 'items-start'}`}>
+                <div className={`flex flex-col w-full ${isOwn ? 'items-end' : 'items-start'}`}>
                 <div className={`flex items-baseline gap-2 ${isOwn ? 'flex-row-reverse' : ''}`}>
                     {!isOwn && <span className="font-bold text-sm text-text-primary">{message.sender.name}</span>}
                     <span className="text-xs text-text-secondary flex items-center gap-1">
@@ -525,8 +560,17 @@ const ChatMessage: React.FC<ChatMessageProps> = ({
                         />
                     )}
                 </div>
+                </div>
             </div>
-        </div>
+            {isKnowledgeModalOpen && (
+                <KnowledgeDocModal
+                    isOpen={isKnowledgeModalOpen}
+                    onClose={() => setKnowledgeModalOpen(false)}
+                    client={client}
+                    initialDraft={knowledgeDraft}
+                />
+            )}
+        </>
     );
 };
 

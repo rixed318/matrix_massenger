@@ -100,6 +100,7 @@ import {
     generateRoomDigest,
     DEFAULT_DIGEST_ACCOUNT_KEY,
 } from '../services/digestService';
+import { bindKnowledgeBaseToClient } from '../services/knowledgeBaseService';
 
 interface ChatPageProps {
     client?: MatrixClient;
@@ -856,6 +857,7 @@ const ChatSidePanels: React.FC<ChatSidePanelsProps> = ({
                 isPaginating={sharedMedia.isPaginating}
                 onLoadMore={sharedMedia.onLoadMore}
                 currentUserId={sharedMedia.currentUserId}
+                client={client}
             />
 
             {groupCall.activeGroupCall && (
@@ -938,6 +940,10 @@ const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, s
     const client = (providedClient ?? activeRuntime?.client)!;
     const [presenceState, dispatchPresence] = useReducer(presenceReducer, new Map<string, PresenceEventContent>());
     const currentUserId = client.getUserId?.() ?? null;
+    useEffect(() => {
+        const stop = bindKnowledgeBaseToClient(client);
+        return () => stop();
+    }, [client]);
     const savedMessagesRoomId = savedRoomIdProp ?? activeRuntime?.savedMessagesRoomId ?? '';
     const logout = onLogout ?? (() => { void removeAccount(); });
     const { accounts: accountList, activeKey: activeAccountKey, setActiveKey: switchAccount, openAddAccount } = useAccountListSnapshot();
