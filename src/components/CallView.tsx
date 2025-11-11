@@ -1,10 +1,12 @@
-import React, { useState, useEffect, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { MatrixCall, MatrixClient, CallSessionState, updateLocalCallDeviceState } from '@matrix-messenger/core';
 import Avatar from './Avatar';
 import { mxcToHttp } from '@matrix-messenger/core';
 import { CallEvent } from 'matrix-js-sdk';
 import CallParticipantsPanel, { Participant as CallParticipant } from './CallParticipantsPanel';
 import { GroupCallStageState } from '../services/webrtc/groupCallConstants';
+import type { CallDeviceEffectsState } from '../services/matrixService';
+import type { VideoEffectsConfiguration, VideoEffectsPreset } from '../services/videoEffectsService';
 
 export type CallLayout = 'spotlight' | 'grid';
 
@@ -12,6 +14,7 @@ interface ExtendedParticipant extends CallParticipant {
     stream?: MediaStream | null;
     screenshareStream?: MediaStream | null;
     dominant?: boolean;
+    effectsEnabled?: boolean;
 }
 
 interface CallViewProps {
@@ -47,6 +50,11 @@ interface CallViewProps {
     callSession?: CallSessionState | null;
     onHandover?: () => void;
     localDeviceId?: string | null;
+    localEffectsState?: CallDeviceEffectsState | null;
+    onLocalEffectsChange?: (state: CallDeviceEffectsState) => void;
+    effectsPresets?: VideoEffectsPreset[];
+    onSaveEffectsPreset?: (preset: VideoEffectsPreset) => void | Promise<void>;
+    onToggleParticipantEffects?: (participantId: string, enabled: boolean) => void;
 }
 
 interface VideoTileInfo {
@@ -147,6 +155,11 @@ const CallView: React.FC<CallViewProps> = ({
     callSession,
     onHandover,
     localDeviceId,
+    localEffectsState,
+    onLocalEffectsChange,
+    effectsPresets,
+    onSaveEffectsPreset,
+    onToggleParticipantEffects,
 }) => {
     const [callState, setCallState] = useState<string>(call?.state ?? '');
     const [duration, setDuration] = useState(0);
@@ -155,6 +168,13 @@ const CallView: React.FC<CallViewProps> = ({
     const durationIntervalRef = useRef<number | null>(null);
     const localVideoRef = useRef<HTMLVideoElement>(null);
     const remoteVideoRef = useRef<HTMLVideoElement>(null);
+    const effectsPreviewRef = useRef<HTMLVideoElement>(null);
+    const backgroundFileInputRef = useRef<HTMLInputElement>(null);
+    const [effectsPanelOpen, setEffectsPanelOpen] = useState(false);
+    const BLUR_EFFECT_ID = 'local-blur';
+    const BACKGROUND_EFFECT_ID = 'local-background';
+    const NOISE_EFFECT_ID = 'local-noise';
+    const presets = effectsPresets ?? [];
 
     const isGroupCall = Boolean(participants && participants.length > 0);
     const stageSpeakers = useMemo(
@@ -166,6 +186,213 @@ const CallView: React.FC<CallViewProps> = ({
         [participants],
     );
     const queueOrder = stageState?.handRaiseQueue ?? [];
+    const videoEffects = localEffectsState?.configuration.video ?? [];
+    const audioEffects = localEffectsState?.configuration.audio ?? [];
+    const blurEffect = videoEffects.find(effect => effect.type === 'blur');
+    const blurIntensity = typeof blurEffect?.intensity === 'number' ? blurEffect.intensity : 0;
+    const backgroundEffect = videoEffects.find(effect => effect.type === 'background');
+    const backgroundMode: 'none' | 'gradient' | 'custom' = backgroundEffect
+        ? backgroundEffect.assetUrl
+            ? 'custom'
+            : 'gradient'
+        : 'none';
+    const noiseEffect = audioEffects.find(effect => effect.type === 'noise-suppression');
+    const noiseLevel = typeof noiseEffect?.intensity === 'number' ? noiseEffect.intensity : 0;
+    const applyEffectsToRemote = Boolean(localEffectsState?.applyToRemote);
+
+    const updateConfiguration = useCallback(
+        (
+            updater: (config: VideoEffectsConfiguration) => VideoEffectsConfiguration,
+            extra?: Partial<CallDeviceEffectsState>,
+        ) => {
+            if (!onLocalEffectsChange) {
+                return;
+            }
+            const baseConfig: VideoEffectsConfiguration = {
+                video: videoEffects.map(effect => ({ ...effect })),
+                audio: audioEffects.map(effect => ({ ...effect })),
+            };
+            const baseState: CallDeviceEffectsState = {
+                presetId: localEffectsState?.presetId ?? null,
+                applyToRemote: localEffectsState?.applyToRemote ?? false,
+                configuration: baseConfig,
+            };
+            const nextConfig = updater(baseState.configuration);
+            onLocalEffectsChange({
+                presetId: extra?.presetId ?? baseState.presetId,
+                applyToRemote: extra?.applyToRemote ?? baseState.applyToRemote,
+                configuration: nextConfig,
+            });
+        },
+        [onLocalEffectsChange, videoEffects, audioEffects, localEffectsState],
+    );
+
+    const handleBlurIntensity = useCallback(
+        (value: number) => {
+            updateConfiguration(
+                config => {
+                    const filtered = config.video.filter(effect => effect.type !== 'blur');
+                    if (value > 0) {
+                        const existing = config.video.find(effect => effect.type === 'blur');
+                        filtered.push({
+                            id: existing?.id ?? BLUR_EFFECT_ID,
+                            type: 'blur',
+                            intensity: value,
+                            enabled: true,
+                            assetUrl: existing?.assetUrl,
+                        });
+                    }
+                    return { ...config, video: filtered };
+                },
+                { presetId: null },
+            );
+        },
+        [updateConfiguration],
+    );
+
+    const handleBackgroundMode = useCallback(
+        (mode: 'none' | 'gradient' | 'custom', assetUrl?: string | null) => {
+            updateConfiguration(
+                config => {
+                    const filtered = config.video.filter(effect => effect.type !== 'background');
+                    if (mode === 'none') {
+                        return { ...config, video: filtered };
+                    }
+                    const existing = config.video.find(effect => effect.type === 'background');
+                    const nextEffect = {
+                        id: existing?.id ?? BACKGROUND_EFFECT_ID,
+                        type: 'background' as const,
+                        intensity: typeof existing?.intensity === 'number' ? existing.intensity : 1,
+                        assetUrl: mode === 'gradient' ? null : assetUrl ?? existing?.assetUrl ?? null,
+                        enabled: true,
+                    };
+                    return { ...config, video: [nextEffect, ...filtered] };
+                },
+                { presetId: null },
+            );
+        },
+        [updateConfiguration],
+    );
+
+    const handleNoiseLevel = useCallback(
+        (value: number) => {
+            updateConfiguration(
+                config => {
+                    const filtered = config.audio.filter(effect => effect.type !== 'noise-suppression');
+                    if (value <= 0) {
+                        return { ...config, audio: filtered };
+                    }
+                    const existing = config.audio.find(effect => effect.type === 'noise-suppression');
+                    filtered.push({
+                        id: existing?.id ?? NOISE_EFFECT_ID,
+                        type: 'noise-suppression',
+                        intensity: value,
+                        enabled: true,
+                    });
+                    return { ...config, audio: filtered };
+                },
+                { presetId: null },
+            );
+        },
+        [updateConfiguration],
+    );
+
+    const handleApplyEffectsToRemote = useCallback(
+        (enabled: boolean) => {
+            updateConfiguration(config => ({ ...config }), { applyToRemote: enabled });
+        },
+        [updateConfiguration],
+    );
+
+    const handlePresetSelect = useCallback(
+        (presetId: string) => {
+            if (!onLocalEffectsChange) return;
+            if (!presetId) {
+                onLocalEffectsChange({
+                    presetId: null,
+                    applyToRemote: localEffectsState?.applyToRemote ?? false,
+                    configuration: {
+                        video: videoEffects.map(effect => ({ ...effect })),
+                        audio: audioEffects.map(effect => ({ ...effect })),
+                    },
+                });
+                return;
+            }
+            const preset = presets.find(item => item.id === presetId);
+            if (preset) {
+                onLocalEffectsChange({
+                    presetId: preset.id,
+                    applyToRemote: localEffectsState?.applyToRemote ?? false,
+                    configuration: {
+                        video: preset.video.map(effect => ({ ...effect })),
+                        audio: preset.audio.map(effect => ({ ...effect })),
+                    },
+                });
+            }
+        },
+        [onLocalEffectsChange, presets, localEffectsState, videoEffects, audioEffects],
+    );
+
+    const handleSavePreset = useCallback(async () => {
+        if (!onSaveEffectsPreset || !onLocalEffectsChange) return;
+        const suggested = localEffectsState?.presetId ? `Копия ${localEffectsState.presetId}` : 'Мой пресет';
+        const label = window.prompt('Название пресета', suggested);
+        if (!label) return;
+        const trimmed = label.trim();
+        if (!trimmed) return;
+        const preset: VideoEffectsPreset = {
+            id: `preset-${Date.now().toString(36)}`,
+            label: trimmed,
+            video: videoEffects.map(effect => ({ ...effect })),
+            audio: audioEffects.map(effect => ({ ...effect })),
+            updatedAt: Date.now(),
+        };
+        await onSaveEffectsPreset(preset);
+        onLocalEffectsChange({
+            presetId: preset.id,
+            applyToRemote: localEffectsState?.applyToRemote ?? false,
+            configuration: {
+                video: preset.video.map(effect => ({ ...effect })),
+                audio: preset.audio.map(effect => ({ ...effect })),
+            },
+        });
+    }, [onSaveEffectsPreset, onLocalEffectsChange, localEffectsState, videoEffects, audioEffects]);
+
+    const handleBackgroundUpload = useCallback(
+        (event: React.ChangeEvent<HTMLInputElement>) => {
+            const file = event.target.files?.[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = () => {
+                const result = typeof reader.result === 'string' ? reader.result : null;
+                if (result) {
+                    handleBackgroundMode('custom', result);
+                }
+            };
+            reader.readAsDataURL(file);
+            if (backgroundFileInputRef.current) {
+                backgroundFileInputRef.current.value = '';
+            }
+            event.target.value = '';
+        },
+        [handleBackgroundMode],
+    );
+
+    useEffect(() => {
+        if (!effectsPreviewRef.current) return;
+        const localStream = participants?.find(participant => participant.isLocal)?.stream ?? null;
+        const element = effectsPreviewRef.current;
+        try {
+            if (localStream) {
+                (element as HTMLVideoElement).srcObject = localStream;
+                void element.play().catch(() => undefined);
+            } else {
+                (element as HTMLVideoElement).srcObject = null;
+            }
+        } catch (error) {
+            console.warn('Failed to attach preview stream', error);
+        }
+    }, [participants]);
 
     useEffect(() => {
         if (!call || isGroupCall) return;
@@ -387,6 +614,18 @@ const CallView: React.FC<CallViewProps> = ({
                 <div className="absolute top-6 right-6 flex items-center gap-3">
                     <div className="text-sm text-text-secondary">{headerTitle || 'Групповой звонок'}</div>
                     <button
+                        className={`px-3 py-1 rounded-full text-sm ${
+                            effectsPanelOpen
+                                ? 'bg-indigo-600 text-white'
+                                : 'bg-bg-secondary hover:bg-bg-tertiary text-text-secondary'
+                        } ${!onLocalEffectsChange ? 'opacity-50 cursor-not-allowed hover:bg-bg-secondary' : ''}`}
+                        onClick={() => onLocalEffectsChange && setEffectsPanelOpen(prev => !prev)}
+                        type="button"
+                        disabled={!onLocalEffectsChange}
+                    >
+                        ✨ Эффекты
+                    </button>
+                    <button
                         className="px-3 py-1 rounded-full text-sm bg-bg-secondary hover:bg-bg-tertiary"
                         onClick={onToggleParticipantsPanel}
                         type="button"
@@ -551,6 +790,152 @@ const CallView: React.FC<CallViewProps> = ({
                     </button>
                 </div>
 
+                {effectsPanelOpen && (
+                    <div
+                        className={`fixed ${showParticipantsPanel ? 'right-[22rem]' : 'right-4'} top-24 bottom-4 w-80 bg-bg-secondary border border-border-primary rounded-xl shadow-xl p-4 z-50 overflow-y-auto`}
+                    >
+                        <div className="flex items-center justify-between mb-3">
+                            <h3 className="text-sm font-semibold text-text-primary">Эффекты камеры</h3>
+                            <button
+                                type="button"
+                                className="text-xs px-2 py-1 rounded bg-bg-tertiary hover:bg-bg-secondary text-text-secondary"
+                                onClick={() => setEffectsPanelOpen(false)}
+                            >
+                                Закрыть
+                            </button>
+                        </div>
+                        <div className="aspect-video rounded-lg overflow-hidden bg-black/80 mb-4">
+                            <video
+                                ref={effectsPreviewRef}
+                                muted
+                                autoPlay
+                                playsInline
+                                className="w-full h-full object-cover"
+                            />
+                        </div>
+                        <div className="space-y-4 text-sm text-text-primary">
+                            <div>
+                                <label className="block text-xs text-text-secondary mb-1" htmlFor="call-effects-preset">
+                                    Пресет
+                                </label>
+                                <select
+                                    id="call-effects-preset"
+                                    value={localEffectsState?.presetId ?? ''}
+                                    onChange={event => handlePresetSelect(event.target.value)}
+                                    className="w-full rounded-md border border-border-primary bg-bg-tertiary px-2 py-1 text-sm text-text-primary focus:outline-none focus:ring-2 focus:ring-ring-focus"
+                                    disabled={!onLocalEffectsChange}
+                                >
+                                    <option value="">Своя настройка</option>
+                                    {presets.map(preset => (
+                                        <option key={preset.id} value={preset.id}>
+                                            {preset.label}
+                                        </option>
+                                    ))}
+                                </select>
+                            </div>
+                            <div>
+                                <span className="block text-xs text-text-secondary mb-1">Фон</span>
+                                <div className="flex flex-wrap gap-2">
+                                    <button
+                                        type="button"
+                                        className={`px-2 py-1 rounded text-xs ${
+                                            backgroundMode === 'none'
+                                                ? 'bg-indigo-600 text-white'
+                                                : 'bg-bg-tertiary hover:bg-bg-secondary text-text-secondary'
+                                        }`}
+                                        onClick={() => handleBackgroundMode('none')}
+                                        disabled={!onLocalEffectsChange}
+                                    >
+                                        Обычный
+                                    </button>
+                                    <button
+                                        type="button"
+                                        className={`px-2 py-1 rounded text-xs ${
+                                            backgroundMode === 'gradient'
+                                                ? 'bg-indigo-600 text-white'
+                                                : 'bg-bg-tertiary hover:bg-bg-secondary text-text-secondary'
+                                        }`}
+                                        onClick={() => handleBackgroundMode('gradient')}
+                                        disabled={!onLocalEffectsChange}
+                                    >
+                                        Градиент
+                                    </button>
+                                    <button
+                                        type="button"
+                                        className="px-2 py-1 rounded text-xs bg-bg-tertiary hover:bg-bg-secondary text-text-secondary"
+                                        onClick={() => backgroundFileInputRef.current?.click()}
+                                        disabled={!onLocalEffectsChange}
+                                    >
+                                        Из файла…
+                                    </button>
+                                    <input
+                                        type="file"
+                                        ref={backgroundFileInputRef}
+                                        accept="image/*"
+                                        onChange={handleBackgroundUpload}
+                                        className="hidden"
+                                    />
+                                </div>
+                                {backgroundEffect?.assetUrl && (
+                                    <p className="mt-1 text-xs text-text-secondary break-words">
+                                        Используется пользовательское изображение.
+                                    </p>
+                                )}
+                            </div>
+                            <div>
+                                <label className="block text-xs text-text-secondary mb-1" htmlFor="call-effects-blur">
+                                    Размытие ({Math.round(blurIntensity)} px)
+                                </label>
+                                <input
+                                    id="call-effects-blur"
+                                    type="range"
+                                    min={0}
+                                    max={15}
+                                    step={1}
+                                    value={Math.round(blurIntensity)}
+                                    onChange={event => handleBlurIntensity(Number(event.target.value))}
+                                    className="w-full"
+                                    disabled={!onLocalEffectsChange}
+                                />
+                            </div>
+                            <div>
+                                <label className="block text-xs text-text-secondary mb-1" htmlFor="call-effects-noise">
+                                    Шумоподавление ({Math.round(noiseLevel * 100)}%)
+                                </label>
+                                <input
+                                    id="call-effects-noise"
+                                    type="range"
+                                    min={0}
+                                    max={1}
+                                    step={0.1}
+                                    value={Number(noiseLevel.toFixed(1))}
+                                    onChange={event => handleNoiseLevel(Number(event.target.value))}
+                                    className="w-full"
+                                    disabled={!onLocalEffectsChange}
+                                />
+                            </div>
+                            <label className="flex items-center gap-2 text-xs text-text-primary">
+                                <input
+                                    type="checkbox"
+                                    className="h-4 w-4 text-accent focus:ring-ring-focus"
+                                    checked={applyEffectsToRemote}
+                                    onChange={event => handleApplyEffectsToRemote(event.target.checked)}
+                                    disabled={!onLocalEffectsChange}
+                                />
+                                Применять к входящему видео
+                            </label>
+                            <button
+                                type="button"
+                                className="w-full px-3 py-2 text-xs rounded bg-indigo-600 text-white hover:bg-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed"
+                                onClick={() => void handleSavePreset()}
+                                disabled={!onSaveEffectsPreset || !onLocalEffectsChange}
+                            >
+                                Сохранить как пресет
+                            </button>
+                        </div>
+                    </div>
+                )}
+
                 {showParticipantsPanel && (
                     <CallParticipantsPanel
                         participants={participants ?? []}
@@ -565,6 +950,7 @@ const CallView: React.FC<CallViewProps> = ({
                         onLowerHand={id => onLowerHand?.(id)}
                         localUserId={localUserId}
                         canModerate={canModerateParticipants}
+                        onToggleEffects={onToggleParticipantEffects}
                     />
                 )}
             </div>

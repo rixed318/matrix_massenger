@@ -15,6 +15,7 @@ import AutomationsPanel from './Settings/AutomationsPanel';
 import type { SendKeyBehavior } from '../types';
 import { getSmartReplySettings, setSmartReplySettings } from '../services/aiComposeService';
 import type { SmartReplySettings } from '../services/aiComposeService';
+import type { VideoEffectsPreset } from '../services/videoEffectsService';
 
 interface SettingsModalProps {
     isOpen: boolean;
@@ -33,6 +34,8 @@ interface SettingsModalProps {
     presenceRestricted: boolean;
     animatedReactionsEnabled: boolean;
     onSetAnimatedReactionsEnabled: (enabled: boolean) => void;
+    videoEffectsPresets: VideoEffectsPreset[];
+    onRemoveVideoEffectsPreset: (id: string) => void;
 }
 
 const ThemeSwatch: React.FC<{ name: string; colors: { primary: string; secondary: string; accent: string; }; isActive: boolean; onClick: () => void; }> = ({ name, colors, isActive, onClick }) => (
@@ -81,7 +84,26 @@ const DIGEST_PERIOD_OPTIONS: Array<{ value: 'never' | 'daily' | 'weekly' | 'hour
     { value: 'hourly', label: 'Каждый час' },
 ];
 
-const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, onSave, client, notificationsEnabled, onSetNotificationsEnabled, chatBackground, onSetChatBackground, onResetChatBackground, sendKeyBehavior, onSetSendKeyBehavior, isPresenceHidden, onSetPresenceHidden, presenceRestricted, animatedReactionsEnabled, onSetAnimatedReactionsEnabled }) => {
+const SettingsModal: React.FC<SettingsModalProps> = ({
+    isOpen,
+    onClose,
+    onSave,
+    client,
+    notificationsEnabled,
+    onSetNotificationsEnabled,
+    chatBackground,
+    onSetChatBackground,
+    onResetChatBackground,
+    sendKeyBehavior,
+    onSetSendKeyBehavior,
+    isPresenceHidden,
+    onSetPresenceHidden,
+    presenceRestricted,
+    animatedReactionsEnabled,
+    onSetAnimatedReactionsEnabled,
+    videoEffectsPresets,
+    onRemoveVideoEffectsPreset,
+}) => {
     const user = client.getUser(client.getUserId());
     const [displayName, setDisplayName] = useState(user?.displayName || '');
     const [avatarFile, setAvatarFile] = useState<File | null>(null);
@@ -466,6 +488,42 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, onSave, 
                             </label>
                             <p className="text-xs text-text-secondary">Настройки сохраняются в данных аккаунта и применяются также при показе предложенных ответов в уведомлениях.</p>
                         </div>
+                    </div>
+
+                    <div className="pt-6 border-t border-border-primary">
+                        <h3 className="text-lg font-semibold text-text-primary mb-3">Видеофильтры</h3>
+                        <p className="text-sm text-text-secondary mb-4">
+                            Сохранённые пресеты для фоновых эффектов и шумоподавления, доступные во время звонка.
+                        </p>
+                        <ul className="space-y-3">
+                            {videoEffectsPresets.length === 0 ? (
+                                <li className="text-sm text-text-secondary">
+                                    Пока нет сохранённых пресетов. Сохраните свой набор эффектов из окна звонка, чтобы он появился здесь.
+                                </li>
+                            ) : (
+                                videoEffectsPresets.map(preset => (
+                                    <li
+                                        key={preset.id}
+                                        className="flex items-center justify-between rounded-lg border border-border-primary px-3 py-2 bg-bg-secondary/60"
+                                    >
+                                        <div>
+                                            <p className="text-sm font-medium text-text-primary">{preset.label}</p>
+                                            <p className="text-xs text-text-secondary">
+                                                Видео: {preset.video.length} • Аудио: {preset.audio.length} • Обновлено{' '}
+                                                {new Date(preset.updatedAt).toLocaleString()}
+                                            </p>
+                                        </div>
+                                        <button
+                                            type="button"
+                                            className="text-xs px-2 py-1 rounded bg-bg-tertiary hover:bg-bg-secondary text-text-secondary"
+                                            onClick={() => onRemoveVideoEffectsPreset(preset.id)}
+                                        >
+                                            Удалить
+                                        </button>
+                                    </li>
+                                ))
+                            )}
+                        </ul>
                     </div>
 
                     <div className="pt-6 border-t border-border-primary">

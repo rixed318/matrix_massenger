@@ -2,6 +2,7 @@ import { MatrixClient, MatrixEvent, MatrixRoom, MatrixUser, Sticker, Gif, RoomCr
 import type { SecureCloudProfile } from './secureCloudService';
 import { normaliseSecureCloudProfile } from './secureCloudService';
 import GroupCallCoordinator, { GroupCallParticipant as CoordinatorParticipant } from './webrtc/groupCallCoordinator';
+import type { VideoEffectsConfiguration } from './videoEffectsService';
 import { buildGeoUri, buildStaticMapUrl, buildExternalNavigationUrl, MAP_ZOOM_DEFAULT, STATIC_MAP_HEIGHT, STATIC_MAP_WIDTH, sanitizeZoom } from '../utils/location';
 import {
     GROUP_CALL_CONTROL_EVENT_TYPE,
@@ -198,6 +199,12 @@ const CALL_SESSION_EVENT_TYPE = 'econix.call_session';
 
 export type CallSessionStatus = 'ringing' | 'connecting' | 'connected' | 'ended';
 
+export interface CallDeviceEffectsState {
+    presetId?: string | null;
+    configuration: VideoEffectsConfiguration;
+    applyToRemote?: boolean;
+}
+
 export interface CallSessionDeviceState {
     userId: string;
     deviceId: string;
@@ -206,6 +213,7 @@ export interface CallSessionDeviceState {
     connected?: boolean;
     isRemote?: boolean;
     lastSeenTs: number;
+    effects?: CallDeviceEffectsState;
 }
 
 export interface CallSessionState {
@@ -253,6 +261,70 @@ const nextCallStateTimestamp = (): number => {
     return now;
 };
 
+const normaliseEffectsConfiguration = (
+    config: VideoEffectsConfiguration | null | undefined,
+): VideoEffectsConfiguration => {
+    if (!config) {
+        return { video: [], audio: [] };
+    }
+    const video = Array.isArray(config.video)
+        ? config.video
+              .filter(effect => effect && typeof effect.id === 'string' && typeof effect.type === 'string')
+              .map(effect => ({
+                  id: effect.id,
+                  type: effect.type,
+                  intensity: typeof effect.intensity === 'number' ? effect.intensity : undefined,
+                  assetUrl:
+                      typeof effect.assetUrl === 'string'
+                          ? effect.assetUrl
+                          : effect.assetUrl === null
+                          ? null
+                          : undefined,
+                  enabled: effect.enabled !== false,
+              }))
+        : [];
+    const audio = Array.isArray(config.audio)
+        ? config.audio
+              .filter(effect => effect && typeof effect.id === 'string')
+              .map(effect => ({
+                  id: effect.id,
+                  type: 'noise-suppression' as const,
+                  intensity: typeof effect.intensity === 'number' ? effect.intensity : undefined,
+                  enabled: effect.enabled !== false,
+              }))
+        : [];
+    return { video, audio };
+};
+
+const normaliseDeviceEffectsState = (
+    effects: CallDeviceEffectsState | undefined,
+): CallDeviceEffectsState | undefined => {
+    if (!effects) {
+        return undefined;
+    }
+    return {
+        presetId: typeof effects.presetId === 'string' ? effects.presetId : null,
+        applyToRemote: effects.applyToRemote === true,
+        configuration: normaliseEffectsConfiguration(effects.configuration),
+    };
+};
+
+const cloneDeviceEffectsState = (
+    effects: CallDeviceEffectsState | undefined,
+): CallDeviceEffectsState | undefined => {
+    if (!effects) {
+        return undefined;
+    }
+    return {
+        presetId: effects.presetId ?? null,
+        applyToRemote: effects.applyToRemote,
+        configuration: {
+            video: effects.configuration.video.map(effect => ({ ...effect })),
+            audio: effects.configuration.audio.map(effect => ({ ...effect })),
+        },
+    };
+};
+
 const sanitiseDevices = (devices: CallSessionDeviceState[] | undefined): CallSessionDeviceState[] => {
     if (!Array.isArray(devices)) {
         return [];
@@ -272,6 +344,7 @@ const sanitiseDevices = (devices: CallSessionDeviceState[] | undefined): CallSes
             connected: device.connected === true,
             isRemote: device.isRemote === true ? true : undefined,
             lastSeenTs: lastSeen,
+            effects: normaliseDeviceEffectsState(device.effects),
         });
     });
     return Array.from(deduped.values()).sort((a, b) => (b.lastSeenTs || 0) - (a.lastSeenTs || 0));
@@ -619,6 +692,10 @@ export const updateLocalCallDeviceState = (client: MatrixClient, patch: Partial<
         return;
     }
     const now = nextCallStateTimestamp();
+    const hasEffectsPatch = Object.prototype.hasOwnProperty.call(patch, 'effects');
+    const normalisedEffects = hasEffectsPatch
+        ? normaliseDeviceEffectsState(patch.effects as CallDeviceEffectsState | undefined)
+        : undefined;
     const devices = current.devices.map(device => {
         if (device.deviceId !== deviceId) {
             return device;
@@ -626,6 +703,7 @@ export const updateLocalCallDeviceState = (client: MatrixClient, patch: Partial<
         return {
             ...device,
             ...patch,
+            effects: hasEffectsPatch ? cloneDeviceEffectsState(normalisedEffects) : device.effects,
             lastSeenTs: now,
         };
     });
@@ -638,6 +716,7 @@ export const updateLocalCallDeviceState = (client: MatrixClient, patch: Partial<
             connected: patch.connected ?? (current.status === 'connected'),
             isRemote: false,
             lastSeenTs: now,
+            effects: hasEffectsPatch ? cloneDeviceEffectsState(normalisedEffects) : undefined,
         });
     }
     const nextSession: CallSessionState = {
@@ -734,6 +813,7 @@ export const buildCallSessionSnapshot = (
             connected: true,
             isRemote: true,
             lastSeenTs: now,
+            effects: cloneDeviceEffectsState(existingRemote?.effects),
         };
         const remoteIndex = devices.findIndex(device => device.deviceId === remoteDeviceId);
         if (remoteIndex >= 0) {
@@ -753,6 +833,7 @@ export const buildCallSessionSnapshot = (
             ? true
             : existing?.devices?.find(device => device.deviceId === deviceId)?.connected ?? false,
         lastSeenTs: now,
+        effects: cloneDeviceEffectsState(existing?.devices?.find(device => device.deviceId === deviceId)?.effects),
     });
     return {
         sessionId,

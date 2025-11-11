@@ -64,6 +64,7 @@ import {
     createGroupCallCoordinator,
     leaveGroupCallCoordinator,
     GroupCallParticipant,
+    CallDeviceEffectsState,
     buildCallSessionSnapshot,
     CallSessionState,
     handoverCallToCurrentDevice,
@@ -72,6 +73,7 @@ import {
     setCallSessionForClient,
     updateLocalCallDeviceState,
 } from '../services/matrixService';
+import { videoEffectsService, type VideoEffectsConfiguration, type VideoEffectsPreset } from '../services/videoEffectsService';
 import GroupCallCoordinator from '../services/webrtc/groupCallCoordinator';
 import { GROUP_CALL_STATE_EVENT_TYPE, GroupCallStageState } from '../services/webrtc/groupCallConstants';
 import type { CallLayout } from './CallView';
@@ -111,6 +113,43 @@ const DRAFT_STORAGE_KEY = 'matrix-message-drafts';
 const DRAFT_ACCOUNT_DATA_EVENT = 'econix.message_drafts';
 
 type PendingQueueSummary = OutboxPayload & { attempts: number; error?: string; progress?: OutboxProgressState };
+
+const cloneVideoEffectsConfiguration = (config: VideoEffectsConfiguration): VideoEffectsConfiguration => ({
+    video: (config.video ?? []).map(effect => ({ ...effect })),
+    audio: (config.audio ?? []).map(effect => ({ ...effect })),
+});
+
+const areVideoEffectsEqual = (
+    a: VideoEffectsConfiguration | null | undefined,
+    b: VideoEffectsConfiguration | null | undefined,
+): boolean => {
+    if (!a && !b) return true;
+    if (!a || !b) return false;
+    if ((a.video?.length ?? 0) !== (b.video?.length ?? 0)) return false;
+    if ((a.audio?.length ?? 0) !== (b.audio?.length ?? 0)) return false;
+    const compareVideo = (a.video ?? []).every((effect, index) => {
+        const other = b.video?.[index];
+        if (!other) return false;
+        return (
+            effect.id === other.id &&
+            effect.type === other.type &&
+            effect.enabled === other.enabled &&
+            (effect.intensity ?? null) === (other.intensity ?? null) &&
+            (effect.assetUrl ?? null) === (other.assetUrl ?? null)
+        );
+    });
+    const compareAudio = (a.audio ?? []).every((effect, index) => {
+        const other = b.audio?.[index];
+        if (!other) return false;
+        return (
+            effect.id === other.id &&
+            effect.type === other.type &&
+            effect.enabled === other.enabled &&
+            (effect.intensity ?? null) === (other.intensity ?? null)
+        );
+    });
+    return compareVideo && compareAudio;
+};
 
 interface ChatTimelineSectionProps {
     secureCloud: {
@@ -215,6 +254,8 @@ interface ChatSidePanelsProps {
         presenceRestricted: boolean;
         animatedReactionsEnabled: boolean;
         onSetAnimatedReactionsEnabled: (enabled: boolean) => void;
+        videoEffectsPresets: VideoEffectsPreset[];
+        onRemoveVideoEffectsPreset: (id: string) => void;
     };
     createRoom: {
         isOpen: boolean;
@@ -327,6 +368,11 @@ interface ChatSidePanelsProps {
         canModerateParticipants: boolean;
         client: MatrixClient;
         onHangup: () => void;
+        localEffectsState?: CallDeviceEffectsState | null;
+        onLocalEffectsChange?: (state: CallDeviceEffectsState) => void;
+        effectsPresets?: VideoEffectsPreset[];
+        onSaveEffectsPreset?: (preset: VideoEffectsPreset) => void;
+        onToggleParticipantEffects?: (participantId: string, enabled: boolean) => void;
     };
     calls: {
         activeCall: MatrixCall | null;
@@ -709,6 +755,8 @@ const ChatSidePanels: React.FC<ChatSidePanelsProps> = ({
                     presenceRestricted={settings.presenceRestricted}
                     animatedReactionsEnabled={settings.animatedReactionsEnabled}
                     onSetAnimatedReactionsEnabled={settings.onSetAnimatedReactionsEnabled}
+                    videoEffectsPresets={settings.videoEffectsPresets}
+                    onRemoveVideoEffectsPreset={settings.onRemoveVideoEffectsPreset}
                 />
             )}
 
@@ -889,6 +937,12 @@ const ChatSidePanels: React.FC<ChatSidePanelsProps> = ({
                     onSendParticipantToAudience={groupCall.onSendToAudience}
                     localUserId={groupCall.localUserId}
                     canModerateParticipants={groupCall.canModerateParticipants}
+                    localEffectsState={groupCall.localEffectsState || undefined}
+                    onLocalEffectsChange={groupCall.onLocalEffectsChange}
+                    effectsPresets={groupCall.effectsPresets}
+                    onSaveEffectsPreset={groupCall.onSaveEffectsPreset}
+                    onDeleteEffectsPreset={groupCall.onDeleteEffectsPreset}
+                    onToggleParticipantEffects={groupCall.onToggleParticipantEffects}
                 />
             )}
 
@@ -1038,6 +1092,68 @@ const ChatPage: React.FC<ChatPageProps> = ({ client: providedClient, onLogout, s
     const previousParticipantIdsRef = useRef<Set<string>>(new Set());
     const previousHandRaiseRef = useRef<Set<string>>(new Set());
     const handRaiseQueueRef = useRef<string[]>([]);
+    const defaultEffectsConfiguration = useMemo(() => videoEffectsService.getDefaultConfiguration(), []);
+    const [localEffectsState, setLocalEffectsState] = useState<CallDeviceEffectsState | null>(null);
+    const [videoEffectsPresets, setVideoEffectsPresets] = useState<VideoEffectsPreset[]>([]);
+    const [remoteEffects, setRemoteEffects] = useState<Record<string, boolean>>({});
+
+    useEffect(() => {
+        let mounted = true;
+        void videoEffectsService.loadPresets().then(presets => {
+            if (mounted) {
+                setVideoEffectsPresets(presets);
+            }
+        });
+        return () => {
+            mounted = false;
+        };
+    }, []);
+
+    useEffect(() => {
+        if (!localDeviceId) {
+            setLocalEffectsState({
+                presetId: null,
+                applyToRemote: false,
+                configuration: cloneVideoEffectsConfiguration(defaultEffectsConfiguration),
+            });
+            return;
+        }
+        const device = accountCallSession?.devices.find(entry => entry.deviceId === localDeviceId);
+        if (device?.effects) {
+            const nextState: CallDeviceEffectsState = {
+                presetId: device.effects.presetId ?? null,
+                applyToRemote: device.effects.applyToRemote ?? false,
+                configuration: cloneVideoEffectsConfiguration(device.effects.configuration),
+            };
+            setLocalEffectsState(prev => {
+                if (
+                    prev &&
+                    prev.presetId === nextState.presetId &&
+                    prev.applyToRemote === nextState.applyToRemote &&
+                    areVideoEffectsEqual(prev.configuration, nextState.configuration)
+                ) {
+                    return prev;
+                }
+                return nextState;
+            });
+        } else {
+            setLocalEffectsState(prev => {
+                if (
+                    prev &&
+                    prev.presetId === null &&
+                    prev.applyToRemote === false &&
+                    areVideoEffectsEqual(prev.configuration, defaultEffectsConfiguration)
+                ) {
+                    return prev;
+                }
+                return {
+                    presetId: null,
+                    applyToRemote: false,
+                    configuration: cloneVideoEffectsConfiguration(defaultEffectsConfiguration),
+                };
+            });
+        }
+    }, [accountCallSession, localDeviceId, defaultEffectsConfiguration]);
     const [groupCallPermissionError, setGroupCallPermissionError] = useState<string | null>(null);
     const stories = useStoryStore<Story[]>(state => state.stories);
     const storiesHydrated = useStoryStore(state => state.isHydrated);
@@ -1969,6 +2085,67 @@ const handleStartGroupCall = useCallback(async () => {
     }
 }, [selectedRoomId, canStartGroupCall, groupCallDisabledReason, client, notificationsEnabled]);
 
+const handleLocalEffectsChange = useCallback(
+    (nextState: CallDeviceEffectsState) => {
+        const normalised: CallDeviceEffectsState = {
+            presetId: nextState.presetId ?? null,
+            applyToRemote: Boolean(nextState.applyToRemote),
+            configuration: cloneVideoEffectsConfiguration(nextState.configuration),
+        };
+        setLocalEffectsState(prev => {
+            if (
+                prev &&
+                prev.presetId === normalised.presetId &&
+                prev.applyToRemote === normalised.applyToRemote &&
+                areVideoEffectsEqual(prev.configuration, normalised.configuration)
+            ) {
+                return prev;
+            }
+            return normalised;
+        });
+        updateLocalCallDeviceState(client, { effects: normalised });
+        void groupCallCoordinator?.setLocalEffectsConfiguration(normalised.configuration);
+    },
+    [client, groupCallCoordinator],
+);
+
+const handleSaveEffectsPreset = useCallback(async (preset: VideoEffectsPreset) => {
+    await videoEffectsService.savePreset(preset);
+    const presets = await videoEffectsService.loadPresets();
+    setVideoEffectsPresets(presets);
+}, []);
+
+const handleDeleteEffectsPreset = useCallback(async (presetId: string) => {
+    await videoEffectsService.deletePreset(presetId);
+    const presets = await videoEffectsService.loadPresets();
+    setVideoEffectsPresets(presets);
+}, []);
+
+const handleToggleParticipantEffects = useCallback(
+    (participantId: string, enabled: boolean) => {
+        if (!participantId || participantId === client.getUserId()) {
+            return;
+        }
+        setRemoteEffects(prev => {
+            const next = { ...prev };
+            if (enabled) {
+                next[participantId] = true;
+            } else {
+                delete next[participantId];
+            }
+            return next;
+        });
+        if (!groupCallCoordinator || !localEffectsState) {
+            return;
+        }
+        void groupCallCoordinator.setIncomingEffectsConfiguration(
+            participantId,
+            enabled ? localEffectsState.configuration : null,
+        );
+    },
+    [client, groupCallCoordinator, localEffectsState],
+);
+
 const handleToggleScreenShare = useCallback(async () => {
     if (!groupCallCoordinator) return;
     try {
@@ -2200,6 +2377,47 @@ const handleSendParticipantToAudience = useCallback((participantId: string) => {
     }, [groupCallCoordinator, activeGroupCall, client, canStartGroupCall, notificationsEnabled]);
 
     useEffect(() => {
+        setRemoteEffects(prev => {
+            const activeIds = new Set(groupParticipants.map(participant => participant.userId));
+            const next = { ...prev };
+            Object.keys(next).forEach(id => {
+                if (!activeIds.has(id)) {
+                    delete next[id];
+                }
+            });
+            return next;
+        });
+    }, [groupParticipants]);
+
+    useEffect(() => {
+        if (!groupCallCoordinator || !localEffectsState) {
+            return;
+        }
+        const config = localEffectsState.configuration;
+        const applyAll = localEffectsState.applyToRemote;
+        const localUserId = client.getUserId?.() ?? '';
+        const tasks = groupParticipants.map(participant => {
+            if (participant.userId === localUserId) {
+                return Promise.resolve();
+            }
+            const explicitlyEnabled = Boolean(remoteEffects[participant.userId]);
+            const shouldApply = applyAll || explicitlyEnabled;
+            const current = groupCallCoordinator.getIncomingEffectsConfiguration(participant.userId);
+            if (shouldApply) {
+                if (!current || !areVideoEffectsEqual(current, config)) {
+                    return groupCallCoordinator.setIncomingEffectsConfiguration(participant.userId, config);
+                }
+                return Promise.resolve();
+            }
+            if (current) {
+                return groupCallCoordinator.setIncomingEffectsConfiguration(participant.userId, null);
+            }
+            return Promise.resolve();
+        });
+        void Promise.all(tasks);
+    }, [groupCallCoordinator, localEffectsState, groupParticipants, remoteEffects, client]);
+
+    useEffect(() => {
         if (!activeGroupCall) return;
         previousParticipantIdsRef.current = new Set(groupParticipants.map(p => p.userId));
     }, [activeGroupCall, groupParticipants]);
@@ -2242,9 +2460,25 @@ const handleSendParticipantToAudience = useCallback((participantId: string) => {
                 presenceSummary: summary
                     ? { ...summary, formattedUserId: formatMatrixIdForDisplay(participant.userId) }
                     : undefined,
+                effectsEnabled:
+                    Boolean(
+                        (localEffectsState?.applyToRemote && participant.userId !== (client.getUserId() || '')) ||
+                            remoteEffects[participant.userId],
+                    ),
             };
         });
-    }, [groupParticipants, client, spotlightParticipantId, activeGroupCall, selectedRoomId, presenceState, isPresenceHidden, currentUserId]);
+    }, [
+        groupParticipants,
+        client,
+        spotlightParticipantId,
+        activeGroupCall,
+        selectedRoomId,
+        presenceState,
+        isPresenceHidden,
+        currentUserId,
+        localEffectsState,
+        remoteEffects,
+    ]);
 
     const handleSetChatBackground = (bgUrl: string) => {
         setChatBackground(bgUrl);
@@ -4097,6 +4331,10 @@ const handleSendParticipantToAudience = useCallback((participantId: string) => {
             presenceRestricted: hasPresenceRestriction,
             animatedReactionsEnabled,
             onSetAnimatedReactionsEnabled: handleAnimatedReactionsToggle,
+            videoEffectsPresets,
+            onRemoveVideoEffectsPreset: presetId => {
+                void handleDeleteEffectsPreset(presetId);
+            },
         },
         createRoom: {
             isOpen: isCreateRoomOpen,
@@ -4208,6 +4446,11 @@ const handleSendParticipantToAudience = useCallback((participantId: string) => {
             canModerateParticipants: canStartGroupCall,
             client,
             onHangup: handleCloseGroupCall,
+            localEffectsState,
+            onLocalEffectsChange: handleLocalEffectsChange,
+            effectsPresets: videoEffectsPresets,
+            onSaveEffectsPreset: handleSaveEffectsPreset,
+            onToggleParticipantEffects: handleToggleParticipantEffects,
         },
         calls: {
             activeCall,
