@@ -5,7 +5,9 @@ import React, {
     useRef,
     useState,
 } from 'react';
+import type { MatrixClient } from '@matrix-messenger/core';
 import type { RoomMediaSummary, RoomMediaItem, SharedMediaCategory } from '../services/matrixService';
+import KnowledgeBasePanel from './KnowledgeBase/KnowledgeBasePanel';
 
 type SharedMediaPanelProps = {
     isOpen: boolean;
@@ -15,6 +17,7 @@ type SharedMediaPanelProps = {
     isPaginating?: boolean;
     onLoadMore?: () => void;
     currentUserId?: string;
+    client?: MatrixClient;
 };
 
 const TABS: Array<{ key: SharedMediaCategory; label: string }> = [
@@ -86,6 +89,7 @@ const SharedMediaPanel: React.FC<SharedMediaPanelProps> = ({
     isPaginating = false,
     onLoadMore,
     currentUserId,
+    client,
 }) => {
     const [activeTab, setActiveTab] = useState<SharedMediaCategory>('media');
     const [searchValue, setSearchValue] = useState('');
@@ -646,6 +650,9 @@ const SharedMediaPanel: React.FC<SharedMediaPanelProps> = ({
                             {isPaginating ? 'Загрузка…' : 'Загрузить ещё'}
                         </button>
                     )}
+                </div>
+                <div className="border-t border-border-primary px-4 py-4">
+                    <KnowledgeBasePanel client={client} />
                 </div>
             </aside>
         </div>
