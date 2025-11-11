@@ -5,6 +5,15 @@ import { mxcToHttp } from '@matrix-messenger/core';
 import { CallEvent } from 'matrix-js-sdk';
 import CallParticipantsPanel, { Participant as CallParticipant } from './CallParticipantsPanel';
 import { GroupCallStageState } from '../services/webrtc/groupCallConstants';
+import GroupCallCoordinator from '../services/webrtc/groupCallCoordinator';
+import {
+    startLiveTranscriptionSession,
+    stopLiveTranscriptionSession,
+    subscribeLiveTranscription,
+    translateCaption,
+    LiveTranscriptChunk,
+    getTranscriptionRuntimeConfig,
+} from '../services/transcriptionService';
 
 export type CallLayout = 'spotlight' | 'grid';
 
@@ -47,6 +56,7 @@ interface CallViewProps {
     callSession?: CallSessionState | null;
     onHandover?: () => void;
     localDeviceId?: string | null;
+    coordinator?: GroupCallCoordinator | null;
 }
 
 interface VideoTileInfo {
@@ -147,6 +157,7 @@ const CallView: React.FC<CallViewProps> = ({
     callSession,
     onHandover,
     localDeviceId,
+    coordinator,
 }) => {
     const [callState, setCallState] = useState<string>(call?.state ?? '');
     const [duration, setDuration] = useState(0);
@@ -155,6 +166,19 @@ const CallView: React.FC<CallViewProps> = ({
     const durationIntervalRef = useRef<number | null>(null);
     const localVideoRef = useRef<HTMLVideoElement>(null);
     const remoteVideoRef = useRef<HTMLVideoElement>(null);
+    const [liveCaptions, setLiveCaptions] = useState<Record<string, LiveTranscriptChunk>>({});
+    const [captionOrder, setCaptionOrder] = useState<string[]>([]);
+    const [captionLanguage, setCaptionLanguage] = useState<string>('auto');
+    const [captionTargetLanguage, setCaptionTargetLanguage] = useState<string>('');
+    const [captionAutoTranslate, setCaptionAutoTranslate] = useState<boolean>(false);
+    const [captionShowForAll, setCaptionShowForAll] = useState<boolean>(false);
+    const [captionsEnabled, setCaptionsEnabled] = useState<boolean>(true);
+    const captionSettingsRef = useRef({
+        autoTranslate: captionAutoTranslate,
+        targetLanguage: captionTargetLanguage,
+        showForAll: captionShowForAll,
+    });
+    const broadcastedChunksRef = useRef<Set<string>>(new Set());
 
     const isGroupCall = Boolean(participants && participants.length > 0);
     const stageSpeakers = useMemo(
@@ -166,6 +190,185 @@ const CallView: React.FC<CallViewProps> = ({
         [participants],
     );
     const queueOrder = stageState?.handRaiseQueue ?? [];
+    const callIdentifier = useMemo(() => {
+        if (callSession?.callId) return callSession.callId;
+        if (coordinator) return coordinator.sessionId;
+        const directId = (call as any)?.callId ?? (call as any)?.groupCallId;
+        return typeof directId === 'string' ? directId : null;
+    }, [callSession?.callId, coordinator, call]);
+    const latestCaption = useMemo(() => {
+        for (let idx = captionOrder.length - 1; idx >= 0; idx -= 1) {
+            const chunk = liveCaptions[captionOrder[idx]];
+            if (chunk && (chunk.final || chunk.text)) {
+                return chunk;
+            }
+        }
+        return null;
+    }, [captionOrder, liveCaptions]);
+
+    useEffect(() => {
+        captionSettingsRef.current = {
+            autoTranslate: captionAutoTranslate,
+            targetLanguage: captionTargetLanguage,
+            showForAll: captionShowForAll,
+        };
+    }, [captionAutoTranslate, captionTargetLanguage, captionShowForAll]);
+
+    useEffect(() => {
+        if (callSession) return;
+        const runtime = getTranscriptionRuntimeConfig();
+        if (!captionTargetLanguage && runtime.defaultTargetLanguage) {
+            setCaptionTargetLanguage(runtime.defaultTargetLanguage);
+        }
+        if (captionLanguage === 'auto' && runtime.defaultLanguage) {
+            setCaptionLanguage(runtime.defaultLanguage);
+        }
+    }, [callSession, captionLanguage, captionTargetLanguage]);
+
+    useEffect(() => {
+        if (!callSession) {
+            return;
+        }
+        const deviceId = localDeviceId ?? client.getDeviceId?.() ?? null;
+        const device = deviceId ? callSession.devices.find(d => d.deviceId === deviceId) : null;
+        const prefs = device?.captionPreferences;
+        if (prefs) {
+            if (typeof prefs.language === 'string') {
+                setCaptionLanguage(prefs.language || 'auto');
+            }
+            if (typeof prefs.targetLanguage === 'string') {
+                setCaptionTargetLanguage(prefs.targetLanguage);
+            }
+            setCaptionAutoTranslate(prefs.autoTranslate === true);
+            setCaptionShowForAll(prefs.showForAll === true);
+        }
+    }, [callSession, localDeviceId, client]);
+
+    useEffect(() => {
+        if (!callIdentifier) return;
+        const unsubscribe = subscribeLiveTranscription(callIdentifier, chunk => {
+            setLiveCaptions(prev => ({
+                ...prev,
+                [chunk.chunkId]: {
+                    ...(prev[chunk.chunkId] ?? {}),
+                    ...chunk,
+                },
+            }));
+            setCaptionOrder(prev => (prev.includes(chunk.chunkId) ? prev : [...prev, chunk.chunkId]));
+            if (chunk.final && chunk.source === 'local' && coordinator && captionSettingsRef.current.showForAll) {
+                if (!broadcastedChunksRef.current.has(chunk.chunkId)) {
+                    coordinator.publishCaption(chunk.text, {
+                        id: chunk.chunkId,
+                        language: chunk.language,
+                        final: chunk.final,
+                        translatedText: chunk.translatedText,
+                        targetLanguage: chunk.targetLanguage,
+                    });
+                    broadcastedChunksRef.current.add(chunk.chunkId);
+                }
+            }
+            if (chunk.final) {
+                const settings = captionSettingsRef.current;
+                if (
+                    settings.autoTranslate &&
+                    typeof settings.targetLanguage === 'string' &&
+                    settings.targetLanguage.trim().length > 0 &&
+                    !chunk.translatedText
+                ) {
+                    const target = settings.targetLanguage.trim();
+                    void translateCaption(callIdentifier, chunk.text, target, chunk.language)
+                        .then(result => {
+                            if (!result) return;
+                            setLiveCaptions(current => {
+                                const existing = current[chunk.chunkId];
+                                if (!existing) return current;
+                                return {
+                                    ...current,
+                                    [chunk.chunkId]: {
+                                        ...existing,
+                                        translatedText: result,
+                                        targetLanguage: target,
+                                    },
+                                };
+                            });
+                            if (settings.showForAll && coordinator) {
+                                const key = `${chunk.chunkId}:tl:${target}`;
+                                if (!broadcastedChunksRef.current.has(key)) {
+                                    coordinator.publishCaptionTranslation(chunk.chunkId, result, target);
+                                    broadcastedChunksRef.current.add(key);
+                                }
+                            }
+                        })
+                        .catch(error => console.warn('Failed to translate caption', error));
+                }
+            }
+        });
+        return unsubscribe;
+    }, [callIdentifier, coordinator]);
+
+    useEffect(() => {
+        if (!coordinator || !callIdentifier) return;
+        if (!(captionsEnabled || captionShowForAll || captionAutoTranslate)) {
+            return;
+        }
+        const stream = coordinator.getLocalStream();
+        if (!stream) {
+            return;
+        }
+        const session = startLiveTranscriptionSession(stream, {
+            callId: callIdentifier,
+            language: captionLanguage === 'auto' ? undefined : captionLanguage,
+        });
+        return () => {
+            if (session) {
+                stopLiveTranscriptionSession(callIdentifier);
+            }
+        };
+    }, [coordinator, callIdentifier, captionLanguage, captionsEnabled, captionShowForAll, captionAutoTranslate]);
+
+    const persistCaptionPreferences = (
+        next: {
+            language?: string;
+            targetLanguage?: string;
+            autoTranslate?: boolean;
+            showForAll?: boolean;
+        },
+    ) => {
+        const effective = {
+            language: next.language ?? captionLanguage,
+            targetLanguage: next.targetLanguage ?? captionTargetLanguage,
+            autoTranslate: next.autoTranslate ?? captionAutoTranslate,
+            showForAll: next.showForAll ?? captionShowForAll,
+        };
+        updateLocalCallDeviceState(client, {
+            captionPreferences: {
+                language: effective.language === 'auto' ? undefined : effective.language,
+                targetLanguage: effective.targetLanguage?.trim() || undefined,
+                autoTranslate: effective.autoTranslate,
+                showForAll: effective.showForAll,
+            },
+        });
+    };
+
+    const handleCaptionLanguageChange = (value: string) => {
+        setCaptionLanguage(value);
+        persistCaptionPreferences({ language: value });
+    };
+
+    const handleCaptionTargetChange = (value: string) => {
+        setCaptionTargetLanguage(value);
+        persistCaptionPreferences({ targetLanguage: value });
+    };
+
+    const handleCaptionAutoTranslateChange = (enabled: boolean) => {
+        setCaptionAutoTranslate(enabled);
+        persistCaptionPreferences({ autoTranslate: enabled });
+    };
+
+    const handleCaptionShowForAllChange = (enabled: boolean) => {
+        setCaptionShowForAll(enabled);
+        persistCaptionPreferences({ showForAll: enabled });
+    };
 
     useEffect(() => {
         if (!call || isGroupCall) return;
@@ -387,6 +590,13 @@ const CallView: React.FC<CallViewProps> = ({
                 <div className="absolute top-6 right-6 flex items-center gap-3">
                     <div className="text-sm text-text-secondary">{headerTitle || 'Групповой звонок'}</div>
                     <button
+                        className={`px-3 py-1 rounded-full text-sm ${captionsEnabled ? 'bg-indigo-600 text-white' : 'bg-bg-secondary hover:bg-bg-tertiary text-text-secondary'}`}
+                        onClick={() => setCaptionsEnabled(prev => !prev)}
+                        type="button"
+                    >
+                        {captionsEnabled ? 'CC вкл.' : 'CC выкл.'}
+                    </button>
+                    <button
                         className="px-3 py-1 rounded-full text-sm bg-bg-secondary hover:bg-bg-tertiary"
                         onClick={onToggleParticipantsPanel}
                         type="button"
@@ -497,6 +707,20 @@ const CallView: React.FC<CallViewProps> = ({
                     )}
                 </div>
 
+                {captionsEnabled && latestCaption && (
+                    <div className="absolute bottom-36 inset-x-0 flex justify-center pointer-events-none px-6">
+                        <div className="max-w-3xl bg-black/70 text-white px-4 py-3 rounded-2xl text-center text-base shadow-lg">
+                            <div className="font-medium break-words">{latestCaption.translatedText ?? latestCaption.text}</div>
+                            <div className="text-xs text-white/70 mt-1">
+                                {(latestCaption.language || 'auto').toUpperCase()}
+                                {latestCaption.translatedText
+                                    ? ` → ${(latestCaption.targetLanguage || captionTargetLanguage || '').toUpperCase()}`
+                                    : ''}
+                            </div>
+                        </div>
+                    </div>
+                )}
+
                 <div className="absolute bottom-12 inset-x-0 flex flex-wrap items-center justify-center gap-4">
                     {canRaise && (
                         <button
@@ -565,6 +789,14 @@ const CallView: React.FC<CallViewProps> = ({
                         onLowerHand={id => onLowerHand?.(id)}
                         localUserId={localUserId}
                         canModerate={canModerateParticipants}
+                        captionLanguage={captionLanguage}
+                        captionTargetLanguage={captionTargetLanguage}
+                        captionAutoTranslate={captionAutoTranslate}
+                        captionShowForAll={captionShowForAll}
+                        onCaptionLanguageChange={handleCaptionLanguageChange}
+                        onCaptionTargetLanguageChange={handleCaptionTargetChange}
+                        onCaptionAutoTranslateChange={handleCaptionAutoTranslateChange}
+                        onCaptionShowForAllChange={handleCaptionShowForAllChange}
                     />
                 )}
             </div>
@@ -598,6 +830,16 @@ const CallView: React.FC<CallViewProps> = ({
                     className="absolute top-0 left-0 w-full h-full object-cover"
                 />
             )}
+
+            <div className="absolute top-6 right-6 flex items-center gap-3 z-10">
+                <button
+                    className={`px-3 py-1 rounded-full text-sm ${captionsEnabled ? 'bg-indigo-600 text-white' : 'bg-bg-secondary hover:bg-bg-tertiary text-text-secondary'}`}
+                    onClick={() => setCaptionsEnabled(prev => !prev)}
+                    type="button"
+                >
+                    {captionsEnabled ? 'CC вкл.' : 'CC выкл.'}
+                </button>
+            </div>
 
             <div className="relative text-center z-10">
                 {!isVideoCall && <Avatar name={peerName} imageUrl={peerAvatar} size="md" />}
@@ -645,6 +887,20 @@ const CallView: React.FC<CallViewProps> = ({
                     muted
                     className={`absolute bottom-40 right-8 w-48 h-auto rounded-lg shadow-lg border-2 border-gray-700 transition-opacity ${computedVideoMuted ? 'opacity-0' : 'opacity-100'}`}
                 />
+            )}
+
+            {captionsEnabled && latestCaption && (
+                <div className="absolute bottom-28 inset-x-0 flex justify-center pointer-events-none px-6 z-10">
+                    <div className="max-w-2xl bg-black/70 text-white px-4 py-3 rounded-2xl text-center text-base shadow-lg">
+                        <div className="font-medium break-words">{latestCaption.translatedText ?? latestCaption.text}</div>
+                        <div className="text-xs text-white/70 mt-1">
+                            {(latestCaption.language || 'auto').toUpperCase()}
+                            {latestCaption.translatedText
+                                ? ` → ${(latestCaption.targetLanguage || captionTargetLanguage || '').toUpperCase()}`
+                                : ''}
+                        </div>
+                    </div>
+                </div>
             )}
 
             <div className="absolute bottom-16 flex items-center gap-8 z-10">

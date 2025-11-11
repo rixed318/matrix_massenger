@@ -889,6 +889,7 @@ const ChatSidePanels: React.FC<ChatSidePanelsProps> = ({
                     onSendParticipantToAudience={groupCall.onSendToAudience}
                     localUserId={groupCall.localUserId}
                     canModerateParticipants={groupCall.canModerateParticipants}
+                    coordinator={groupCallCoordinator}
                 />
             )}
 

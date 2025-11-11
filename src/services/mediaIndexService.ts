@@ -460,6 +460,49 @@ export function applyTranscriptUpdate(roomId: string, eventId: string, transcrip
   void upsertIndexEntries(roomId, [target], []);
 }
 
+interface CaptionRecord {
+  id: string;
+  callId: string;
+  text: string;
+  language?: string;
+  translatedText?: string;
+  targetLanguage?: string;
+  timestamp: number;
+  sender: string;
+}
+
+export function recordCallCaption(roomId: string, caption: CaptionRecord): void {
+  if (!caption?.id || !caption.text) return;
+  const idx = load(roomId);
+  const tokens = tokenize(caption.text);
+  const translated = caption.translatedText ?? caption.text;
+  const transcriptTokens = tokenize(translated);
+  const metadata: IndexedMessageMetadata = {
+    eventId: caption.id,
+    roomId,
+    sender: caption.sender,
+    timestamp: caption.timestamp,
+    body: caption.text,
+    tokens,
+    tags: ['call.caption'],
+    reactions: [],
+    hasMedia: false,
+    mediaTypes: [],
+    transcriptText: translated,
+    transcriptStatus: 'completed',
+    transcriptLanguage: caption.translatedText ? (caption.targetLanguage ?? caption.language) : caption.language,
+    transcriptTokens,
+    transcriptUpdatedAt: Date.now(),
+  };
+  idx.messages = dedupeMessages([
+    ...idx.messages.filter(m => m.eventId !== caption.id),
+    metadata,
+  ]).sort((a, b) => a.timestamp - b.timestamp);
+  inMemory.set(roomId, idx);
+  persist(roomId);
+  void upsertIndexEntries(roomId, [metadata], []);
+}
+
 export function startLiveIndexing(roomId: string) {
   const client = matrixService.getClient?.() as MatrixClient | undefined;
   if (!client) return;
