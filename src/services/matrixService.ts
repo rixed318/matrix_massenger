@@ -3,6 +3,8 @@ import type { SecureCloudProfile } from './secureCloudService';
 import { normaliseSecureCloudProfile } from './secureCloudService';
 import GroupCallCoordinator, { GroupCallParticipant as CoordinatorParticipant } from './webrtc/groupCallCoordinator';
 import { buildGeoUri, buildStaticMapUrl, buildExternalNavigationUrl, MAP_ZOOM_DEFAULT, STATIC_MAP_HEIGHT, STATIC_MAP_WIDTH, sanitizeZoom } from '../utils/location';
+import { setTravelModeNotificationState } from './notificationService';
+import { setTravelModePushState } from './pushService';
 import {
     GROUP_CALL_CONTROL_EVENT_TYPE,
     GROUP_CALL_PARTICIPANTS_EVENT_TYPE,
@@ -3237,6 +3239,11 @@ const bootstrapAuthenticatedClient = async (client: MatrixClient, secureProfile?
     } catch (e) {
         console.warn('bindStoryAccountData failed', e);
     }
+    try {
+        bindTravelModeAccountData(client);
+    } catch (e) {
+        console.warn('bindTravelModeAccountData failed', e);
+    }
     if (secureProfile) {
         setSecureCloudProfileForClient(client, secureProfile);
     }
@@ -5892,6 +5899,141 @@ const roomTTLCache = new Map<string, number | null>();
 const nextMessageTTLCache = new Map<string, number | null>();
 const SELF_DESTRUCT_CONTENT_KEY = 'com.matrix_messenger.self_destruct';
 const HIDDEN_ROOM_TAG = 'com.matrix_messenger.hidden';
+const TRAVEL_MODE_ACCOUNT_EVENT = 'com.matrix_messenger.travel_mode';
+
+interface TravelModeAccountState {
+  enabled: boolean;
+  hiddenRooms: string[];
+  autoDeactivateAt: number | null;
+  autoDeactivateTimeoutMs: number | null;
+  updatedAt: number;
+}
+
+const DEFAULT_TRAVEL_MODE_STATE: TravelModeAccountState = {
+  enabled: false,
+  hiddenRooms: [],
+  autoDeactivateAt: null,
+  autoDeactivateTimeoutMs: null,
+  updatedAt: 0,
+};
+
+const travelModeAccountCache = new WeakMap<MatrixClient, TravelModeAccountState>();
+
+const sanitizeTravelModeAccountState = (content: any): TravelModeAccountState => {
+  if (!content || typeof content !== 'object') {
+    return { ...DEFAULT_TRAVEL_MODE_STATE };
+  }
+  const enabled = Boolean(content.enabled);
+  const rawRooms = Array.isArray(content.hiddenRooms) ? content.hiddenRooms : [];
+  const hiddenRooms = rawRooms.filter((roomId): roomId is string => typeof roomId === 'string');
+  const autoDeactivateAt =
+    typeof content.autoDeactivateAt === 'number' && Number.isFinite(content.autoDeactivateAt)
+      ? content.autoDeactivateAt
+      : null;
+  const autoDeactivateTimeoutMs =
+    typeof content.autoDeactivateTimeoutMs === 'number' && Number.isFinite(content.autoDeactivateTimeoutMs)
+      ? content.autoDeactivateTimeoutMs
+      : null;
+  const updatedAt =
+    typeof content.updatedAt === 'number' && Number.isFinite(content.updatedAt) ? content.updatedAt : Date.now();
+
+  return {
+    enabled,
+    hiddenRooms,
+    autoDeactivateAt,
+    autoDeactivateTimeoutMs,
+    updatedAt,
+  };
+};
+
+const notifyTravelModeObservers = (state: TravelModeAccountState) => {
+  setTravelModeNotificationState(state.enabled, state.hiddenRooms);
+  setTravelModePushState(state.enabled, state.hiddenRooms);
+};
+
+const readTravelModeAccountData = (client: MatrixClient): TravelModeAccountState => {
+  const cached = travelModeAccountCache.get(client);
+  if (cached) {
+    return cached;
+  }
+  const event = client.getAccountData(TRAVEL_MODE_ACCOUNT_EVENT as any);
+  const content = event?.getContent?.();
+  const state = sanitizeTravelModeAccountState(content);
+  travelModeAccountCache.set(client, state);
+  notifyTravelModeObservers(state);
+  return state;
+};
+
+export const getTravelModeAccountData = (client: MatrixClient): TravelModeAccountState => {
+  const state = readTravelModeAccountData(client);
+  return {
+    ...state,
+    hiddenRooms: [...state.hiddenRooms],
+  };
+};
+
+export const setTravelModeAccountData = async (
+  client: MatrixClient,
+  update: Partial<TravelModeAccountState>,
+): Promise<void> => {
+  const current = readTravelModeAccountData(client);
+  const now = Date.now();
+  const hiddenRooms = Array.isArray(update.hiddenRooms)
+    ? update.hiddenRooms.filter((roomId): roomId is string => typeof roomId === 'string')
+    : current.hiddenRooms;
+  const next: TravelModeAccountState = {
+    enabled: typeof update.enabled === 'boolean' ? update.enabled : current.enabled,
+    hiddenRooms,
+    autoDeactivateAt:
+      update.autoDeactivateAt === null
+        ? null
+        : typeof update.autoDeactivateAt === 'number' && Number.isFinite(update.autoDeactivateAt)
+          ? update.autoDeactivateAt
+          : current.autoDeactivateAt,
+    autoDeactivateTimeoutMs:
+      update.autoDeactivateTimeoutMs === null
+        ? null
+        : typeof update.autoDeactivateTimeoutMs === 'number' && Number.isFinite(update.autoDeactivateTimeoutMs)
+          ? update.autoDeactivateTimeoutMs
+          : current.autoDeactivateTimeoutMs,
+    updatedAt: now,
+  };
+
+  travelModeAccountCache.set(client, next);
+  notifyTravelModeObservers(next);
+
+  try {
+    await client.setAccountData(TRAVEL_MODE_ACCOUNT_EVENT as any, {
+      enabled: next.enabled,
+      hiddenRooms: next.hiddenRooms,
+      autoDeactivateAt: next.autoDeactivateAt,
+      autoDeactivateTimeoutMs: next.autoDeactivateTimeoutMs,
+      updatedAt: next.updatedAt,
+    } as any);
+  } catch (error) {
+    console.warn('Failed to persist travel mode account data', error);
+  }
+};
+
+export const bindTravelModeAccountData = (client: MatrixClient): (() => void) => {
+  const handler = (event: MatrixEvent) => {
+    if (event.getType() !== TRAVEL_MODE_ACCOUNT_EVENT) {
+      return;
+    }
+    const content = event.getContent?.();
+    const state = sanitizeTravelModeAccountState(content);
+    travelModeAccountCache.set(client, state);
+    notifyTravelModeObservers(state);
+  };
+
+  client.on(ClientEvent.AccountData as any, handler as any);
+  const initial = readTravelModeAccountData(client);
+  notifyTravelModeObservers(initial);
+
+  return () => {
+    client.removeListener(ClientEvent.AccountData as any, handler as any);
+  };
+};
 
 const selfDestructTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const selfDestructBindings = new WeakMap<MatrixClient, () => void>();

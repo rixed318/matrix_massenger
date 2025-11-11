@@ -241,6 +241,69 @@ async function idbSmartCollections(userId: string): Promise<SmartCollectionSumma
   return smart;
 }
 
+async function idbDeleteRoom(roomId: string): Promise<void> {
+  const tx = await idbTransaction("readwrite");
+  if (!tx) return;
+  const messageStore = tx.objectStore(STORE_MESSAGES);
+  const mediaStore = tx.objectStore(STORE_MEDIA);
+  const completion = new Promise<void>((resolve, reject) => {
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
+  });
+  const removeMessages = new Promise<void>((resolve, reject) => {
+    const index = messageStore.index("byRoom");
+    const request = index.openCursor(IDBKeyRange.only(roomId));
+    request.onsuccess = () => {
+      const cursor = request.result;
+      if (cursor) {
+        cursor.delete();
+        cursor.continue();
+      } else {
+        resolve();
+      }
+    };
+    request.onerror = () => reject(request.error);
+  });
+  const removeMedia = new Promise<void>((resolve, reject) => {
+    const request = mediaStore.openCursor();
+    request.onsuccess = () => {
+      const cursor = request.result;
+      if (cursor) {
+        const value = cursor.value as MediaItem;
+        if (value.roomId === roomId) {
+          cursor.delete();
+        }
+        cursor.continue();
+      } else {
+        resolve();
+      }
+    };
+    request.onerror = () => reject(request.error);
+  });
+  await Promise.all([removeMessages.catch(() => undefined), removeMedia.catch(() => undefined)]);
+  await completion.catch(() => undefined);
+}
+
+async function idbClearAll(): Promise<void> {
+  const tx = await idbTransaction("readwrite");
+  if (!tx) return;
+  const messageStore = tx.objectStore(STORE_MESSAGES);
+  const mediaStore = tx.objectStore(STORE_MEDIA);
+  await Promise.all([
+    new Promise<void>((resolve, reject) => {
+      const request = messageStore.clear();
+      request.onsuccess = () => resolve();
+      request.onerror = () => reject(request.error);
+    }).catch(() => undefined),
+    new Promise<void>((resolve, reject) => {
+      const request = mediaStore.clear();
+      request.onsuccess = () => resolve();
+      request.onerror = () => reject(request.error);
+    }).catch(() => undefined),
+  ]);
+}
+
 // -----------------------------
 // Public API
 // -----------------------------
@@ -292,5 +355,35 @@ export async function getSmartCollections(userId: string): Promise<SmartCollecti
     }
   }
   return idbSmartCollections(userId);
+}
+
+export async function purgeRoomIndex(roomId: string): Promise<void> {
+  if (!roomId) return;
+  if (isTauri) {
+    try {
+      await invoke("purge_room_index", { roomId });
+      return;
+    } catch (error) {
+      console.warn("Failed to purge room index via Tauri", error);
+    }
+  }
+  await idbDeleteRoom(roomId);
+}
+
+export async function purgeRoomsFromIndex(roomIds: string[]): Promise<void> {
+  if (!Array.isArray(roomIds) || !roomIds.length) return;
+  await Promise.all(roomIds.map(roomId => purgeRoomIndex(roomId)));
+}
+
+export async function clearLocalIndex(): Promise<void> {
+  if (isTauri) {
+    try {
+      await invoke("clear_index_store");
+      return;
+    } catch (error) {
+      console.warn("Failed to clear index via Tauri", error);
+    }
+  }
+  await idbClearAll();
 }
 

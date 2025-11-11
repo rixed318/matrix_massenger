@@ -1,10 +1,27 @@
 const STORAGE_KEY = 'app-lock/config';
 const SESSION_FLAG = 'matrix-messenger:app-lock:session';
 const BIOMETRIC_KEY = 'app-lock/biometric';
+const TEMPORARY_PIN_WINDOW_MS = 10 * 60 * 1000;
+const MAX_TEMP_WINDOWS = 10;
 
 interface SecureStorageInvocation {
   command: string;
   args?: Record<string, unknown>;
+}
+
+export interface TemporaryPinWindow {
+  start: number;
+  expiresAt: number;
+}
+
+export interface TravelModeRecord {
+  enabled: boolean;
+  autoDeactivateTimeoutMs?: number | null;
+  autoDeactivateAt?: number | null;
+  autoLogout?: boolean;
+  clearCacheOnEnable?: boolean;
+  temporaryPinWindows: TemporaryPinWindow[];
+  updatedAt: number;
 }
 
 export interface AppLockRecord {
@@ -13,12 +30,31 @@ export interface AppLockRecord {
   secret: string;
   biometricEnabled: boolean;
   updatedAt: number;
+  travelMode?: TravelModeRecord;
+}
+
+export interface TravelModeSnapshot {
+  enabled: boolean;
+  autoDeactivateTimeoutMs?: number | null;
+  autoDeactivateAt?: number | null;
+  autoLogout?: boolean;
+  clearCacheOnEnable?: boolean;
+  temporaryPinWindows: TemporaryPinWindow[];
+  updatedAt?: number;
 }
 
 export interface AppLockSnapshot {
   enabled: boolean;
   biometricEnabled: boolean;
   updatedAt?: number;
+  travelMode: TravelModeSnapshot;
+}
+
+export interface EnableTravelModeOptions {
+  autoDeactivateTimeoutMs?: number | null;
+  autoLogout?: boolean;
+  clearCacheOnEnable?: boolean;
+  temporaryPinWindows?: TemporaryPinWindow[];
 }
 
 export interface UnlockResult {
@@ -94,13 +130,103 @@ const hashPin = async (pin: string, saltBase64: string): Promise<string> => {
   return bufferToBase64(digest);
 };
 
+const EMPTY_TRAVEL_MODE: TravelModeRecord = {
+  enabled: false,
+  autoDeactivateTimeoutMs: null,
+  autoDeactivateAt: null,
+  autoLogout: false,
+  clearCacheOnEnable: false,
+  temporaryPinWindows: [],
+  updatedAt: 0,
+};
+
+const sanitizePinWindows = (windows: TemporaryPinWindow[] = []): TemporaryPinWindow[] => {
+  if (!Array.isArray(windows)) return [];
+  const now = Date.now();
+  return windows
+    .filter(window => {
+      if (!window || typeof window !== 'object') return false;
+      const start = Number(window.start);
+      const expiresAt = Number(window.expiresAt);
+      if (!Number.isFinite(start) || !Number.isFinite(expiresAt)) return false;
+      return expiresAt > now - 5 * 60 * 1000; // drop windows expired long ago
+    })
+    .map(window => ({
+      start: Number(window.start),
+      expiresAt: Number(window.expiresAt),
+    }))
+    .sort((a, b) => a.start - b.start);
+};
+
+const normalizeTravelMode = (payload?: TravelModeRecord | null): TravelModeRecord => {
+  if (!payload || typeof payload !== 'object') {
+    return { ...EMPTY_TRAVEL_MODE };
+  }
+  const sanitized: TravelModeRecord = {
+    enabled: Boolean(payload.enabled),
+    autoDeactivateTimeoutMs:
+      typeof payload.autoDeactivateTimeoutMs === 'number' && Number.isFinite(payload.autoDeactivateTimeoutMs)
+        ? payload.autoDeactivateTimeoutMs
+        : null,
+    autoDeactivateAt:
+      typeof payload.autoDeactivateAt === 'number' && Number.isFinite(payload.autoDeactivateAt)
+        ? payload.autoDeactivateAt
+        : null,
+    autoLogout: Boolean(payload.autoLogout),
+    clearCacheOnEnable: Boolean(payload.clearCacheOnEnable),
+    temporaryPinWindows: sanitizePinWindows(payload.temporaryPinWindows),
+    updatedAt: typeof payload.updatedAt === 'number' && Number.isFinite(payload.updatedAt) ? payload.updatedAt : Date.now(),
+  };
+  if (!sanitized.enabled) {
+    sanitized.autoDeactivateAt = null;
+    sanitized.temporaryPinWindows = [];
+  }
+  return sanitized;
+};
+
+const mergeTravelMode = (record: AppLockRecord): TravelModeRecord => normalizeTravelMode(record.travelMode);
+
+const toTravelModeSnapshot = (travel: TravelModeRecord | undefined): TravelModeSnapshot => {
+  const normalized = normalizeTravelMode(travel);
+  return {
+    enabled: normalized.enabled,
+    autoDeactivateTimeoutMs: normalized.autoDeactivateTimeoutMs ?? null,
+    autoDeactivateAt: normalized.autoDeactivateAt ?? null,
+    autoLogout: Boolean(normalized.autoLogout),
+    clearCacheOnEnable: Boolean(normalized.clearCacheOnEnable),
+    temporaryPinWindows: sanitizePinWindows(normalized.temporaryPinWindows),
+    updatedAt: normalized.updatedAt,
+  };
+};
+
+const appendTemporaryPinWindow = async (
+  record: AppLockRecord,
+  durationMs: number,
+  now: number = Date.now(),
+): Promise<void> => {
+  if (!record.travelMode) return;
+  const travelMode = mergeTravelMode(record);
+  if (!travelMode.enabled) return;
+  const expiresAt = now + Math.max(0, durationMs);
+  const windows = sanitizePinWindows([...travelMode.temporaryPinWindows, { start: now, expiresAt }]);
+  const limited = windows.slice(-MAX_TEMP_WINDOWS);
+  record.travelMode = {
+    ...travelMode,
+    temporaryPinWindows: limited,
+    updatedAt: now,
+  };
+  await writeRecord(record);
+};
+
 const readRecord = async (): Promise<AppLockRecord | null> => {
   try {
     const raw = await callSecureStorage<string | null>({ command: 'get', args: { key: STORAGE_KEY } });
     if (!raw) return null;
     const parsed = JSON.parse(raw);
     if (!parsed || typeof parsed !== 'object') return null;
-    return parsed as AppLockRecord;
+    const record = parsed as AppLockRecord;
+    record.travelMode = mergeTravelMode(record);
+    return record;
   } catch (error) {
     console.warn('Failed to read app lock record', error);
     return null;
@@ -108,7 +234,11 @@ const readRecord = async (): Promise<AppLockRecord | null> => {
 };
 
 const writeRecord = async (record: AppLockRecord): Promise<void> => {
-  await callSecureStorage({ command: 'set', args: { key: STORAGE_KEY, value: JSON.stringify(record) } });
+  const payload: AppLockRecord = {
+    ...record,
+    travelMode: mergeTravelMode(record),
+  };
+  await callSecureStorage({ command: 'set', args: { key: STORAGE_KEY, value: JSON.stringify(payload) } });
 };
 
 const clearSessionFlag = () => {
@@ -142,13 +272,87 @@ export const getAppLockSnapshot = async (): Promise<AppLockSnapshot> => {
   const record = await readRecord();
   if (!record) {
     clearSessionFlag();
-    return { enabled: false, biometricEnabled: false };
+    return { enabled: false, biometricEnabled: false, travelMode: toTravelModeSnapshot(undefined) };
+  }
+  let travelMode = mergeTravelMode(record);
+  if (travelMode.enabled && travelMode.autoDeactivateAt && travelMode.autoDeactivateAt <= Date.now()) {
+    travelMode = { ...travelMode, enabled: false, autoDeactivateAt: null, temporaryPinWindows: [] };
+    record.travelMode = travelMode;
+    await writeRecord(record);
   }
   return {
     enabled: true,
     biometricEnabled: Boolean(record.biometricEnabled),
     updatedAt: record.updatedAt,
+    travelMode: toTravelModeSnapshot(travelMode),
   };
+};
+
+export const getTravelModeSnapshot = async (): Promise<TravelModeSnapshot> => {
+  const snapshot = await getAppLockSnapshot();
+  return snapshot.travelMode;
+};
+
+export const enableTravelMode = async (options: EnableTravelModeOptions = {}): Promise<TravelModeSnapshot> => {
+  if (!isTauriRuntime()) {
+    throw new Error('Travel mode requires Tauri runtime');
+  }
+  const record = await readRecord();
+  if (!record) {
+    throw new Error('Включите блокировку приложения перед активацией Travel Mode');
+  }
+
+  const now = Date.now();
+  const previous = mergeTravelMode(record);
+  const autoDeactivateTimeoutMs =
+    typeof options.autoDeactivateTimeoutMs === 'number' && Number.isFinite(options.autoDeactivateTimeoutMs)
+      ? options.autoDeactivateTimeoutMs
+      : previous.autoDeactivateTimeoutMs ?? null;
+  const autoDeactivateAt = autoDeactivateTimeoutMs ? now + autoDeactivateTimeoutMs : null;
+  const temporaryPinWindows = sanitizePinWindows(
+    options.temporaryPinWindows ?? previous.temporaryPinWindows ?? [],
+  );
+
+  const travelMode: TravelModeRecord = {
+    enabled: true,
+    autoDeactivateTimeoutMs,
+    autoDeactivateAt,
+    autoLogout: typeof options.autoLogout === 'boolean' ? options.autoLogout : previous.autoLogout ?? false,
+    clearCacheOnEnable:
+      typeof options.clearCacheOnEnable === 'boolean' ? options.clearCacheOnEnable : previous.clearCacheOnEnable ?? false,
+    temporaryPinWindows,
+    updatedAt: now,
+  };
+
+  record.travelMode = travelMode;
+  await writeRecord(record);
+
+  clearSessionFlag();
+  return toTravelModeSnapshot(travelMode);
+};
+
+export const disableTravelMode = async (): Promise<void> => {
+  if (!isTauriRuntime()) {
+    return;
+  }
+  const record = await readRecord();
+  if (!record) return;
+  const travelMode = mergeTravelMode(record);
+  if (!travelMode.enabled) return;
+  record.travelMode = {
+    ...travelMode,
+    enabled: false,
+    autoDeactivateAt: null,
+    temporaryPinWindows: [],
+    updatedAt: Date.now(),
+  };
+  await writeRecord(record);
+};
+
+export const hasActiveTravelModeWindow = (snapshot: TravelModeSnapshot): boolean => {
+  if (!snapshot.enabled) return false;
+  const now = Date.now();
+  return snapshot.temporaryPinWindows.some(window => window.expiresAt > now);
 };
 
 export const enableAppLock = async (pin: string, biometric: boolean): Promise<void> => {
@@ -167,6 +371,7 @@ export const enableAppLock = async (pin: string, biometric: boolean): Promise<vo
     secret,
     biometricEnabled: biometric,
     updatedAt: Date.now(),
+    travelMode: { ...EMPTY_TRAVEL_MODE, updatedAt: Date.now() },
   };
   await writeRecord(record);
 
@@ -221,6 +426,7 @@ export const unlockWithPin = async (pin: string): Promise<UnlockResult> => {
       return { success: false, error: 'Неверный PIN-код' };
     }
     setSessionFlag();
+    await appendTemporaryPinWindow(record, TEMPORARY_PIN_WINDOW_MS);
     return { success: true };
   } catch (error) {
     return { success: false, error: (error as Error).message };
@@ -242,6 +448,7 @@ export const unlockWithBiometric = async (): Promise<UnlockResult> => {
     });
     if (secret && secret === record.secret) {
       setSessionFlag();
+      await appendTemporaryPinWindow(record, TEMPORARY_PIN_WINDOW_MS);
       return { success: true };
     }
     return { success: false, error: 'Не удалось подтвердить личность' };

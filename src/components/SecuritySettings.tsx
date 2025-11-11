@@ -19,6 +19,10 @@ import {
   enableAppLock,
   disableAppLock,
   AppLockSnapshot,
+  enableTravelMode,
+  disableTravelMode,
+  type TravelModeSnapshot,
+  hasActiveTravelModeWindow,
 } from '../services/appLockService';
 import {
   exportSecureCloudAggregatedStats,
@@ -33,6 +37,7 @@ import {
   type SecureCloudProfile,
   type SecureCloudDetector,
 } from '../services/secureCloudService';
+import { getHiddenRoomIds, setTravelModeAccountData } from '../services/matrixService';
 import SecureCloudAnalyticsPanel from './SecureCloudAnalyticsPanel';
 import { SECURE_CLOUD_EXPORT_RANGE_PRESETS, type SecureCloudExportRangeId } from '../constants/secureCloud';
 
@@ -135,6 +140,18 @@ const SecuritySettings: React.FC<SecuritySettingsProps> = ({ client, isOpen, onC
   const [pinConfirm, setPinConfirm] = useState('');
   const [appLockBiometric, setAppLockBiometric] = useState(false);
   const [appLockLoading, setAppLockLoading] = useState(false);
+  const [travelModeSnapshot, setTravelModeSnapshot] = useState<TravelModeSnapshot>({
+    enabled: false,
+    autoDeactivateTimeoutMs: null,
+    autoDeactivateAt: null,
+    autoLogout: false,
+    clearCacheOnEnable: false,
+    temporaryPinWindows: [],
+  });
+  const [travelModeTimeoutMs, setTravelModeTimeoutMs] = useState<number | null>(null);
+  const [travelModeAutoLogout, setTravelModeAutoLogout] = useState(false);
+  const [travelModeClearCache, setTravelModeClearCache] = useState(false);
+  const [travelModeLoading, setTravelModeLoading] = useState(false);
   const [secureCloudStats, setSecureCloudStats] = useState<SecureCloudAggregatedStats | null>(null);
   const [secureCloudProfile, setSecureCloudProfile] = useState<SecureCloudProfile | null>(null);
   const [secureCloudAnalyticsConsent, setSecureCloudAnalyticsConsent] = useState(false);
@@ -153,6 +170,10 @@ const SecuritySettings: React.FC<SecuritySettingsProps> = ({ client, isOpen, onC
       setAppLockBiometric(snapshot.biometricEnabled);
       setPinValue('');
       setPinConfirm('');
+      setTravelModeSnapshot(snapshot.travelMode);
+      setTravelModeAutoLogout(Boolean(snapshot.travelMode.autoLogout));
+      setTravelModeClearCache(Boolean(snapshot.travelMode.clearCacheOnEnable));
+      setTravelModeTimeoutMs(snapshot.travelMode.autoDeactivateTimeoutMs ?? null);
     } catch (err) {
       console.warn('Failed to load app lock snapshot', err);
     }
@@ -195,6 +216,31 @@ const SecuritySettings: React.FC<SecuritySettingsProps> = ({ client, isOpen, onC
       setSecureCloudExportRoom('all');
     }
   }, [secureCloudExportRoom, secureCloudRoomOptions]);
+
+  const travelModeTimeoutOptions = useMemo(() => [
+    null,
+    30 * 60 * 1000,
+    60 * 60 * 1000,
+    6 * 60 * 60 * 1000,
+    12 * 60 * 60 * 1000,
+    24 * 60 * 60 * 1000,
+    72 * 60 * 60 * 1000,
+  ], []);
+
+  const formatTravelModeTimeout = useCallback((value: number | null): string => {
+    if (!value) return 'Не отключать автоматически';
+    const minutes = Math.round(value / (60 * 1000));
+    if (minutes < 60) return `${minutes} мин.`;
+    const hours = value / (60 * 60 * 1000);
+    if (hours < 24) return `${Math.round(hours)} ч.`;
+    const days = value / (24 * 60 * 60 * 1000);
+    return `${Math.round(days)} дн.`;
+  }, []);
+
+  const travelModeHasActiveWindow = useMemo(
+    () => hasActiveTravelModeWindow(travelModeSnapshot),
+    [travelModeSnapshot],
+  );
 
   const updateSecureCloudProfile = useCallback(
     (updater: (current: SecureCloudProfile) => SecureCloudProfile) => {
@@ -843,6 +889,59 @@ const SecuritySettings: React.FC<SecuritySettingsProps> = ({ client, isOpen, onC
     }
   };
 
+  const handleApplyTravelMode = async () => {
+    if (!isTauriRuntime) return;
+    if (!appLockSnapshot.enabled) {
+      setError('Сначала включите блокировку приложения и задайте PIN.');
+      return;
+    }
+    setTravelModeLoading(true);
+    setError(null);
+    setFeedback(null);
+    try {
+      const snapshot = await enableTravelMode({
+        autoDeactivateTimeoutMs: travelModeTimeoutMs ?? undefined,
+        autoLogout: travelModeAutoLogout,
+        clearCacheOnEnable: travelModeClearCache,
+      });
+      setTravelModeSnapshot(snapshot);
+      const hiddenRooms = getHiddenRoomIds(client);
+      await setTravelModeAccountData(client, {
+        enabled: true,
+        hiddenRooms,
+        autoDeactivateAt: snapshot.autoDeactivateAt ?? null,
+        autoDeactivateTimeoutMs: snapshot.autoDeactivateTimeoutMs ?? null,
+      });
+      setFeedback('Travel Mode активирован. Скрытые комнаты будут защищены до деактивации.');
+      await refreshAppLock();
+    } catch (err: any) {
+      setError(`Не удалось включить Travel Mode: ${err?.message ?? err}`);
+    } finally {
+      setTravelModeLoading(false);
+    }
+  };
+
+  const handleDisableTravelMode = async () => {
+    if (!isTauriRuntime) return;
+    setTravelModeLoading(true);
+    setError(null);
+    setFeedback(null);
+    try {
+      await disableTravelMode();
+      await setTravelModeAccountData(client, {
+        enabled: false,
+        hiddenRooms: [],
+        autoDeactivateAt: null,
+      });
+      setFeedback('Travel Mode выключен. Скрытые чаты снова доступны после ввода PIN.');
+      await refreshAppLock();
+    } catch (err: any) {
+      setError(`Не удалось выключить Travel Mode: ${err?.message ?? err}`);
+    } finally {
+      setTravelModeLoading(false);
+    }
+  };
+
   const handleStartQrVerification = async () => {
     setError(null);
     setFeedback(null);
@@ -971,6 +1070,116 @@ const SecuritySettings: React.FC<SecuritySettingsProps> = ({ client, isOpen, onC
                   При смене PIN скрытые чаты потребуют повторной разблокировки.
                 </span>
               )}
+            </div>
+          </section>
+
+          <section className="space-y-4">
+            <div className="flex items-start justify-between gap-4">
+              <div className="space-y-1">
+                <h3 className="text-lg font-semibold text-text-primary">Travel Mode</h3>
+                <p className="text-sm text-text-secondary">
+                  Временно скрывает чувствительные чаты, отключает уведомления и может очищать локальные следы при поездках.
+                  Режим требует активной блокировки приложения и синхронизируется через Matrix account data.
+                </p>
+                {travelModeSnapshot.autoDeactivateAt && (
+                  <p className="text-xs text-text-secondary">
+                    Автоотключение {formatDistanceToNow(travelModeSnapshot.autoDeactivateAt, { addSuffix: true })}
+                  </p>
+                )}
+                {travelModeHasActiveWindow && (
+                  <p className="text-xs text-emerald-400">
+                    Действует временное PIN-окно повторной разблокировки.
+                  </p>
+                )}
+                {!isTauriRuntime && (
+                  <p className="text-xs text-amber-400">Доступно только в настольном приложении.</p>
+                )}
+              </div>
+              <div className="flex flex-col items-end gap-2">
+                <span
+                  className={`px-3 py-1 rounded-full text-xs font-semibold ${travelModeSnapshot.enabled
+                    ? 'bg-emerald-500/10 text-emerald-300'
+                    : 'bg-bg-tertiary text-text-secondary'}`}
+                >
+                  {travelModeSnapshot.enabled ? 'Активен' : 'Не активен'}
+                </span>
+                {travelModeSnapshot.enabled && (
+                  <button
+                    onClick={handleDisableTravelMode}
+                    className="text-xs text-red-400 hover:text-red-300 disabled:opacity-50"
+                    disabled={!isTauriRuntime || travelModeLoading}
+                  >
+                    Завершить режим
+                  </button>
+                )}
+              </div>
+            </div>
+            <div className="grid gap-4 md:grid-cols-2">
+              <label className="block">
+                <span className="block text-sm font-medium text-text-secondary mb-1">Авто-таймер</span>
+                <select
+                  className="w-full bg-bg-secondary text-text-primary px-3 py-2 rounded-md border border-border-primary focus:outline-none focus:ring-1 focus:ring-ring-focus"
+                  value={travelModeTimeoutMs ?? 'null'}
+                  onChange={event => {
+                    const value = event.target.value === 'null' ? null : Number(event.target.value);
+                    setTravelModeTimeoutMs(Number.isNaN(value as number) ? null : value);
+                  }}
+                  disabled={!isTauriRuntime || travelModeLoading}
+                >
+                  {travelModeTimeoutOptions.map(option => (
+                    <option key={option ?? 'null'} value={option ?? 'null'}>
+                      {formatTravelModeTimeout(option)}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <div className="flex items-center gap-3">
+                <input
+                  id="travel-mode-autologout"
+                  type="checkbox"
+                  className="h-4 w-4"
+                  checked={travelModeAutoLogout}
+                  onChange={event => setTravelModeAutoLogout(event.target.checked)}
+                  disabled={!isTauriRuntime || travelModeLoading}
+                />
+                <label htmlFor="travel-mode-autologout" className="text-sm text-text-secondary">
+                  Автоматически выйти из аккаунта при активации
+                </label>
+              </div>
+              <div className="flex items-center gap-3">
+                <input
+                  id="travel-mode-clear-cache"
+                  type="checkbox"
+                  className="h-4 w-4"
+                  checked={travelModeClearCache}
+                  onChange={event => setTravelModeClearCache(event.target.checked)}
+                  disabled={!isTauriRuntime || travelModeLoading}
+                />
+                <label htmlFor="travel-mode-clear-cache" className="text-sm text-text-secondary">
+                  Очистить локальный кеш сообщений и медиа
+                </label>
+              </div>
+            </div>
+            <div className="flex flex-wrap gap-3 items-center">
+              <button
+                onClick={handleApplyTravelMode}
+                className="px-4 py-2 bg-accent text-text-inverted rounded-md hover:bg-accent/90 disabled:opacity-50"
+                disabled={!isTauriRuntime || travelModeLoading}
+              >
+                {travelModeSnapshot.enabled ? 'Обновить настройки' : 'Включить Travel Mode'}
+              </button>
+              {travelModeSnapshot.enabled && (
+                <button
+                  onClick={handleDisableTravelMode}
+                  className="px-4 py-2 bg-bg-tertiary text-text-secondary rounded-md hover:bg-bg-tertiary/80 disabled:opacity-50"
+                  disabled={!isTauriRuntime || travelModeLoading}
+                >
+                  Выключить Travel Mode
+                </button>
+              )}
+              <span className="text-xs text-text-secondary">
+                Активных PIN-окон: {travelModeSnapshot.temporaryPinWindows.length}
+              </span>
             </div>
           </section>
 

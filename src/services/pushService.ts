@@ -53,6 +53,22 @@ const postToServiceWorker = (type: string, payload: Record<string, unknown>) => 
   }
 };
 
+let travelModeState: { enabled: boolean; hiddenRooms: Set<string> } = {
+  enabled: false,
+  hiddenRooms: new Set(),
+};
+
+export const setTravelModePushState = (enabled: boolean, roomIds: string[]): void => {
+  travelModeState = {
+    enabled: Boolean(enabled),
+    hiddenRooms: new Set(Array.isArray(roomIds) ? roomIds.filter(id => typeof id === 'string') : []),
+  };
+  postToServiceWorker('TRAVEL_MODE_STATE', {
+    enabled: travelModeState.enabled,
+    hiddenRooms: Array.from(travelModeState.hiddenRooms),
+  });
+};
+
 export interface StoredPushSubscription {
   endpoint: string;
   auth: string;
