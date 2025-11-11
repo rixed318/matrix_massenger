@@ -6,7 +6,7 @@ import MessageView from './MessageView';
 import ChatHeader from './ChatHeader';
 import MessageInput from './MessageInput';
 import { mxcToHttp, sendReaction, sendTypingIndicator, editMessage, sendMessage, deleteMessage, sendImageMessage, sendReadReceipt, sendFileMessage, setDisplayName, setAvatar, createRoom, inviteUser, forwardMessage, paginateRoomHistory, sendAudioMessage, sendVideoMessage, setPinnedMessages, sendPollStart, sendPollResponse, translateText, sendStickerMessage, sendGifMessage, sendLocationMessage, getSecureCloudProfileForClient, getRoomNotificationMode, setRoomNotificationMode as updateRoomPushRule, RoomCreationOptions, getRoomTTL, setRoomTTL, isRoomHidden, setRoomHidden } from '@matrix-messenger/core';
-import { startGroupCall, joinGroupCall, getDisplayMedia, enumerateDevices } from '@matrix-messenger/core';
+import { joinGroupCall, getDisplayMedia, enumerateDevices } from '@matrix-messenger/core';
 import {
     getScheduledMessages,
     addScheduledMessage,
