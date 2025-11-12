@@ -29,6 +29,7 @@ export interface StoryStoreState {
     setActiveKey: (key: string | null) => void;
     markStoryAsRead: (storyId: string) => Promise<void>;
     toggleStoryReaction: (storyId: string, emoji: string) => Promise<void>;
+    refreshActiveStories: () => Promise<void>;
 }
 
 const storySubscriptions = new Map<string, () => void>();
@@ -162,6 +163,33 @@ export const storyStore = createStore<StoryStoreState>((set, get) => ({
             console.warn('toggleStoryReaction failed', error);
         }
     },
+    refreshActiveStories: async () => {
+        const key = get().activeKey;
+        if (!key) {
+            return;
+        }
+        const client = clientRegistry.get(key);
+        if (!client) {
+            return;
+        }
+        try {
+            const snapshot = loadStoriesFromAccountData(client);
+            set(state => {
+                const accounts = {
+                    ...state.accounts,
+                    [key]: buildAccountState(snapshot),
+                };
+                const patch: Partial<StoryStoreState> = { accounts };
+                if (state.activeKey === key) {
+                    patch.stories = snapshot.stories;
+                    patch.isHydrated = true;
+                }
+                return { ...state, ...patch };
+            });
+        } catch (error) {
+            console.warn('Failed to refresh stories for account', key, error);
+        }
+    },
 }));
 
 export const useStoryStore = <T,>(selector: (state: StoryStoreState) => T): T => useStore(storyStore, selector);
@@ -184,4 +212,8 @@ export const markActiveStoryAsRead = async (storyId: string): Promise<void> => {
 
 export const toggleActiveStoryReaction = async (storyId: string, emoji: string): Promise<void> => {
     await storyStore.getState().toggleStoryReaction(storyId, emoji);
+};
+
+export const refreshActiveStoryFeed = async (): Promise<void> => {
+    await storyStore.getState().refreshActiveStories();
 };
