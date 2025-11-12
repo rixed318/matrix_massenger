@@ -16,6 +16,10 @@ import {
   generateRoomDigest,
   DEFAULT_DIGEST_ACCOUNT_KEY,
 } from '../services/digestService';
+import {
+  getSmartCollections,
+  type SmartCollection,
+} from '../services/mediaIndexService';
 
 interface RoomListProps {
   rooms: Room[];
@@ -76,6 +80,8 @@ const RoomList: React.FC<RoomListProps> = ({
   const userAvatarUrl = mxcToHttp(client, user?.avatarUrl);
   const [searchQuery, setSearchQuery] = useState('');
   const [isSearchFocused, setIsSearchFocused] = useState(false);
+  const [smartCollectionsByUser, setSmartCollectionsByUser] = useState<Record<string, SmartCollection[]>>({});
+  const [activeSmartCollectionId, setActiveSmartCollectionId] = useState<string | null>(null);
 
   const { activeQuickFilterId, setActiveQuickFilterId } = useAccountStore(state => ({
     activeQuickFilterId: state.activeQuickFilterId,
@@ -84,6 +90,39 @@ const RoomList: React.FC<RoomListProps> = ({
 
   const activeAccount = accounts.find(account => account.key === activeAccountKey) ?? null;
   const accountBadge = activeAccount?.displayName ?? activeAccount?.userId ?? null;
+  const activeUserId = activeAccount?.userId ?? client.getUserId();
+
+  useEffect(() => {
+    setActiveSmartCollectionId(null);
+  }, [activeUserId]);
+
+  useEffect(() => {
+    if (!activeUserId) {
+      return;
+    }
+    if (smartCollectionsByUser[activeUserId]) {
+      return;
+    }
+
+    let cancelled = false;
+    void getSmartCollections(activeUserId)
+      .then(collections => {
+        if (!cancelled) {
+          setSmartCollectionsByUser(prev => ({ ...prev, [activeUserId]: collections }));
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setSmartCollectionsByUser(prev => ({ ...prev, [activeUserId]: [] }));
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeUserId, smartCollectionsByUser]);
+
+  const smartCollections = smartCollectionsByUser[activeUserId ?? ''] ?? [];
 
   const roomsByFolder = useMemo(() => {
     if (activeFolderId === 'all') {
@@ -151,6 +190,15 @@ const RoomList: React.FC<RoomListProps> = ({
   }, [rooms, quickFilterMap]);
 
   const roomsMatchingFilter = useMemo(() => {
+    if (activeSmartCollectionId) {
+      const target = smartCollections.find(collection => collection.id === activeSmartCollectionId);
+      if (!target) {
+        return [] as Room[];
+      }
+      const allowed = new Set(target.roomIds ?? []);
+      return roomsByFolder.filter(room => allowed.has(room.roomId));
+    }
+
     return roomsByFolder.filter(room => {
       const membership = quickFilterMap.get(room.roomId);
       if (!membership) {
@@ -158,7 +206,7 @@ const RoomList: React.FC<RoomListProps> = ({
       }
       return membership[activeQuickFilterId];
     });
-  }, [roomsByFolder, quickFilterMap, activeQuickFilterId]);
+  }, [roomsByFolder, quickFilterMap, activeQuickFilterId, activeSmartCollectionId, smartCollections]);
 
   const searchIndex = useMemo(
     () => buildSearchIndexFromRooms(roomsMatchingFilter, accountBadge),
@@ -403,13 +451,35 @@ const RoomList: React.FC<RoomListProps> = ({
             <button
               key={summary.id}
               type="button"
-              onClick={() => setActiveQuickFilterId(summary.id)}
-              className={quickFilterChipClass(activeQuickFilterId === summary.id)}
+              onClick={() => {
+                setActiveSmartCollectionId(null);
+                setActiveQuickFilterId(summary.id);
+              }}
+              className={quickFilterChipClass(activeSmartCollectionId === null && activeQuickFilterId === summary.id)}
               title={summary.description ?? summary.label}
             >
               <span>{summary.label}</span>
               <span className="ml-2 inline-flex min-w-[1.5rem] items-center justify-center rounded-full bg-bg-secondary px-1.5 text-[11px] font-semibold">
                 {summary.id === 'all' ? summary.roomCount : summary.unreadCount || summary.roomCount}
+              </span>
+            </button>
+          ))}
+          {smartCollections.length > 0 && (
+            <span className="px-1 text-[10px] uppercase tracking-wide text-text-tertiary">Умные подборки</span>
+          )}
+          {smartCollections.map(collection => (
+            <button
+              key={collection.id}
+              type="button"
+              onClick={() =>
+                setActiveSmartCollectionId(prev => (prev === collection.id ? null : collection.id))
+              }
+              className={quickFilterChipClass(activeSmartCollectionId === collection.id)}
+              title={collection.description}
+            >
+              <span>{collection.label}</span>
+              <span className="ml-2 inline-flex min-w-[1.5rem] items-center justify-center rounded-full bg-bg-secondary px-1.5 text-[11px] font-semibold">
+                {collection.count}
               </span>
             </button>
           ))}

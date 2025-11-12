@@ -37,7 +37,9 @@ export interface MediaItem {
 
 export interface IndexedMessageMetadata extends IndexedMessageRecord {}
 
-export interface SmartCollection extends SmartCollectionSummary {}
+export interface SmartCollection extends SmartCollectionSummary {
+  roomIds?: string[];
+}
 
 export interface MediaQuery {
   type?: MediaType;
@@ -646,7 +648,12 @@ export async function searchLocalMessages(query: LocalSearchQuery, userId?: stri
 export async function getSmartCollections(userId: string): Promise<SmartCollection[]> {
   try {
     const smart = await loadSmartCollections(userId);
-    return smart;
+    return smart.map(collection => ({
+      ...collection,
+      roomIds: Array.isArray((collection as SmartCollection).roomIds)
+        ? (collection as SmartCollection).roomIds
+        : [],
+    }));
   } catch (error) {
     console.warn("Failed to load smart collections", error);
     return [];
