@@ -1,7 +1,7 @@
-import React, { useState, useRef, useEffect, useMemo } from 'react';
-import { Message, Reaction, MatrixClient } from '@matrix-messenger/core';
+import React, { useState, useRef, useEffect, useMemo, useCallback } from 'react';
+import { Message, Reaction, MatrixClient, MatrixRoom, MatrixEvent } from '@matrix-messenger/core';
 import Avatar from './Avatar';
-import { format } from 'date-fns';
+import { format, formatDistanceToNow } from 'date-fns';
 import ReactionPicker from './ReactionPicker';
 import ReactionsDisplay from './ReactionsDisplay';
 import ReplyQuote from './ReplyQuote';
@@ -9,11 +9,84 @@ import { mxcToHttp } from '@matrix-messenger/core';
 import VoiceMessagePlayer from './VoiceMessagePlayer';
 import VideoMessagePlayer from './VideoMessagePlayer';
 import PollView from './PollView';
-import { EventType } from 'matrix-js-sdk';
+import { EventType, RoomEvent } from 'matrix-js-sdk';
 import LinkPreview from './LinkPreview';
 import { buildExternalNavigationUrl, buildStaticMapUrl, MAP_ZOOM_DEFAULT, formatCoordinate, sanitizeZoom } from '../utils/location';
 import KnowledgeDocModal from './KnowledgeBase/KnowledgeDocModal';
 import type { KnowledgeDocDraft } from '../services/knowledgeBaseService';
+import { formatMatrixIdForDisplay } from '../utils/presence';
+
+const MAX_VIEWERS_PREVIEW = 12;
+
+const VIEW_STATS_KEYS = [
+    'com.matrix_messenger.message_stats',
+    'com.beeper.message_stats',
+    'io.element.message_stats',
+    'org.matrix.msc3773.message_stats',
+    'message_stats',
+];
+
+const normaliseNumericValue = (value: unknown): number | undefined => {
+    if (typeof value === 'number' && Number.isFinite(value)) {
+        return value;
+    }
+    if (typeof value === 'string') {
+        const parsed = Number(value);
+        if (Number.isFinite(parsed)) {
+            return parsed;
+        }
+    }
+    return undefined;
+};
+
+const extractCountFromStats = (stats: any): number | undefined => {
+    if (!stats || typeof stats !== 'object') {
+        return undefined;
+    }
+    for (const key of ['view_count', 'views', 'count', 'total', 'unique_views']) {
+        const candidate = normaliseNumericValue(stats[key]);
+        if (candidate !== undefined) {
+            return candidate;
+        }
+    }
+    return undefined;
+};
+
+const pickServerViewCount = (unsigned: any): number | undefined => {
+    if (!unsigned || typeof unsigned !== 'object') {
+        return undefined;
+    }
+
+    for (const key of VIEW_STATS_KEYS) {
+        const stats = unsigned[key];
+        const value = extractCountFromStats(stats);
+        if (value !== undefined) {
+            return value;
+        }
+    }
+
+    return extractCountFromStats(unsigned);
+};
+
+const areReadByEqual = (a?: Message['readBy'], b?: Message['readBy']): boolean => {
+    const left = a ?? {};
+    const right = b ?? {};
+    const leftKeys = Object.keys(left);
+    const rightKeys = Object.keys(right);
+
+    if (leftKeys.length !== rightKeys.length) {
+        return false;
+    }
+
+    return leftKeys.every(userId => {
+        const leftEntry = left[userId];
+        const rightEntry = right[userId];
+        if (!leftEntry || !rightEntry) {
+            return false;
+        }
+        return leftEntry.ts === rightEntry.ts;
+    });
+};
 
 interface ChatMessageProps {
     message: Message;
@@ -41,12 +114,140 @@ const ChatMessage: React.FC<ChatMessageProps> = ({
     const [isPickerOpen, setPickerOpen] = useState(false);
     const [isEditing, setIsEditing] = useState(false);
     const [editedContent, setEditedContent] = useState(message.content.body);
+    const [readByState, setReadByState] = useState<Message['readBy']>(() => message.readBy);
     const editInputRef = useRef<HTMLInputElement>(null);
+    const viewPopoverAnchorRef = useRef<HTMLSpanElement>(null);
+    const [isViewersPopoverOpen, setViewersPopoverOpen] = useState(false);
     const isOwn = message.isOwn;
-    const isReadByOthers = isOwn && Object.keys(message.readBy).some(userId => userId !== client.getUserId());
+    const clientUserId = client.getUserId();
+    const isReadByOthers = useMemo(() => (
+        isOwn && Object.keys(readByState).some(userId => userId !== clientUserId)
+    ), [isOwn, readByState, clientUserId]);
     const [remainingSeconds, setRemainingSeconds] = useState<number | null>(null);
     const [showTranscript, setShowTranscript] = useState<boolean>(message.transcript?.status === 'completed');
     const [isKnowledgeModalOpen, setKnowledgeModalOpen] = useState(false);
+
+    const matrixRoom = useMemo<MatrixRoom | null>(() => {
+        const rawEvent = message.rawEvent;
+        const directRoom = rawEvent?.getRoom?.();
+        if (directRoom) {
+            return directRoom;
+        }
+        const roomId = rawEvent?.getRoomId?.();
+        if (roomId) {
+            return client.getRoom(roomId) ?? null;
+        }
+        return null;
+    }, [client, message.rawEvent]);
+
+    const refreshReadByFromRoom = useCallback(() => {
+        if (!matrixRoom) return;
+        try {
+            const event: MatrixEvent | null = message.rawEvent ?? matrixRoom.findEventById?.(message.id) ?? null;
+            if (!event) return;
+            const readBy: Message['readBy'] = {};
+            matrixRoom.getUsersReadUpTo(event).forEach(userId => {
+                const receipt = matrixRoom.getReadReceiptForUserId(userId);
+                const ts = receipt?.data?.ts;
+                if (typeof ts === 'number') {
+                    readBy[userId] = { ts };
+                }
+            });
+            setReadByState(prev => (areReadByEqual(prev, readBy) ? prev : readBy));
+        } catch (error) {
+            console.warn('Failed to refresh read receipts for message', error);
+        }
+    }, [matrixRoom, message.id, message.rawEvent]);
+
+    useEffect(() => {
+        setReadByState(prev => (areReadByEqual(prev, message.readBy) ? prev : message.readBy));
+    }, [message.id, message.readBy]);
+
+    useEffect(() => {
+        refreshReadByFromRoom();
+    }, [refreshReadByFromRoom]);
+
+    useEffect(() => {
+        if (!matrixRoom) return;
+        const handleReceipt = (event: MatrixEvent, room?: MatrixRoom) => {
+            const targetRoomId = room?.roomId ?? event?.getRoomId?.();
+            if (!targetRoomId || targetRoomId !== matrixRoom.roomId) {
+                return;
+            }
+            refreshReadByFromRoom();
+        };
+
+        client.on(RoomEvent.Receipt, handleReceipt as any);
+        return () => {
+            client.removeListener(RoomEvent.Receipt, handleReceipt as any);
+        };
+    }, [client, matrixRoom, message.rawEvent, refreshReadByFromRoom]);
+
+    useEffect(() => {
+        if (!isViewersPopoverOpen) {
+            return;
+        }
+        const handleDocumentClick = (event: MouseEvent) => {
+            if (!viewPopoverAnchorRef.current?.contains(event.target as Node)) {
+                setViewersPopoverOpen(false);
+            }
+        };
+        const handleKeyDown = (event: KeyboardEvent) => {
+            if (event.key === 'Escape') {
+                setViewersPopoverOpen(false);
+            }
+        };
+
+        document.addEventListener('mousedown', handleDocumentClick);
+        document.addEventListener('keydown', handleKeyDown);
+        return () => {
+            document.removeEventListener('mousedown', handleDocumentClick);
+            document.removeEventListener('keydown', handleKeyDown);
+        };
+    }, [isViewersPopoverOpen]);
+
+    useEffect(() => {
+        setViewersPopoverOpen(false);
+    }, [message.id]);
+
+    const readByEntries = useMemo(() => Object.entries(readByState), [readByState]);
+    const sortedReadBy = useMemo(() => (
+        [...readByEntries].sort(([, a], [, b]) => b.ts - a.ts)
+    ), [readByEntries]);
+
+    const serverViewCount = useMemo(() => {
+        const unsigned = message.rawEvent?.getUnsigned?.();
+        return pickServerViewCount(unsigned);
+    }, [message.rawEvent]);
+
+    const derivedViewCount = sortedReadBy.length;
+    const viewCount = serverViewCount !== undefined
+        ? Math.max(serverViewCount, derivedViewCount)
+        : derivedViewCount;
+
+    const resolveDisplayName = useCallback((userId: string) => {
+        const member = matrixRoom?.getMember?.(userId);
+        if (member?.name) {
+            return member.name;
+        }
+        const user = client.getUser(userId);
+        if (user?.displayName) {
+            return user.displayName;
+        }
+        return formatMatrixIdForDisplay(userId);
+    }, [client, matrixRoom]);
+
+    const latestReaders = useMemo(() => (
+        sortedReadBy
+            .slice(0, MAX_VIEWERS_PREVIEW)
+            .map(([userId, data]) => ({
+                userId,
+                name: resolveDisplayName(userId),
+                ts: data.ts,
+            }))
+    ), [resolveDisplayName, sortedReadBy]);
+
+    const hiddenReaderCount = Math.max(viewCount - latestReaders.length, 0);
 
     const knowledgeDraft = useMemo<KnowledgeDocDraft>(() => {
         const roomId = message.rawEvent?.getRoomId?.() ?? (typeof message.rawEvent?.getRoomId === 'function' ? message.rawEvent?.getRoomId() : undefined);
@@ -131,6 +332,52 @@ const ChatMessage: React.FC<ChatMessageProps> = ({
         const i = Math.floor(Math.log(bytes) / Math.log(k));
         return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
     };
+
+    const isChannelOrBroadcastRoom = useMemo(() => {
+        if (!matrixRoom) return false;
+        if (matrixRoom.getType?.() === 'm.space') return false;
+        try {
+            const powerLevelsEvent = matrixRoom.currentState?.getStateEvents?.(EventType.RoomPowerLevels, '');
+            const content = powerLevelsEvent?.getContent?.() as Record<string, any> | undefined;
+            const usersDefault = typeof content?.users_default === 'number' ? content.users_default : 0;
+            const eventsContent = typeof content?.events === 'object' && content?.events
+                ? content.events as Record<string, number>
+                : {};
+            const messageLevel = typeof eventsContent[EventType.RoomMessage] === 'number'
+                ? eventsContent[EventType.RoomMessage]
+                : (typeof content?.events_default === 'number' ? content.events_default : usersDefault);
+
+            const createEvent = matrixRoom.currentState?.getStateEvents?.(EventType.RoomCreate, '');
+            const createContent = createEvent?.getContent?.();
+            const createType = typeof createContent?.type === 'string' ? createContent.type : '';
+            const hasBroadcastType = createType.includes('broadcast');
+
+            return hasBroadcastType || messageLevel > usersDefault;
+        } catch (error) {
+            console.warn('Failed to determine room mode for view counter', error);
+            return false;
+        }
+    }, [matrixRoom]);
+
+    const shouldShowViewCounter = isChannelOrBroadcastRoom && Number.isFinite(viewCount);
+
+    const handleToggleViewersPopover = useCallback((event: React.MouseEvent<HTMLButtonElement>) => {
+        event.preventDefault();
+        event.stopPropagation();
+        setViewersPopoverOpen(prev => !prev);
+    }, []);
+
+    const handleMouseEnterViewCounter = useCallback(() => {
+        if (typeof window !== 'undefined' && window.matchMedia?.('(hover: hover)').matches) {
+            setViewersPopoverOpen(true);
+        }
+    }, []);
+
+    const handleMouseLeaveViewCounter = useCallback(() => {
+        if (typeof window !== 'undefined' && window.matchMedia?.('(hover: hover)').matches) {
+            setViewersPopoverOpen(false);
+        }
+    }, []);
 
     const renderWithMentions = (text: string) => {
         if (message.content.formatted_body) {
@@ -520,6 +767,49 @@ const ChatMessage: React.FC<ChatMessageProps> = ({
                     <span className="text-xs text-text-secondary flex items-center gap-1">
                         {format(new Date(message.timestamp), 'p')}
                         {message.isEdited && !message.isRedacted && <span className="italic text-gray-500">(edited)</span>}
+                        {shouldShowViewCounter && (
+                            <span
+                                ref={viewPopoverAnchorRef}
+                                className="relative inline-flex"
+                                onMouseEnter={handleMouseEnterViewCounter}
+                                onMouseLeave={handleMouseLeaveViewCounter}
+                            >
+                                <button
+                                    type="button"
+                                    onClick={handleToggleViewersPopover}
+                                    className="ml-1 inline-flex items-center gap-1 rounded-full bg-bg-primary/70 px-2 py-0.5 text-[11px] font-medium text-text-secondary hover:bg-bg-tertiary"
+                                    aria-label={`${viewCount} ${viewCount === 1 ? 'view' : 'views'}`}
+                                    aria-expanded={isViewersPopoverOpen}
+                                >
+                                    <svg xmlns="http://www.w3.org/2000/svg" className="h-3.5 w-3.5" viewBox="0 0 20 20" fill="currentColor">
+                                        <path d="M10 3c-5 0-9 5.25-9 7s4 7 9 7 9-5.25 9-7-4-7-9-7zm0 12a5 5 0 110-10 5 5 0 010 10zm0-2a3 3 0 100-6 3 3 0 000 6z" />
+                                    </svg>
+                                    <span>{viewCount}</span>
+                                </button>
+                                {isViewersPopoverOpen && (
+                                    <div className={`absolute top-[calc(100%+0.25rem)] z-30 min-w-[200px] rounded-lg border border-border-primary bg-bg-primary/95 p-3 text-left shadow-xl backdrop-blur ${isOwn ? 'right-0' : 'left-0'}`}>
+                                        <p className="text-[11px] font-semibold uppercase tracking-wide text-text-secondary">Views</p>
+                                        <ul className="mt-2 max-h-60 space-y-1 overflow-y-auto pr-1">
+                                            {latestReaders.length > 0 ? (
+                                                latestReaders.map(reader => (
+                                                    <li key={reader.userId} className="flex items-center justify-between gap-3 text-xs text-text-secondary">
+                                                        <span className="truncate text-text-primary">{reader.name}</span>
+                                                        <span className="flex-shrink-0 text-[11px] text-text-secondary/70">
+                                                            {reader.ts ? formatDistanceToNow(new Date(reader.ts), { addSuffix: true }) : '—'}
+                                                        </span>
+                                                    </li>
+                                                ))
+                                            ) : (
+                                                <li className="text-xs text-text-secondary/70">No views yet</li>
+                                            )}
+                                        </ul>
+                                        {hiddenReaderCount > 0 && (
+                                            <p className="mt-2 text-[11px] text-text-secondary/70">+{hiddenReaderCount} more {hiddenReaderCount === 1 ? 'viewer' : 'viewers'}</p>
+                                        )}
+                                    </div>
+                                )}
+                            </span>
+                        )}
                         {isOwn && !message.isUploading && !message.isRedacted && (
                             <span className="ml-1">
                                 {isReadByOthers ? (
